@@ -1,3 +1,5 @@
+// compile: cc main.c -lraylib -lm -O2
+
 #include <math.h>
 #include <raylib.h>
 #include <raymath.h>
@@ -57,6 +59,9 @@
 #define BOID_FIGHTING_RADIUS_SQ (BOID_FIGHTING_RADIUS * BOID_FIGHTING_RADIUS)
 #define BOID_STOP_RADIUS_SQ (BOID_STOP_RADIUS * BOID_STOP_RADIUS)
 
+#define CHUNK_SIZE_BOIDS 1024
+#define CHUNK_SIZE_PIXELS BOID_NEAREST_ENEMY_RADIUS
+
 // <======================================== STRUCTURES AND TYPEDEFS =======================================>
 
 typedef enum {
@@ -100,6 +105,68 @@ typedef struct {
 } Boid;
 
 typedef uint16_t BoidIndex;
+typedef uint16_t ChunkSize;
+
+typedef struct {
+    BoidIndex boids[CHUNK_SIZE_BOIDS]; // Array of boids
+    ChunkSize count; // Boids count
+} Chunk;
+
+typedef struct {
+    Chunk *chunks;
+    int screenWidth, screenHeight;
+    uint16_t rows, cols; // Number of chunks by width/height
+    uint32_t chunksCount;
+} Grid;
+
+// <============================================ GRID AND CHUNKS ===========================================>
+
+// Fill the chunks with zeros (clear)
+void ClearGrid(Grid *grid) {
+    for (uint32_t i = 0; i < grid->chunksCount; i++) {
+        grid->chunks[i].count = 0;
+    }
+}
+
+// Fill chunks with boids
+void FillGrid(Grid *grid, Boid *boids, BoidIndex boidsCount) {
+    for (BoidIndex i = 0; i < boidsCount; i++) {
+        Boid *boid = &boids[i];
+
+        float x = boid->pos.x;
+        float y = boid->pos.y;
+
+        if (x < 0) x = 0;
+        else if (x > grid->screenWidth) x = grid->screenWidth;
+        if (y < 0) y = 0;
+        else if (y > grid->screenHeight) y = grid->screenHeight;
+        
+        uint16_t chunkX = x / CHUNK_SIZE_PIXELS;
+        uint16_t chunkY = y / CHUNK_SIZE_PIXELS;
+        uint32_t chunkIndex = chunkX + chunkY*grid->cols;
+
+        Chunk *chunk = &grid->chunks[chunkIndex];
+
+        if (chunk->count < CHUNK_SIZE_BOIDS)
+            chunk->boids[chunk->count++] = i;
+    }
+}
+
+// Add data to the grid, completely refill chunks (delete and recrate all chunks)
+void InitGrid(Grid *grid, Boid *boids, BoidIndex boidsCount, int screenWidth, int screenHeight) {
+    grid->screenWidth = screenWidth;
+    grid->screenHeight = screenHeight;
+    grid->cols = (uint16_t)(screenWidth/CHUNK_SIZE_PIXELS) + 1;
+    grid->rows = (uint16_t)(screenHeight/CHUNK_SIZE_PIXELS) + 1;
+    grid->chunksCount = grid->rows * grid->cols;
+
+    if (grid->chunks != NULL) {
+        free(grid->chunks);
+    }
+    grid->chunks = RL_CALLOC(grid->chunksCount, sizeof(Chunk));
+
+    FillGrid(grid, boids, boidsCount);
+}
 
 // <================================================= BOIDS ================================================>
 
@@ -126,7 +193,7 @@ void BoidNormalSpeed(Boid *boid) {
         boid->velocity = Vector2Scale(boid->velocity, BOID_MIN_SPEED/speed);
 }
 
-void UpdateBoid(Boid *boids, BoidIndex boidsCount, BoidIndex boidIndex) {
+void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidIndex) {
     Boid *boid = &boids[boidIndex];
 
     // Skip if surrending or falled
@@ -175,44 +242,66 @@ void UpdateBoid(Boid *boids, BoidIndex boidsCount, BoidIndex boidIndex) {
     Vector2 closeEnemiesPos = { 0 }; // Sum of vectors of enemies positions for retreat
     float nearestEnemyDistanceSqr = INFINITY;
     Boid *nearestEnemy = NULL;
+    // Position limitation by screen size
+    Vector2 pos = boid->pos;
+    if (pos.x < 0) pos.x = 0;
+    else if (pos.x > grid->screenWidth) pos.x = grid->screenWidth;
+    if (pos.y < 0) pos.y = 0;
+    else if (pos.y > grid->screenHeight) pos.y = grid->screenHeight;
 
-    for (size_t i = 0; i < boidsCount; i++) {
-        if (i == boidIndex) continue;
+    // Get boid's chunk
+    int32_t chunkX = boid->pos.x / CHUNK_SIZE_PIXELS;
+    int32_t chunkY = boid->pos.y / CHUNK_SIZE_PIXELS;
 
-        Boid *otherBoid = &boids[i];
+    // 8 neighboring chunks + current chunk
+    for (int32_t x = chunkX-1; x <= chunkX+1; x++) {
+        for (int32_t y = chunkY-1; y <= chunkY+1; y++) {
+            if ((x < 0) || (x >= grid->cols) || (y < 0) || y >= grid->rows) continue;
 
-        // Skip surrending and falled boids
-        if (otherBoid->action == ACT_SURRENDER || otherBoid->action == ACT_FALL) continue;
+            uint32_t chunkIndex = x + y*grid->cols;
+            Chunk *chunk = &grid->chunks[chunkIndex];
+
+            // Processing boids from neighboring chunks
+            for (size_t i = 0; i < chunk->count; i++) {
+                BoidIndex otherBoidIndex = chunk->boids[i];
+                if (otherBoidIndex == boidIndex) continue;
+
+                Boid *otherBoid = &boids[otherBoidIndex];
+
+                // Skip surrending and falled boids
+                if (otherBoid->action == ACT_SURRENDER || otherBoid->action == ACT_FALL) continue;
         
-        Vector2 distanceV = Vector2Subtract(boid->pos, otherBoid->pos);
-        float distanceSqr = Vector2LengthSqr(distanceV);
+                Vector2 distanceV = Vector2Subtract(boid->pos, otherBoid->pos);
+                float distanceSqr = Vector2LengthSqr(distanceV);
         
-        // Calculate avoid
-        if (distanceSqr < BOID_AVOID_RADIUS_SQ)
-            close = Vector2Add(close, distanceV);
+                // Calculate avoid
+                if (distanceSqr < BOID_AVOID_RADIUS_SQ)
+                    close = Vector2Add(close, distanceV);
 
-        // Count only not retreating boids
-        // if (otherBoid->action != ACT_RETREAT) {
-            teamsBoidsCount[otherBoid->team]++;
-            if (distanceSqr < BOID_VISIBLE_RADIUS_SQ) {
-                teamsCloseBoidsCount[otherBoid->team]++;
-                if (boid->team == otherBoid->team && distanceSqr > BOID_AVOID_RADIUS_SQ) { // Cohesion and alignment only with teammates
-                    neighborsVelocity = Vector2Add(neighborsVelocity, otherBoid->velocity); // Calculate alignment
-                    neighborsPos = Vector2Add(neighborsPos, otherBoid->pos); // Calculate cohesion
+                // Count only not retreating boids
+                // if (otherBoid->action != ACT_RETREAT) {
+                teamsBoidsCount[otherBoid->team]++;
+                if (distanceSqr < BOID_VISIBLE_RADIUS_SQ) {
+                    teamsCloseBoidsCount[otherBoid->team]++;
+                    if (boid->team == otherBoid->team && distanceSqr > BOID_AVOID_RADIUS_SQ) { // Cohesion and alignment only with teammates
+                        neighborsVelocity = Vector2Add(neighborsVelocity, otherBoid->velocity); // Calculate alignment
+                        neighborsPos = Vector2Add(neighborsPos, otherBoid->pos); // Calculate cohesion
+                    }
+                }
+                // }
+
+                // Find nearest enemy
+                if ((otherBoid->team != boid->team) && (distanceSqr < BOID_NEAREST_ENEMY_RADIUS_SQ) && (distanceSqr < nearestEnemyDistanceSqr)) {
+                    nearestEnemyPos = distanceV;
+                    nearestEnemyDistanceSqr = distanceSqr;
+                    nearestEnemy = otherBoid;
+                }
+
+                // Calculate vector for retreat
+                if ((boid->action == ACT_RETREAT) && (otherBoid->team != boid->team) && (distanceSqr < BOID_VISIBLE_RADIUS_SQ)) {
+                    closeEnemiesPos = Vector2Add(closeEnemiesPos, distanceV);
                 }
             }
-        // }
-
-        // Find nearest enemy
-        if ((otherBoid->team != boid->team) && (distanceSqr < BOID_NEAREST_ENEMY_RADIUS_SQ) && (distanceSqr < nearestEnemyDistanceSqr)) {
-            nearestEnemyPos = distanceV;
-            nearestEnemyDistanceSqr = distanceSqr;
-            nearestEnemy = otherBoid;
-        }
-
-        // Calculate vector for retreat
-        if ((boid->action == ACT_RETREAT) && (otherBoid->team != boid->team) && (distanceSqr < BOID_VISIBLE_RADIUS_SQ)) {
-            closeEnemiesPos = Vector2Add(closeEnemiesPos, distanceV);
         }
     }
 
@@ -342,7 +431,7 @@ void UpdateBoid(Boid *boids, BoidIndex boidsCount, BoidIndex boidIndex) {
     // }
 
     // Avoid
-    boid->velocity = Vector2Add(boid->velocity, Vector2Scale(close, BOID_AVOID_FACTOR));
+    boid->velocity = Vector2Add(boid->velocity, Vector2Scale(close, BOID_AVOID_FACTOR * (1/boid->speed)));
 }
 
 void DrawBoid(Boid *boid, Texture2D texture) {
@@ -381,8 +470,6 @@ void DrawBoid(Boid *boid, Texture2D texture) {
 // <================================================= MAIN =================================================>
 
 int main(int argc, char *argv[]) {
-    printf("%zu\n", sizeof(Boid));
-    
     SetTraceLogLevel(LOG_WARNING);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     SetConfigFlags(FLAG_FULLSCREEN_MODE);
@@ -392,6 +479,22 @@ int main(int argc, char *argv[]) {
     // Boids
     Boid boids[MAX_BOIDS_COUNT];
     BoidIndex boidsCount = 0;
+    // for (BoidIndex i = 0; i < 10000; i++) {
+    //     Boid newBoid = { 0 };
+    //     newBoid.pos = (Vector2){GetRandomValue(0, GetScreenWidth()), GetRandomValue(0, GetScreenHeight())};
+    //     newBoid.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+    //     newBoid.direction = newBoid.velocity;
+    //     newBoid.speed = GetRandomValue(90, 150)/100.0;
+    //     newBoid.health = BOID_MAX_HEALTH;
+    //     newBoid.xp = GetRandomValue(0, 5);
+    //     newBoid.action = ACT_ATTACK;
+    //     newBoid.team = GetRandomValue(0, 3);
+
+    //     boids[boidsCount++] = newBoid;
+    // }
+    Grid grid = { 0 }; // Grid of chunks
+    InitGrid(&grid, boids, boidsCount, GetScreenWidth(), GetScreenHeight());
+    printf("Chunks: %dx%d\n", grid.cols, grid.rows);
 
     // Camera
     Camera2D camera = { 0 };
@@ -407,20 +510,6 @@ int main(int argc, char *argv[]) {
     GenTextureMipmaps(&texture);
     SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
 
-    // for (BoidIndex i = 0; i < 10000; i++) {
-    //     Boid newBoid = { 0 };
-    //     newBoid.pos = (Vector2){GetRandomValue(0, GetScreenWidth()), GetRandomValue(0, GetScreenHeight())};
-    //     newBoid.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
-    //     newBoid.direction = newBoid.velocity;
-    //     newBoid.speed = GetRandomValue(90, 150)/100.0;
-    //     newBoid.health = BOID_MAX_HEALTH;
-    //     newBoid.xp = GetRandomValue(0, 5);
-    //     newBoid.action = ACT_ATTACK;
-    //     newBoid.team = GetRandomValue(0, 3);
-
-    //     boids[boidsCount++] = newBoid;
-    // }
-    
     while (!WindowShouldClose()) {
         // Keys
         if (IsKeyPressed(KEY_SPACE)) pause = !pause;
@@ -478,10 +567,13 @@ int main(int argc, char *argv[]) {
 
         // Update boids
         if (!pause) {
+            if ((grid.screenWidth != screenWidth) || (grid.screenHeight != screenHeight))
+                InitGrid(&grid, boids, boidsCount, screenWidth, screenHeight);
+
             for (BoidIndex i = 0; i < boidsCount; i++) {
                 Boid *boid = &boids[i];
             
-                UpdateBoid(boids, boidsCount, i);
+                UpdateBoid(boids, &grid, boidsCount, i);
 
                 if (boid->action != ACT_SURRENDER && boid->action != ACT_FALL) {
                     BoidNormalSpeed(boid);
@@ -493,6 +585,9 @@ int main(int argc, char *argv[]) {
 
                 boid->pos = Vector2Add(boid->pos, Vector2Scale(boid->velocity, boid->speed));
             }
+
+            ClearGrid(&grid);
+            FillGrid(&grid, boids, boidsCount);
         }
 
         // Drawing
