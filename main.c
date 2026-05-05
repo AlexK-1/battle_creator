@@ -4,6 +4,7 @@
 #include <math.h>
 #include <raylib.h>
 #include <raymath.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,7 @@
 
 #define CHUNK_SIZE_BOIDS 1024
 #define CHUNK_SIZE_PIXELS BOID_NEAREST_ENEMY_RADIUS
+#define WORLD_SIZE {10024, 10024}
 
 // <======================================== STRUCTURES AND TYPEDEFS =======================================>
 
@@ -156,11 +158,11 @@ void FillGrid(Grid *grid, Boid *boids, BoidIndex boidsCount) {
 }
 
 // Add data to the grid, completely refill chunks (delete and recrate all chunks)
-void InitGrid(Grid *grid, Boid *boids, BoidIndex boidsCount, int screenWidth, int screenHeight) {
-    grid->screenWidth = screenWidth;
-    grid->screenHeight = screenHeight;
-    grid->cols = (uint16_t)(screenWidth/CHUNK_SIZE_PIXELS) + 1;
-    grid->rows = (uint16_t)(screenHeight/CHUNK_SIZE_PIXELS) + 1;
+void InitGrid(Grid *grid, Boid *boids, BoidIndex boidsCount, int width, int height) {
+    grid->screenWidth = width;
+    grid->screenHeight = height;
+    grid->cols = (uint16_t)(width/CHUNK_SIZE_PIXELS) + 1;
+    grid->rows = (uint16_t)(height/CHUNK_SIZE_PIXELS) + 1;
     grid->chunksCount = grid->rows * grid->cols;
 
     if (grid->chunks != NULL) {
@@ -174,14 +176,14 @@ void InitGrid(Grid *grid, Boid *boids, BoidIndex boidsCount, int screenWidth, in
 // <================================================= BOIDS ================================================>
 
 // Push the boid away from the bound
-void BoidBound(Boid *boid, int screenWidth, int screenHeight) {
+void BoidBound(Boid *boid, int width, int height) {
     if (boid->pos.x < BOID_BOUND_PADDING)
         boid->velocity.x += BOID_BOUND_FACTOR;
-    else if (boid->pos.x > screenWidth-BOID_BOUND_PADDING)
+    else if (boid->pos.x > width-BOID_BOUND_PADDING)
         boid->velocity.x -= BOID_BOUND_FACTOR;
     if (boid->pos.y < BOID_BOUND_PADDING)
         boid->velocity.y += BOID_BOUND_FACTOR;
-    else if (boid->pos.y > screenHeight-BOID_BOUND_PADDING)
+    else if (boid->pos.y > height-BOID_BOUND_PADDING)
         boid->velocity.y -= BOID_BOUND_FACTOR;
 }
 
@@ -510,7 +512,13 @@ int main(int argc, char *argv[]) {
     // }
 
     Grid grid = { 0 }; // Grid of chunks
-    InitGrid(&grid, boids, boidsCount, GetScreenWidth(), GetScreenHeight());
+    struct {
+        int x;
+        int y;
+    } world_size = WORLD_SIZE;
+    bool is_dragging_border = false;
+
+    InitGrid(&grid, boids, boidsCount, world_size.x, world_size.y);
     printf("Chunks: %dx%d\n", grid.cols, grid.rows);
 
     // Camera
@@ -559,7 +567,7 @@ int main(int argc, char *argv[]) {
             float scale = 0.2f*wheel;
             camera.zoom = Clamp(expf(logf(camera.zoom)+scale), 0.125f, 64.0f);
         }
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        if (!is_dragging_border && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             Vector2 delta = GetMouseDelta();
             delta = Vector2Scale(delta, -1.0f/camera.zoom);
             camera.target = Vector2Add(camera.target, delta);
@@ -568,6 +576,20 @@ int main(int argc, char *argv[]) {
         Vector2 mousePosition = GetScreenToWorld2D(GetMousePosition(), camera);
         int screenWidth = GetScreenWidth();
         int screenHeight = GetScreenHeight();
+
+        // move border
+        if (is_dragging_border) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                world_size.x = (int)mousePosition.x;
+                world_size.y = (int)mousePosition.y;
+                world_size.x = world_size.x > 100? world_size.x : 100;
+                world_size.y = world_size.y > 100? world_size.y : 100;
+            } else {
+                is_dragging_border = false;
+            }
+        } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && Vector2Distance(mousePosition, (Vector2){world_size.x, world_size.y}) <= 50) {
+            is_dragging_border = true;
+        }
 
         // Spawn boids
         if ((!selectMode) && (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) && (boidsCount < MAX_BOIDS_COUNT)) {
@@ -604,7 +626,7 @@ int main(int argc, char *argv[]) {
         // Update boids
         if (!pause) {
             if ((grid.screenWidth != screenWidth) || (grid.screenHeight != screenHeight))
-                InitGrid(&grid, boids, boidsCount, screenWidth, screenHeight);
+                InitGrid(&grid, boids, boidsCount, world_size.x, world_size.y);
 
             for (BoidIndex i = 0; i < boidsCount; i++) {
                 Boid *boid = &boids[i];
@@ -613,7 +635,7 @@ int main(int argc, char *argv[]) {
 
                 if (boid->action != ACT_SURRENDER && boid->action != ACT_FALL && boid->action != ACT_DELETE) {
                     BoidNormalSpeed(boid);
-                    BoidBound(boid, screenWidth, screenHeight);
+                    BoidBound(boid, world_size.x, world_size.y);
 
                     boid->direction.x = boid->direction.x*0.97f + boid->velocity.x*0.03f;
                     boid->direction.y = boid->direction.y*0.97f + boid->velocity.y*0.03f;
@@ -682,6 +704,9 @@ int main(int argc, char *argv[]) {
                 if (boid->sprite == SPRITE_FALL)
                     DrawBoid(boid, texture);
             }
+
+            DrawRectangleLines(0, 0, world_size.x, world_size.y, BLACK);
+            DrawCircle(world_size.x, world_size.y, 50 + 10*is_dragging_border, BLACK);
 
             // Draw selection
             for (BoidIndex i = 0; i < boidsCount; i++) {
