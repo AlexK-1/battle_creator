@@ -540,6 +540,8 @@ int main(int argc, char *argv[]) {
     GenTextureMipmaps(&texture);
     SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
 
+    Vector2 prev_mousePosition = {0};
+
     while (!WindowShouldClose()) {
         // Keys
         if (IsKeyPressed(KEY_SPACE)) pause = !pause;
@@ -592,23 +594,37 @@ int main(int argc, char *argv[]) {
         }
 
         // Spawn boids
-        if ((!selectMode) && (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) && (boidsCount < MAX_BOIDS_COUNT)) {
-            Boid newBoid = { 0 };
-            newBoid.pos = mousePosition;
-            if (action == ACT_STOP) {
-                newBoid.direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
-            } else {
-                newBoid.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
-                newBoid.direction = newBoid.velocity;
-            }
-            newBoid.speed = GetRandomValue(90, 150)/100.0;
-            newBoid.health = BOID_MAX_HEALTH;
-            newBoid.xp = GetRandomValue(0, 5);
-            newBoid.action = action;
-            newBoid.team = team;
+        static Vector2 prev_pos = {INFINITY, INFINITY};
+        if ((!selectMode) && (IsMouseButtonDown(MOUSE_RIGHT_BUTTON)) && (boidsCount < MAX_BOIDS_COUNT)) {
+            const int lerp_amt = 10;
+            for (int i = 0; i < lerp_amt; i++) {
+                Vector2 pos = Vector2Lerp(prev_mousePosition, mousePosition, (float)i/lerp_amt);
+                if (pos.x < 0 || pos.y < 0 || pos.x > world_size.x || pos.y > world_size.y)
+                    continue;
+                if (Vector2Distance(prev_pos, pos) >= 100) {
+                    prev_pos = pos;
+                } else continue;
 
-            boids[boidsCount++] = newBoid;
+                Boid newBoid = { 0 };
+                newBoid.pos = pos;
+                if (action == ACT_STOP) {
+                    newBoid.direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+                } else {
+                    newBoid.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+                    newBoid.direction = newBoid.velocity;
+                }
+                newBoid.speed = GetRandomValue(90, 150)/100.0;
+                newBoid.health = BOID_MAX_HEALTH;
+                newBoid.xp = GetRandomValue(0, 5);
+                newBoid.action = action;
+                newBoid.team = team;
+
+                boids[boidsCount++] = newBoid;
+            }
         }
+
+        if (IsMouseButtonReleased(MOUSE_RIGHT_BUTTON))
+            prev_pos = (Vector2){INFINITY, INFINITY};
 
         // Select boids
         if (selectMode) {
@@ -765,6 +781,7 @@ int main(int argc, char *argv[]) {
             
 
         EndDrawing();
+        prev_mousePosition = mousePosition;
     }
 
     UnloadTexture(texture);
