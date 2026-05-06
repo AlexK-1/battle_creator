@@ -4,6 +4,7 @@
 #include <math.h>
 #include <raylib.h>
 #include <raymath.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,7 @@
 
 #define CHUNK_SIZE_BOIDS 1024
 #define CHUNK_SIZE_PIXELS BOID_NEAREST_ENEMY_RADIUS
+#define WORLD_SIZE {10024, 10024}
 
 // <======================================== STRUCTURES AND TYPEDEFS =======================================>
 
@@ -156,11 +158,11 @@ void FillGrid(Grid *grid, Boid *boids, BoidIndex boidsCount) {
 }
 
 // Add data to the grid, completely refill chunks (delete and recrate all chunks)
-void InitGrid(Grid *grid, Boid *boids, BoidIndex boidsCount, int screenWidth, int screenHeight) {
-    grid->screenWidth = screenWidth;
-    grid->screenHeight = screenHeight;
-    grid->cols = (uint16_t)(screenWidth/CHUNK_SIZE_PIXELS) + 1;
-    grid->rows = (uint16_t)(screenHeight/CHUNK_SIZE_PIXELS) + 1;
+void InitGrid(Grid *grid, Boid *boids, BoidIndex boidsCount, int width, int height) {
+    grid->screenWidth = width;
+    grid->screenHeight = height;
+    grid->cols = (uint16_t)(width/CHUNK_SIZE_PIXELS) + 1;
+    grid->rows = (uint16_t)(height/CHUNK_SIZE_PIXELS) + 1;
     grid->chunksCount = grid->rows * grid->cols;
 
     if (grid->chunks != NULL) {
@@ -174,14 +176,14 @@ void InitGrid(Grid *grid, Boid *boids, BoidIndex boidsCount, int screenWidth, in
 // <================================================= BOIDS ================================================>
 
 // Push the boid away from the bound
-void BoidBound(Boid *boid, int screenWidth, int screenHeight) {
+void BoidBound(Boid *boid, int width, int height) {
     if (boid->pos.x < BOID_BOUND_PADDING)
         boid->velocity.x += BOID_BOUND_FACTOR;
-    else if (boid->pos.x > screenWidth-BOID_BOUND_PADDING)
+    else if (boid->pos.x > width-BOID_BOUND_PADDING)
         boid->velocity.x -= BOID_BOUND_FACTOR;
     if (boid->pos.y < BOID_BOUND_PADDING)
         boid->velocity.y += BOID_BOUND_FACTOR;
-    else if (boid->pos.y > screenHeight-BOID_BOUND_PADDING)
+    else if (boid->pos.y > height-BOID_BOUND_PADDING)
         boid->velocity.y -= BOID_BOUND_FACTOR;
 }
 
@@ -510,7 +512,13 @@ int main(int argc, char *argv[]) {
     // }
 
     Grid grid = { 0 }; // Grid of chunks
-    InitGrid(&grid, boids, boidsCount, GetScreenWidth(), GetScreenHeight());
+    struct {
+        int x;
+        int y;
+    } world_size = WORLD_SIZE;
+    bool is_dragging_border = false;
+
+    InitGrid(&grid, boids, boidsCount, world_size.x, world_size.y);
     printf("Chunks: %dx%d\n", grid.cols, grid.rows);
 
     // Camera
@@ -531,6 +539,8 @@ int main(int argc, char *argv[]) {
     Texture2D texture = LoadTexture("resources/texture.png");
     GenTextureMipmaps(&texture);
     SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+
+    Vector2 prev_mousePosition = {0};
 
     while (!WindowShouldClose()) {
         // Keys
@@ -559,7 +569,7 @@ int main(int argc, char *argv[]) {
             float scale = 0.2f*wheel;
             camera.zoom = Clamp(expf(logf(camera.zoom)+scale), 0.125f, 64.0f);
         }
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        if (!is_dragging_border && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             Vector2 delta = GetMouseDelta();
             delta = Vector2Scale(delta, -1.0f/camera.zoom);
             camera.target = Vector2Add(camera.target, delta);
@@ -569,24 +579,52 @@ int main(int argc, char *argv[]) {
         int screenWidth = GetScreenWidth();
         int screenHeight = GetScreenHeight();
 
-        // Spawn boids
-        if ((!selectMode) && (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) && (boidsCount < MAX_BOIDS_COUNT)) {
-            Boid newBoid = { 0 };
-            newBoid.pos = mousePosition;
-            if (action == ACT_STOP) {
-                newBoid.direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+        // move border
+        if (is_dragging_border) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                world_size.x = (int)mousePosition.x;
+                world_size.y = (int)mousePosition.y;
+                world_size.x = world_size.x > 100? world_size.x : 100;
+                world_size.y = world_size.y > 100? world_size.y : 100;
             } else {
-                newBoid.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
-                newBoid.direction = newBoid.velocity;
+                is_dragging_border = false;
             }
-            newBoid.speed = GetRandomValue(90, 150)/100.0;
-            newBoid.health = BOID_MAX_HEALTH;
-            newBoid.xp = GetRandomValue(0, 5);
-            newBoid.action = action;
-            newBoid.team = team;
-
-            boids[boidsCount++] = newBoid;
+        } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && Vector2Distance(mousePosition, (Vector2){world_size.x, world_size.y}) <= 50) {
+            is_dragging_border = true;
         }
+
+        // Spawn boids
+        static Vector2 prev_pos = {INFINITY, INFINITY};
+        if ((!selectMode) && (IsMouseButtonDown(MOUSE_RIGHT_BUTTON)) && (boidsCount < MAX_BOIDS_COUNT)) {
+            const int lerp_amt = 10;
+            for (int i = 0; i < lerp_amt; i++) {
+                Vector2 pos = Vector2Lerp(prev_mousePosition, mousePosition, (float)i/lerp_amt);
+                if (pos.x < 0 || pos.y < 0 || pos.x > world_size.x || pos.y > world_size.y)
+                    continue;
+                if (Vector2Distance(prev_pos, pos) >= 100) {
+                    prev_pos = pos;
+                } else continue;
+
+                Boid newBoid = { 0 };
+                newBoid.pos = pos;
+                if (action == ACT_STOP) {
+                    newBoid.direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+                } else {
+                    newBoid.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+                    newBoid.direction = newBoid.velocity;
+                }
+                newBoid.speed = GetRandomValue(90, 150)/100.0;
+                newBoid.health = BOID_MAX_HEALTH;
+                newBoid.xp = GetRandomValue(0, 5);
+                newBoid.action = action;
+                newBoid.team = team;
+
+                boids[boidsCount++] = newBoid;
+            }
+        }
+
+        if (IsMouseButtonReleased(MOUSE_RIGHT_BUTTON))
+            prev_pos = (Vector2){INFINITY, INFINITY};
 
         // Select boids
         if (selectMode) {
@@ -604,7 +642,7 @@ int main(int argc, char *argv[]) {
         // Update boids
         if (!pause) {
             if ((grid.screenWidth != screenWidth) || (grid.screenHeight != screenHeight))
-                InitGrid(&grid, boids, boidsCount, screenWidth, screenHeight);
+                InitGrid(&grid, boids, boidsCount, world_size.x, world_size.y);
 
             for (BoidIndex i = 0; i < boidsCount; i++) {
                 Boid *boid = &boids[i];
@@ -613,7 +651,7 @@ int main(int argc, char *argv[]) {
 
                 if (boid->action != ACT_SURRENDER && boid->action != ACT_FALL && boid->action != ACT_DELETE) {
                     BoidNormalSpeed(boid);
-                    BoidBound(boid, screenWidth, screenHeight);
+                    BoidBound(boid, world_size.x, world_size.y);
 
                     boid->direction.x = boid->direction.x*0.97f + boid->velocity.x*0.03f;
                     boid->direction.y = boid->direction.y*0.97f + boid->velocity.y*0.03f;
@@ -683,6 +721,9 @@ int main(int argc, char *argv[]) {
                     DrawBoid(boid, texture);
             }
 
+            DrawRectangleLines(0, 0, world_size.x, world_size.y, BLACK);
+            DrawCircle(world_size.x, world_size.y, 50 + 10*is_dragging_border, BLACK);
+
             // Draw selection
             for (BoidIndex i = 0; i < boidsCount; i++) {
                 Boid *boid = &boids[i];
@@ -740,6 +781,7 @@ int main(int argc, char *argv[]) {
             
 
         EndDrawing();
+        prev_mousePosition = mousePosition;
     }
 
     UnloadTexture(texture);
