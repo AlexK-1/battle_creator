@@ -19,7 +19,7 @@
 #define BOID_MIN_SPEED 0.4f
 #define BOID_MAX_HEALTH 100
 #define BOID_MAX_XP 30
-#define BOID_HEALTH_REGEN_INTERVAL 30
+#define BOID_HEALTH_REGEN_INTERVAL 10
 #define BOID_SIZE 75
 
 #define BOID_BOUND_PADDING 50
@@ -460,9 +460,6 @@ void DrawBoid(Boid *boid, Texture2D texture) {
          [SPRITE_FALL] = {1120, 0, 265, 203},
     };
 
-    if (boid->action == ACT_DELETE)
-        return;
-    
     Rectangle sprite = sprites[boid->sprite];
     sprite.y += 260 * boid->team;
     
@@ -536,7 +533,7 @@ int main(int argc, char *argv[]) {
     camera.zoom = 1.0f;
 
     // Control
-    bool pause = false;
+    bool pause = false, showHealth = false;
     BoidAction action = ACT_STOP;
     BoidTeam team = TEAM_RED;
 
@@ -578,9 +575,9 @@ int main(int argc, char *argv[]) {
         else if (IsKeyPressed(KEY_TWO)) action = ACT_ATTACK, changeBoidAction = selectMode;
         else if (IsKeyPressed(KEY_THREE)) action = ACT_RETREAT, changeBoidAction = selectMode;
         if (IsKeyPressed(KEY_X) && (mode == MODE_SELECT)) deleteBoid = true;
-        if (mode == MODE_SELECT) {
+        if (mode == MODE_SELECT)
             selectingShiftPressed |= IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-        }
+        if (IsKeyPressed(KEY_H)) showHealth = !showHealth;
 
         Vector2 mousePosition = GetScreenToWorld2D(GetMousePosition(), camera);
         int screenWidth = GetScreenWidth();
@@ -637,7 +634,7 @@ int main(int argc, char *argv[]) {
                     newBoid.direction = newBoid.velocity;
                 }
                 newBoid.speed = GetRandomValue(90, 150)/100.0;
-                newBoid.health = BOID_MAX_HEALTH;
+                newBoid.health = GetRandomValue(BOID_MAX_HEALTH*0.8, BOID_MAX_HEALTH);
                 newBoid.xp = GetRandomValue(0, 5);
                 newBoid.action = action;
                 newBoid.team = team;
@@ -686,10 +683,12 @@ int main(int argc, char *argv[]) {
 
             for (BoidIndex i = 0; i < boidsCount; i++) {
                 Boid *boid = &boids[i];
+
+                if (boid->action == ACT_DELETE) continue;
             
                 UpdateBoid(boids, &grid, boidsCount, i);
 
-                if (boid->action != ACT_SURRENDER && boid->action != ACT_FALL && boid->action != ACT_DELETE) {
+                if (boid->action != ACT_SURRENDER && boid->action != ACT_FALL) {
                     BoidNormalSpeed(boid);
                     BoidBound(boid, world_size.x, world_size.y);
 
@@ -786,9 +785,10 @@ int main(int argc, char *argv[]) {
             // Draw boids
             for (BoidIndex i = 0; i < boidsCount; i++) {
                 Boid *boid = &boids[i];
-                if (boid->sprite != SPRITE_FALL) {
+                if ((boid->sprite != SPRITE_FALL) && (boid->action != ACT_DELETE)) {
                     DrawBoid(boid, texture);
-                    // DrawText(TextFormat("%d", boid->health), boid->pos.x, boid->pos.y + 40, 20, BLACK);
+                    if (showHealth)
+                        DrawText(TextFormat("%d", boid->health), boid->pos.x - 5 - ((int)log10(boid->health) * 7), boid->pos.y - 50, 20, BLACK);
                 }
             }
 
