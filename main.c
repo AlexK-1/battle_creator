@@ -48,12 +48,13 @@
 #define BOID_FOR_SURRENDER_VALUE 20
 
 #define BOID_BOUND_FACTOR 0.9f
-#define BOID_AVOID_FACTOR 0.02f
+#define BOID_AVOID_FACTOR 0.03f
 #define BOID_ALIGNMENT_FACTOR 0.01f
 #define BOID_COHESION_FACTOR 0.0001f
 #define BOID_ATTACK_FACTOR 0.001f
 #define BOID_FIGHTING_FACTOR 0.001f
-#define BOID_RETREAT_FACTOR 0.02f
+#define BOID_RETREAT_FACTOR 0.01f
+#define BOID_ORDER_FACTOR 0.2f
 
 #define BOID_AVOID_RADIUS_SQ (BOID_AVOID_RADIUS * BOID_AVOID_RADIUS)
 #define BOID_VISIBLE_RADIUS_SQ (BOID_VISIBLE_RADIUS * BOID_VISIBLE_RADIUS)
@@ -97,7 +98,7 @@ typedef enum {
 #define SPRITES_COUNT 8
 
 typedef struct {
-    Vector2 pos, velocity, direction;
+    Vector2 pos, velocity, direction, orderVector;
     float speed;
     int8_t health;
     uint8_t xp, fightingTimer, spriteTimer;
@@ -105,7 +106,7 @@ typedef struct {
     BoidTeam team;
     BoidAction action;
     BoidSprite sprite;
-    bool isFighting, isSelected;
+    bool isFighting, isSelected, isExecutingOrder;
 } Boid;
 
 typedef uint16_t BoidIndex;
@@ -113,7 +114,7 @@ typedef uint16_t ChunkSize;
 
 typedef struct {
     BoidIndex boids[CHUNK_SIZE_BOIDS]; // Array of boids
-    ChunkSize count; // Boids count
+    ChunkSize count; // Number of boids in the chunk
 } Chunk;
 
 typedef struct {
@@ -125,7 +126,7 @@ typedef struct {
 
 // <============================================ GRID AND CHUNKS ===========================================>
 
-// Fill the chunks with zeros (clear)
+// Clear all chunks (set counts to zero)
 void ClearGrid(Grid *grid) {
     for (uint32_t i = 0; i < grid->chunksCount; i++) {
         grid->chunks[i].count = 0;
@@ -157,7 +158,7 @@ void FillGrid(Grid *grid, Boid *boids, BoidIndex boidsCount) {
     }
 }
 
-// Add data to the grid, completely refill chunks (delete and recrate all chunks)
+// Initialize grid and fully rebuild chunks (delete and recreate all chunks)
 void InitGrid(Grid *grid, Boid *boids, BoidIndex boidsCount, int width, int height) {
     grid->screenWidth = width;
     grid->screenHeight = height;
@@ -187,7 +188,7 @@ void BoidBound(Boid *boid, int width, int height) {
         boid->velocity.y -= BOID_BOUND_FACTOR;
 }
 
-// Speed up or slow down the boid so that its speed is between BOID_MIN_SPEED and BOID_MAX_SPEED
+// Adjust boid velocity so its speed stays within [BOID_MIN_SPEED, BOID_MAX_SPEED]
 void BoidNormalSpeed(Boid *boid) {
     float speed = Vector2Length(boid->velocity);
     if (speed > BOID_MAX_SPEED)
@@ -202,7 +203,7 @@ void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidInd
     if (boid->action == ACT_DELETE)
         return;
 
-    // Skip if surrending or falled
+    // Skip if surrendering or fallen
     if (boid->action == ACT_FALL) {
         boid->velocity = (Vector2){ 0 };
         boid->sprite = SPRITE_FALL;
@@ -219,7 +220,7 @@ void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidInd
         return;
     }
 
-    // Determine a fall
+    // Determine if the boid should fall
     if (boid->health <= 0) {
         boid->action = ACT_FALL;
         boid->sprite = SPRITE_FALL;
@@ -240,15 +241,16 @@ void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidInd
     // }
 
     Vector2 close = { 0 }; // Avoid vector
-    BoidIndex teamsBoidsCount[TEAMS_COUNT] = { 0 }, teamsCloseBoidsCount[TEAMS_COUNT] = { 0 }; // Boids count by teams
+    BoidIndex teamsBoidsCount[TEAMS_COUNT] = { 0 }, teamsCloseBoidsCount[TEAMS_COUNT] = { 0 }; // Boids counts per teams
     Vector2 neighborsVelocity = { 0 }; // Alignment velocity vector
     Vector2 neighborsPos = { 0 }; // Cohesion position vector
 
     Vector2 nearestEnemyPos = { 0 };
-    Vector2 closeEnemiesPos = { 0 }; // Sum of vectors of enemies positions for retreat
+    Vector2 closeEnemiesPos = { 0 }; // Sum of enemy direction vectors for retreat
     float nearestEnemyDistanceSqr = INFINITY;
     Boid *nearestEnemy = NULL;
-    // Position limitation by screen size
+
+    // Clamp position within bounds
     Vector2 pos = boid->pos;
     if (pos.x < 0) pos.x = 0;
     else if (pos.x > grid->screenWidth) pos.x = grid->screenWidth;
@@ -267,14 +269,14 @@ void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidInd
             uint32_t chunkIndex = x + y*grid->cols;
             Chunk *chunk = &grid->chunks[chunkIndex];
 
-            // Processing boids from neighboring chunks
+            // Process boids from neighboring chunks
             for (size_t i = 0; i < chunk->count; i++) {
                 BoidIndex otherBoidIndex = chunk->boids[i];
                 if (otherBoidIndex == boidIndex) continue;
 
                 Boid *otherBoid = &boids[otherBoidIndex];
 
-                // Skip surrending and falled boids
+                // Skip surrendering and fallen boids
                 if (otherBoid->action == ACT_SURRENDER || otherBoid->action == ACT_FALL) continue;
         
                 Vector2 distanceV = Vector2Subtract(boid->pos, otherBoid->pos);
@@ -392,12 +394,19 @@ void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidInd
         }
     }
     
-    // Include yourself
+    // Include self in teammate counts
     allTeammatesCount++;
     closeTeammatesCount++;
 
-    if (boid->orderTimer > 0) boid->orderTimer--;
-    if (boid->orderTimer == 0) {
+    if (boid->orderTimer > 0) {
+        boid->orderTimer--;
+
+        // Change direction by order
+        if (boid->isExecutingOrder) {
+            boid->velocity = Vector2Add(boid->velocity, Vector2Scale(boid->orderVector, BOID_ORDER_FACTOR));
+        }
+    }
+    if (boid->orderTimer == 0) { // Behavior of the boid may change some time after last order.
         // Determine retreat
         if ((closeEnemiesCount >= BOID_FOR_RETREAT_MIN) &&
             ((float)closeEnemiesCount / closeTeammatesCount >= BOID_FOR_RETREAT_VALUE)) {
@@ -491,6 +500,7 @@ int main(int argc, char *argv[]) {
     SetTraceLogLevel(LOG_WARNING);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     SetConfigFlags(FLAG_FULLSCREEN_MODE);
+    SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Battle creator");
     SetTargetFPS(60);
 
@@ -530,10 +540,20 @@ int main(int argc, char *argv[]) {
     BoidAction action = ACT_STOP;
     BoidTeam team = TEAM_RED;
 
+    enum {
+        MODE_SPAWN,
+        MODE_SELECT,
+        MODE_DIRECTION,
+        MODE_POINT,
+    } mode = MODE_SPAWN;
+
     bool selectMode = false, selecting = false,
          changeBoidAction = false, changeSelectionTeam = false,
          deleteBoid = false, selectingShiftPressed = false;
     Vector2 selectionStart = { 0 };
+
+    bool showArrow = false, changeBoidDirection = false;
+    Vector2 arrowStart = { 0 };
 
     // Textures
     Texture2D texture = LoadTexture("resources/texture.png");
@@ -545,7 +565,10 @@ int main(int argc, char *argv[]) {
     while (!WindowShouldClose()) {
         // Keys
         if (IsKeyPressed(KEY_SPACE)) pause = !pause;
-        if (IsKeyPressed(KEY_S)) selectMode = !selectMode, selecting = false, selectingShiftPressed = false;
+        if (IsKeyPressed(KEY_A)) mode = MODE_SPAWN, selectMode = false;
+        if (IsKeyPressed(KEY_S)) mode = MODE_SELECT, selectMode = true, selecting = false, selectingShiftPressed = false;
+        if (IsKeyPressed(KEY_D)) mode = MODE_DIRECTION, selectMode = true;
+        if (IsKeyPressed(KEY_F)) mode = MODE_POINT, selectMode = true;
         if (IsKeyPressed(KEY_Q)) team = 0, changeSelectionTeam = selectMode;
         else if (IsKeyPressed(KEY_W)) team = 1, changeSelectionTeam = selectMode;
         else if (IsKeyPressed(KEY_E)) team = 2, changeSelectionTeam = selectMode;
@@ -554,18 +577,22 @@ int main(int argc, char *argv[]) {
         if (IsKeyPressed(KEY_ONE)) action = ACT_STOP, changeBoidAction = selectMode;
         else if (IsKeyPressed(KEY_TWO)) action = ACT_ATTACK, changeBoidAction = selectMode;
         else if (IsKeyPressed(KEY_THREE)) action = ACT_RETREAT, changeBoidAction = selectMode;
-        if (IsKeyPressed(KEY_X) && selectMode) deleteBoid = true;
-        if (selectMode)
+        if (IsKeyPressed(KEY_X) && (mode == MODE_SELECT)) deleteBoid = true;
+        if (mode == MODE_SELECT) {
             selectingShiftPressed |= IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        }
+
+        Vector2 mousePosition = GetScreenToWorld2D(GetMousePosition(), camera);
+        int screenWidth = GetScreenWidth();
+        int screenHeight = GetScreenHeight();
 
         // Camera
         float wheel = GetMouseWheelMove();
         if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) wheel = -1.0;
         if (IsKeyPressed(KEY_KP_ADD) || (IsKeyPressed(KEY_EQUAL) && (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)))) wheel = 1.0;
         if (wheel != 0) {
-            Vector2 mouseWorldPos = GetScreenToWorld2D(GetMousePosition(), camera);
             camera.offset = GetMousePosition();
-            camera.target = mouseWorldPos;
+            camera.target = mousePosition;
             float scale = 0.2f*wheel;
             camera.zoom = Clamp(expf(logf(camera.zoom)+scale), 0.125f, 64.0f);
         }
@@ -574,10 +601,6 @@ int main(int argc, char *argv[]) {
             delta = Vector2Scale(delta, -1.0f/camera.zoom);
             camera.target = Vector2Add(camera.target, delta);
         }
-
-        Vector2 mousePosition = GetScreenToWorld2D(GetMousePosition(), camera);
-        int screenWidth = GetScreenWidth();
-        int screenHeight = GetScreenHeight();
 
         // move border
         if (is_dragging_border) {
@@ -595,7 +618,7 @@ int main(int argc, char *argv[]) {
 
         // Spawn boids
         static Vector2 prev_pos = {INFINITY, INFINITY};
-        if ((!selectMode) && (IsMouseButtonDown(MOUSE_RIGHT_BUTTON)) && (boidsCount < MAX_BOIDS_COUNT)) {
+        if ((mode == MODE_SPAWN) && IsMouseButtonDown(MOUSE_RIGHT_BUTTON) && (boidsCount < MAX_BOIDS_COUNT)) {
             const int lerp_amt = 10;
             for (int i = 0; i < lerp_amt; i++) {
                 Vector2 pos = Vector2Lerp(prev_mousePosition, mousePosition, (float)i/lerp_amt);
@@ -627,7 +650,7 @@ int main(int argc, char *argv[]) {
             prev_pos = (Vector2){INFINITY, INFINITY};
 
         // Select boids
-        if (selectMode) {
+        if (mode == MODE_SELECT) {
             if (IsMouseButtonDown(MOUSE_RIGHT_BUTTON)) {
                 if (!selecting) {
                     selecting = true;
@@ -637,6 +660,23 @@ int main(int argc, char *argv[]) {
                 selecting = false;
                 selectingShiftPressed = false;
             }
+        }
+
+        // Direction mode
+        if (mode == MODE_DIRECTION) {
+            showArrow = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+            if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) {
+                // directionMode = false;
+                showArrow = false;
+                changeBoidDirection = true;
+            }
+            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
+                arrowStart = mousePosition;
+        }
+
+        if (mode == MODE_POINT) {
+            if (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON))
+                changeBoidDirection= true;
         }
 
         // Update boids
@@ -667,46 +707,57 @@ int main(int argc, char *argv[]) {
         }
 
         // Update boids selection
+        Vector2 arrowVector = Vector2Subtract(mousePosition, arrowStart);
+        Vector2 arrowVectorNorm = Vector2Normalize(arrowVector);
         BoidIndex selectedBoidsCount = 0;
-        for (BoidIndex i = 0; i < boidsCount; i++) {
-            Boid *boid = &boids[i];
-            if (boid->action != ACT_SURRENDER && boid->action != ACT_FALL && boid->action != ACT_DELETE) {
-                if (selecting) {
-                    boid->isSelected = (selectingShiftPressed && boid->isSelected) || (
-                                       (boid->pos.x > fmin(selectionStart.x, mousePosition.x)) &&
-                                       (boid->pos.x < fmax(selectionStart.x, mousePosition.x)) &&
-                                       (boid->pos.y > fmin(selectionStart.y, mousePosition.y)) &&
-                                       (boid->pos.y < fmax(selectionStart.y, mousePosition.y)));
-                }
-                if (!selectMode) {
-                    boid->isSelected = false;
-                }
+        if (selectMode) {
+            for (BoidIndex i = 0; i < boidsCount; i++) {
+                Boid *boid = &boids[i];
+                if (boid->action != ACT_SURRENDER && boid->action != ACT_FALL && boid->action != ACT_DELETE) {
+                    if (selecting) {
+                        boid->isSelected = (selectingShiftPressed && boid->isSelected) || (
+                                           (boid->pos.x > fmin(selectionStart.x, mousePosition.x)) &&
+                                           (boid->pos.x < fmax(selectionStart.x, mousePosition.x)) &&
+                                           (boid->pos.y > fmin(selectionStart.y, mousePosition.y)) &&
+                                           (boid->pos.y < fmax(selectionStart.y, mousePosition.y)));
+                    }
 
-                if (boid->isSelected) {
-                    if (deleteBoid) {
-                        boid->action = ACT_DELETE;
-                        continue;
-                    }
-                    if (changeBoidAction) {
-                        if ((boid->action == ACT_STOP) && (action != ACT_STOP)) // Randomize boid's speed, if it stops
-                            boid->velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+                    if (boid->isSelected) {
+                        if (deleteBoid) {
+                            boid->action = ACT_DELETE;
+                            boid->isSelected = false;
+                            continue;
+                        }
+                        if (changeBoidAction) {
+                            if ((boid->action == ACT_STOP) && (action != ACT_STOP)) // Randomize boid's speed, if it stops
+                                boid->velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
 
-                        boid->action = action;
-                        boid->orderTimer = GetRandomValue(5, 15)*60; // 5-15 seconds
-                        if (action == ACT_STOP) boid->sprite = SPRITE_NORMAL;
-                        if (action == ACT_ATTACK) boid->sprite = SPRITE_ANGRY;
-                        if (action == ACT_RETREAT) boid->sprite = SPRITE_SAD;
+                            boid->action = action;
+                            boid->orderTimer = GetRandomValue(5, 15)*60; // 5-15 seconds
+                            if (action == ACT_STOP) boid->sprite = SPRITE_NORMAL;
+                            if (action == ACT_ATTACK) boid->sprite = SPRITE_ANGRY;
+                            if (action == ACT_RETREAT) boid->sprite = SPRITE_SAD;
+                        }
+                        if (changeSelectionTeam) {
+                            boid->isSelected = (boid->team == team);
+                        }
+                        if (changeBoidDirection) {
+                            if (mode == MODE_DIRECTION)
+                                boid->orderVector = (Vector2LengthSqr(arrowVector) >= 40*40)? arrowVectorNorm : (Vector2){ 0 };
+                            else if (mode == MODE_POINT)
+                                boid->orderVector = Vector2Normalize(Vector2Subtract(mousePosition, boid->pos));
+                            boid->orderTimer = GetRandomValue(15, 30)*60; // 15-30 seconds
+                            boid->isExecutingOrder = true;
+                        }
                     }
-                    if (changeSelectionTeam) {
-                        boid->isSelected = (boid->team == team);
-                    }
+                    selectedBoidsCount += boid->isSelected;
                 }
-                selectedBoidsCount += boid->isSelected;
             }
+            changeBoidAction = false;
+            changeSelectionTeam = false;
+            changeBoidDirection = false;
+            deleteBoid = false;
         }
-        changeBoidAction = false;
-        changeSelectionTeam = false;
-        deleteBoid = false;
 
         // Drawing
         BeginDrawing();
@@ -714,7 +765,7 @@ int main(int argc, char *argv[]) {
             ClearBackground(RAYWHITE);
             BeginMode2D(camera);
 
-            // Draw falled boids
+            // Draw fallen boids
             for (BoidIndex i = 0; i < boidsCount; i++) {
                 Boid *boid = &boids[i];
                 if (boid->sprite == SPRITE_FALL)
@@ -741,20 +792,47 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            float thick = 5/camera.zoom;
+            
             // Drawing slection
             if (selecting) {
                 float rectangleX = fmin(selectionStart.x, mousePosition.x);
                 float rectangleY = fmin(selectionStart.y, mousePosition.y);
-                DrawText(TextFormat("%d", selectedBoidsCount), rectangleX, rectangleY-20, 20, BLACK);
+                DrawText(TextFormat("%d", selectedBoidsCount), rectangleX, rectangleY-(20/camera.zoom), 20/camera.zoom, BLACK);
                 DrawRectangleLinesEx((Rectangle){rectangleX, rectangleY,
                                      fabs(mousePosition.x - selectionStart.x), fabs(mousePosition.y - selectionStart.y)},
-                                 5/camera.zoom, BLACK);
+                                 thick, BLACK);
+            }
+
+            // Draw arrow
+            if (showArrow && (Vector2LengthSqr(arrowVector) >= powf(40/camera.zoom, 2))) {
+                DrawLineEx(arrowStart, mousePosition, thick, BLACK);
+                DrawLineEx(mousePosition, Vector2Add(mousePosition, Vector2Scale(Vector2Rotate(arrowVectorNorm,  160*DEG2RAD), 40/camera.zoom)), thick, BLACK);
+                DrawLineEx(mousePosition, Vector2Add(mousePosition, Vector2Scale(Vector2Rotate(arrowVectorNorm, -160*DEG2RAD), 40/camera.zoom)), thick, BLACK);
+            }
+
+            // Draw point
+            if (mode == MODE_POINT) {
+                DrawCircle(mousePosition.x, mousePosition.y, 20/camera.zoom, (Color){0, 0, 0, 50});
             }
 
             EndMode2D();
 
             // Draw "Paused" and "Mode" labels
-            DrawText(selectMode? "Mode: Select" : "Mode: Spawn", screenWidth - 140, 10, 20, BLACK);
+            switch (mode) {
+            case MODE_SPAWN:
+                DrawText("Mode: Spawn", screenWidth - 140, 10, 20, BLACK);
+                break;
+            case MODE_SELECT:
+                DrawText("Mode: Select", screenWidth - 140, 10, 20, BLACK);
+                break;
+            case MODE_DIRECTION:
+                DrawText("Mode: Direction", screenWidth - 165, 10, 20, BLACK);
+                break;
+            case MODE_POINT:
+                DrawText("Mode: Point", screenWidth - 130, 10, 20, BLACK);
+                break;
+            }
             if (pause)
                 DrawText("Paused", screenWidth - 85, 40, 20, BLACK);
 
@@ -765,7 +843,7 @@ int main(int argc, char *argv[]) {
             for (size_t i = 0; i < boidsCount; i++) {
                 Boid *otherBoid = &boids[i];
 
-                // Skip surrending and falled boids
+                // Skip surrendering and fallen boids
                 if (otherBoid->action == ACT_SURRENDER || otherBoid->action == ACT_FALL || otherBoid->action == ACT_DELETE)
                     continue;
 
