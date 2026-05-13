@@ -1,6 +1,5 @@
-// compile: cc main.c -lraylib -lm -O2
-
 #include <assert.h>
+#include <inttypes.h>
 #include <math.h>
 #include <raylib.h>
 #include <raymath.h>
@@ -9,18 +8,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "boids.h"
+#include "kdtree.h"
+
 // <======================================== MACROS AND DEFINITIONS ========================================>
 
 #define MAX_BOIDS_COUNT 10000
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 450
 
-#define BOID_MAX_SPEED 1.0f
-#define BOID_MIN_SPEED 0.4f
+#define BOID_MAX_SPEED 1.5f
+#define BOID_MIN_SPEED 0.7f
 #define BOID_MAX_HEALTH 100
 #define BOID_MAX_XP 30
-#define BOID_HEALTH_REGEN_INTERVAL 10
+#define BOID_HEALTH_REGEN_INTERVAL 20
 #define BOID_SIZE 75
+#define ORDER_LINE_MAX_POINT 64
 
 #define BOID_BOUND_PADDING 50
 #define BOID_AVOID_RADIUS 70
@@ -48,12 +51,12 @@
 #define BOID_FOR_SURRENDER_VALUE 20
 
 #define BOID_BOUND_FACTOR 0.9f
-#define BOID_AVOID_FACTOR 0.03f
+#define BOID_AVOID_FACTOR 0.04f
 #define BOID_ALIGNMENT_FACTOR 0.01f
 #define BOID_COHESION_FACTOR 0.0001f
 #define BOID_ATTACK_FACTOR 0.001f
 #define BOID_FIGHTING_FACTOR 0.001f
-#define BOID_RETREAT_FACTOR 0.01f
+#define BOID_RETREAT_FACTOR 0.001f
 #define BOID_ORDER_FACTOR 0.2f
 
 #define BOID_AVOID_RADIUS_SQ (BOID_AVOID_RADIUS * BOID_AVOID_RADIUS)
@@ -66,50 +69,8 @@
 #define CHUNK_SIZE_PIXELS BOID_NEAREST_ENEMY_RADIUS
 #define WORLD_SIZE {10024, 10024}
 
-// <======================================== STRUCTURES AND TYPEDEFS =======================================>
+// <============================================ GRID AND CHUNKS ===========================================>
 
-typedef enum {
-    TEAM_RED,
-    TEAM_BLUE,
-    TEAM_GREEN,
-    TEAM_YELLOW
-} BoidTeam;
-#define TEAMS_COUNT 4
-
-typedef enum {
-    ACT_STOP,
-    ACT_ATTACK,
-    ACT_RETREAT,
-    ACT_SURRENDER,
-    ACT_FALL,
-    ACT_DELETE
-} BoidAction;
-
-typedef enum {
-    SPRITE_NORMAL,
-    SPRITE_ANGRY,
-    SPRITE_HIT_LEFT,
-    SPRITE_HIT_RIGHT,
-    SPRITE_OUCH,
-    SPRITE_SAD,
-    SPRITE_SURRENDER,
-    SPRITE_FALL
-} BoidSprite;
-#define SPRITES_COUNT 8
-
-typedef struct {
-    Vector2 pos, velocity, direction, orderVector;
-    float speed;
-    int8_t health;
-    uint8_t xp, fightingTimer, spriteTimer;
-    uint16_t timer, orderTimer;
-    BoidTeam team;
-    BoidAction action;
-    BoidSprite sprite;
-    bool isFighting, isSelected, isExecutingOrder;
-} Boid;
-
-typedef uint16_t BoidIndex;
 typedef uint16_t ChunkSize;
 
 typedef struct {
@@ -123,8 +84,6 @@ typedef struct {
     uint16_t rows, cols; // Number of chunks by width/height
     uint32_t chunksCount;
 } Grid;
-
-// <============================================ GRID AND CHUNKS ===========================================>
 
 // Clear all chunks (set counts to zero)
 void ClearGrid(Grid *grid) {
@@ -402,9 +361,12 @@ void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidInd
         boid->orderTimer--;
 
         // Change direction by order
-        if (boid->isExecutingOrder) {
-            boid->velocity = Vector2Add(boid->velocity, Vector2Scale(boid->orderVector, BOID_ORDER_FACTOR));
-        }
+        Vector2 direction = { 0 };
+        if (boid->directionOrder)
+            direction = boid->orderVector;
+        else if (boid->pointOrder)
+            direction = Vector2Normalize(Vector2Subtract(boid->orderVector, boid->pos));
+        boid->velocity = Vector2Add(boid->velocity, Vector2Scale(direction, BOID_ORDER_FACTOR));
     }
     if (boid->orderTimer == 0) { // Behavior of the boid may change some time after last order.
         // Determine retreat
@@ -417,7 +379,7 @@ void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidInd
         // Determine stop
         if (boid->action == ACT_RETREAT) {
             boid->timer++;
-            if ((closeEnemiesCount == 0) && (boid->timer > 360)) { // 6 seconds
+            if ((closeEnemiesCount == 0) && (boid->timer > 6*60)) { // 6 seconds
                 boid->timer = 0;
                 boid->action = ACT_STOP;
                 boid->sprite = SPRITE_NORMAL;
@@ -426,15 +388,18 @@ void UpdateBoid(Boid *boids, Grid *grid, BoidIndex boidsCount, BoidIndex boidInd
             }
         } else if (boid->action == ACT_ATTACK) {
             boid->timer++;
-            if ((nearestEnemy != NULL) && (nearestEnemyDistanceSqr > BOID_STOP_RADIUS_SQ) && (boid->timer > 20*60)) { // 20 seconds
+            if (((nearestEnemy == NULL) || (nearestEnemyDistanceSqr < BOID_STOP_RADIUS_SQ)) && (boid->timer > 20*60)) { // 20 seconds
                 boid->timer = 0;
                 boid->action = ACT_STOP;
                 boid->sprite = SPRITE_NORMAL;
             } else if (closeEnemiesCount > 0) {
                 boid->timer = 0;
             }
-        
         }
+    }
+    if (boid->pointOrder && (boid->orderTimer > 0) && (Vector2DistanceSqr(boid->pos, boid->orderVector) < BOID_SIZE*BOID_SIZE)) {
+        boid->action = ACT_STOP;
+        boid->sprite = SPRITE_NORMAL;
     }
     
     // Determine surrender
@@ -504,6 +469,7 @@ int main(int argc, char *argv[]) {
     // Boids
     Boid boids[MAX_BOIDS_COUNT];
     BoidIndex boidsCount = 0;
+    printf("%u boids: %zuKB\n", MAX_BOIDS_COUNT, sizeof(boids)/1024);
     // for (BoidIndex i = 0; i < 10000; i++) {
     //     Boid newBoid = { 0 };
     //     newBoid.pos = (Vector2){GetRandomValue(0, GetScreenWidth()), GetRandomValue(0, GetScreenHeight())};
@@ -531,6 +497,7 @@ int main(int argc, char *argv[]) {
     // Camera
     Camera2D camera = { 0 };
     camera.zoom = 1.0f;
+    camera.target = (Vector2){world_size.x/2.0, world_size.y/2.0};
 
     // Control
     bool pause = false, showHealth = false;
@@ -542,15 +509,21 @@ int main(int argc, char *argv[]) {
         MODE_SELECT,
         MODE_DIRECTION,
         MODE_POINT,
+        MODE_LINE
     } mode = MODE_SPAWN;
 
-    bool selectMode = false, selecting = false,
+    bool selectMode = false, selecting = false, clearOrder = false,
          changeBoidAction = false, changeSelectionTeam = false,
          deleteBoid = false, selectingShiftPressed = false;
     Vector2 selectionStart = { 0 };
 
     bool showArrow = false, changeBoidDirection = false;
     Vector2 arrowStart = { 0 };
+
+    bool showLine = false;
+    Vector2 linePoints[ORDER_LINE_MAX_POINT];
+    uint8_t linePointsCount = 0;
+    float lineLen = 0;
 
     // Textures
     Texture2D texture = LoadTexture("resources/texture.png");
@@ -566,6 +539,7 @@ int main(int argc, char *argv[]) {
         if (IsKeyPressed(KEY_S)) mode = MODE_SELECT, selectMode = true, selecting = false, selectingShiftPressed = false;
         if (IsKeyPressed(KEY_D)) mode = MODE_DIRECTION, selectMode = true;
         if (IsKeyPressed(KEY_F)) mode = MODE_POINT, selectMode = true;
+        if (IsKeyPressed(KEY_G)) mode = MODE_LINE, selectMode = true, showLine = false;
         if (IsKeyPressed(KEY_Q)) team = 0, changeSelectionTeam = selectMode;
         else if (IsKeyPressed(KEY_W)) team = 1, changeSelectionTeam = selectMode;
         else if (IsKeyPressed(KEY_E)) team = 2, changeSelectionTeam = selectMode;
@@ -578,6 +552,8 @@ int main(int argc, char *argv[]) {
         if (mode == MODE_SELECT)
             selectingShiftPressed |= IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         if (IsKeyPressed(KEY_H)) showHealth = !showHealth;
+        if (IsKeyPressed(KEY_Z) && selectMode) clearOrder = true;
+        if (IsKeyPressed(KEY_T) && (mode == MODE_LINE)) changeBoidDirection = true, showLine = false;
 
         Vector2 mousePosition = GetScreenToWorld2D(GetMousePosition(), camera);
         int screenWidth = GetScreenWidth();
@@ -633,7 +609,7 @@ int main(int argc, char *argv[]) {
                     newBoid.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
                     newBoid.direction = newBoid.velocity;
                 }
-                newBoid.speed = GetRandomValue(90, 150)/100.0;
+                newBoid.speed = GetRandomValue(80, 130)/100.0;
                 newBoid.health = GetRandomValue(BOID_MAX_HEALTH*0.8, BOID_MAX_HEALTH);
                 newBoid.xp = GetRandomValue(0, 5);
                 newBoid.action = action;
@@ -671,9 +647,74 @@ int main(int argc, char *argv[]) {
                 arrowStart = mousePosition;
         }
 
+        // Point mode
         if (mode == MODE_POINT) {
             if (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON))
                 changeBoidDirection= true;
+        }
+
+        // Line mode
+        if (mode == MODE_LINE) {
+            // Building a line from segments
+            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+                if (showLine && (linePointsCount < ORDER_LINE_MAX_POINT)) {
+                    lineLen += Vector2Distance(mousePosition, linePoints[linePointsCount-1]);
+                    linePoints[linePointsCount++] = mousePosition;
+                } else if (!showLine) { // First point
+                    showLine = true;
+                    linePoints[0] = mousePosition;
+                    lineLen = 0;
+                    linePointsCount = 1;
+                }
+            }
+
+            if (changeBoidDirection) {
+                Boid **b = malloc(boidsCount * sizeof(Boid*)); // Array of selected boids
+                BoidIndex bc = 0;
+                for (BoidIndex i =0; i < boidsCount; i++) {
+                    Boid *boid = &boids[i];
+                    if (boid->isSelected && (boid->action != ACT_DELETE) && (boid->action != ACT_FALL) && (boid->action != ACT_SURRENDER)) {
+                        b[bc++] = boid;
+                        boid->isUsed = false; // isUsed == true if boid has already been placed on the line
+                    }
+                }
+                KDNode *tree = CreateKDTree(b, bc, 16); // k-d tree of boids
+
+                float interval = lineLen / (bc - 1), remains = 0;
+                BoidIndex pointIdx = 0;
+                Rectangle rec = {0, 0, world_size.x, world_size.y};
+
+                // Cycle for each segment
+                for (uint8_t segmentIdx = 1; segmentIdx < linePointsCount; segmentIdx++) {
+                    Vector2 segmentStart = linePoints[segmentIdx-1];
+                    Vector2 segmentEnd = linePoints[segmentIdx];
+                    Vector2 segmentDir = Vector2Normalize(Vector2Subtract(segmentEnd, segmentStart));
+                    segmentStart = Vector2Add(segmentStart, Vector2Scale(segmentDir, remains)); // Shift of the beginning of segment to the
+                                                                                                // remainder of previous segment
+
+                    float segmentLen = Vector2Distance(segmentEnd, segmentStart);
+                    BoidIndex segmentPointsCount = floorf(segmentLen / interval) + ((segmentLen > interval) || (segmentIdx == 0));
+
+                    Vector2 point = segmentStart;
+                    float pathLen = 0;
+                    // Placing boids on segment
+                    for (BoidIndex segmentPointIdx = 0; segmentPointIdx < segmentPointsCount; segmentPointIdx++, pointIdx++) {
+                        Boid *nearestBoid = FindNearestInKDTreeApprox(tree, point, rec);
+                        if (nearestBoid == NULL) break;
+                        nearestBoid->orderVector = point;
+                        nearestBoid->orderTimer = Vector2Distance(nearestBoid->pos, point) / BOID_MIN_SPEED;
+                        nearestBoid->isUsed = true;
+                        pathLen += interval;
+                        point = Vector2Add(point, Vector2Scale(segmentDir, interval));
+                    }
+                    remains = pathLen - segmentLen;
+                }
+
+                // printf("boids: %d | used: %d | remains: %d\n", bc, pointIdx, bc-pointIdx);
+
+                ClearKDTree(tree);
+                free(b);
+            }
         }
 
         // Update boids
@@ -727,26 +768,38 @@ int main(int argc, char *argv[]) {
                             boid->isSelected = false;
                             continue;
                         }
-                        if (changeBoidAction) {
-                            if ((boid->action == ACT_STOP) && (action != ACT_STOP)) // Randomize boid's speed, if it stops
-                                boid->velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+                        if (clearOrder) {
+                            boid->directionOrder = false;
+                            boid->pointOrder = false;
+                            boid->orderTimer = 0;
+                        } else {
+                            if (changeBoidAction) {
+                                if ((boid->action == ACT_STOP) && (action != ACT_STOP)) // Randomize boid's speed, if it stops
+                                    boid->velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
 
-                            boid->action = action;
-                            boid->orderTimer = GetRandomValue(5, 15)*60; // 5-15 seconds
-                            if (action == ACT_STOP) boid->sprite = SPRITE_NORMAL;
-                            if (action == ACT_ATTACK) boid->sprite = SPRITE_ANGRY;
-                            if (action == ACT_RETREAT) boid->sprite = SPRITE_SAD;
-                        }
-                        if (changeSelectionTeam) {
-                            boid->isSelected = (boid->team == team);
-                        }
-                        if (changeBoidDirection) {
-                            if (mode == MODE_DIRECTION)
-                                boid->orderVector = (Vector2LengthSqr(arrowVector) >= 40*40)? arrowVectorNorm : (Vector2){ 0 };
-                            else if (mode == MODE_POINT)
-                                boid->orderVector = Vector2Normalize(Vector2Subtract(mousePosition, boid->pos));
-                            boid->orderTimer = GetRandomValue(15, 30)*60; // 15-30 seconds
-                            boid->isExecutingOrder = true;
+                                boid->action = action;
+                                if (mode != MODE_LINE)
+                                    boid->orderTimer = GetRandomValue(5, 15)*60; // 5-15 seconds
+                                if (action == ACT_STOP) boid->sprite = SPRITE_NORMAL;
+                                if (action == ACT_ATTACK) boid->sprite = SPRITE_ANGRY;
+                                if (action == ACT_RETREAT) boid->sprite = SPRITE_SAD;
+                            }
+                            if (changeSelectionTeam) {
+                                boid->isSelected = (boid->team == team);
+                            }
+                            if (changeBoidDirection) {
+                                if (mode == MODE_DIRECTION) {
+                                    boid->orderVector = (Vector2LengthSqr(arrowVector) >= 40*40)? arrowVectorNorm : (Vector2){ 0 };
+                                    boid->directionOrder = true;
+                                } else if (mode == MODE_POINT) {
+                                    boid->orderVector = mousePosition;
+                                    boid->pointOrder = true;
+                                }
+                                if (mode == MODE_LINE) {
+                                    boid->pointOrder = true;
+                                } else
+                                    boid->orderTimer = GetRandomValue(15, 30)*60; // 15-30 seconds
+                            }
                         }
                     }
                     selectedBoidsCount += boid->isSelected;
@@ -756,6 +809,7 @@ int main(int argc, char *argv[]) {
             changeSelectionTeam = false;
             changeBoidDirection = false;
             deleteBoid = false;
+            clearOrder = false;
         }
 
         // Drawing
@@ -779,6 +833,8 @@ int main(int argc, char *argv[]) {
                 Boid *boid = &boids[i];
                 if ((boid->sprite != SPRITE_FALL) && (boid->isSelected)) {
                     DrawSelection(boid, texture);
+                    // if (boid->pointOrder)
+                        // DrawCircle(boid->orderVector.x, boid->orderVector.y, 20, (Color){0, 0, 0, 50});
                 }
             }
 
@@ -788,14 +844,14 @@ int main(int argc, char *argv[]) {
                 if ((boid->sprite != SPRITE_FALL) && (boid->action != ACT_DELETE)) {
                     DrawBoid(boid, texture);
                     if (showHealth)
-                        DrawText(TextFormat("%d", boid->health), boid->pos.x - 5 - ((int)log10(boid->health) * 7), boid->pos.y - 50, 20, BLACK);
+                        DrawText(TextFormat("%d", boid->health), boid->pos.x- 5 - ((int)log10(boid->health) * 7), boid->pos.y - 50, 20, BLACK);
                 }
             }
 
             float thick = 5/camera.zoom;
             
             // Drawing slection
-            if (selecting) {
+            if ((mode == MODE_SELECT) && selecting) {
                 float rectangleX = fmin(selectionStart.x, mousePosition.x);
                 float rectangleY = fmin(selectionStart.y, mousePosition.y);
                 DrawText(TextFormat("%d", selectedBoidsCount), rectangleX, rectangleY-(20/camera.zoom), 20/camera.zoom, BLACK);
@@ -804,16 +860,30 @@ int main(int argc, char *argv[]) {
                                  thick, BLACK);
             }
 
-            // Draw arrow
-            if (showArrow && (Vector2LengthSqr(arrowVector) >= powf(40/camera.zoom, 2))) {
+            // Draw arrow (in direction mode)
+            if ((mode == MODE_DIRECTION) && showArrow && (Vector2LengthSqr(arrowVector) >= powf(40/camera.zoom, 2))) {
                 DrawLineEx(arrowStart, mousePosition, thick, BLACK);
                 DrawLineEx(mousePosition, Vector2Add(mousePosition, Vector2Scale(Vector2Rotate(arrowVectorNorm,  160*DEG2RAD), 40/camera.zoom)), thick, BLACK);
                 DrawLineEx(mousePosition, Vector2Add(mousePosition, Vector2Scale(Vector2Rotate(arrowVectorNorm, -160*DEG2RAD), 40/camera.zoom)), thick, BLACK);
             }
 
-            // Draw point
+            // Draw point (in point mode)
             if (mode == MODE_POINT) {
                 DrawCircle(mousePosition.x, mousePosition.y, 20/camera.zoom, (Color){0, 0, 0, 50});
+            }
+
+            // Draw lines (in line mode)
+            if (mode == MODE_LINE) {
+                if (showLine) {
+                    DrawCircle(linePoints[0].x, linePoints[0].y, 10/camera.zoom, (Color){0, 0, 0, 50});
+                    for (uint8_t i = 1; i < linePointsCount; i++) {
+                        DrawCircle(linePoints[i].x, linePoints[i].y, 10/camera.zoom, (Color){0, 0, 0, 50});
+                        DrawLineEx(linePoints[i-1], linePoints[i], 10/camera.zoom, (Color){0, 0, 0, 50});
+                    }
+                    if (linePointsCount < ORDER_LINE_MAX_POINT)
+                        DrawLineEx(linePoints[linePointsCount-1], mousePosition, 10/camera.zoom, (Color){0, 0, 0, 10});
+                }
+                DrawCircle(mousePosition.x, mousePosition.y, 10/camera.zoom, (Color){0, 0, 0, 50});
             }
 
             EndMode2D();
@@ -830,8 +900,10 @@ int main(int argc, char *argv[]) {
                 DrawText("Mode: Direction", screenWidth - 165, 10, 20, BLACK);
                 break;
             case MODE_POINT:
-                DrawText("Mode: Point", screenWidth - 130, 10, 20, BLACK);
+                DrawText("Mode: Point", screenWidth - 125, 10, 20, BLACK);
                 break;
+            case MODE_LINE:
+                DrawText("Mode: Line", screenWidth - 115, 10, 20, BLACK);
             }
             if (pause)
                 DrawText("Paused", screenWidth - 85, 40, 20, BLACK);
@@ -862,6 +934,7 @@ int main(int argc, char *argv[]) {
         prev_mousePosition = mousePosition;
     }
 
+    free(grid.chunks);
     UnloadTexture(texture);
     CloseWindow();
 
