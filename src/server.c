@@ -53,6 +53,12 @@ typedef struct Room {
     BoidIndex teams[TEAMS_COUNT];
     uint8_t players_number, joined_players;
     uint32_t id;
+    Point world;
+    enum {
+        ROOM_AREAS,
+        ROOM_PLACING,
+        ROOM_GAME
+    } status;
 } Room;
 
 /* V global variables V */
@@ -162,16 +168,18 @@ void process_data(Player *p) {
         strcpy(p->name, data.creator);
         p->team = data.player_team;
         p->joined = true;
-        if (p->approving_queue.max_len != 0)
+        if (p->approving_queue.max_len == 0)
             init_queue(p->approving_queue, MAX_APPROVING_QUEUE_LEN);
 
         Room *room = malloc(sizeof(Room));
         room->players_number = data.players_number;
         room->joined_players = 1;
         room->players[0] = p;
+        room->world = (Point){ntohs(data.world_size.x), ntohs(data.world_size.y)};
         for (int j = 0; j < TEAMS_COUNT; j++)
             room->teams[j] = ntohs(data.boids_number[j]);
         p->room = room;
+        room->status = ROOM_AREAS;
         rooms[last_room_idx] = room;
 
         BoidIndex total_boids_number = 0;
@@ -184,19 +192,20 @@ void process_data(Player *p) {
         a - room index in array
         c - boids number
         t - teams (players) number
+        byte 1 is hidden
         */
 
         room->id = (last_room_idx << 16) | (total_boids_number << 2) | data.players_number;
         rooms[last_room_idx] = room;
-        printf("[*] new room\n    id: %06x\n    teams: %d\n    creator: %s (id = %d)\n    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
-               room->id, data.players_number, data.creator, p->fd, total_boids_number,
+        printf("[*] new room\n    id: %06x\n    teams: %d\n    world: %dx%d\n    creator: %s (id=%d)\n    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
+               room->id, data.players_number, room->world.x, room->world.y, data.creator, p->fd, total_boids_number,
                room->teams[TEAM_RED],
                room->teams[TEAM_BLUE],
                room->teams[TEAM_GREEN],
                room->teams[TEAM_YELLOW]);
 
         SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(p->fd), .players_number = room->players_number,
-                              .joined_players = room->joined_players, .player_team = p->team, .status = JOIN_OK};
+                              .joined_players = room->joined_players, .player_team = p->team, .world_size = data.world_size, .status = JOIN_OK};
 
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i]; // other_player
@@ -221,7 +230,7 @@ void process_data(Player *p) {
 
         uint16_t room_idx = data.room_id & 0xffff0000;
         Room *room = rooms[room_idx];
-        if ((room != NULL) && (room->id == data.room_id)) {
+        if ((room != NULL) && (room->id == data.room_id) && (room->joined_players < room->players_number) && (room->status == ROOM_AREAS)) {
             strcpy(p->name, data.username);
 
             Player *room_owner = room->players[0];
@@ -237,7 +246,7 @@ void process_data(Player *p) {
                 SPApprove send_data = {htonl(p->fd)};
                 strcpy(send_data.username, data.username);
 
-                send_packet(room->players[0]->fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
+                send_packet(room_owner->fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
             }
         } else {
             SPJoined send_data = {.status = JOIN_FAILED};
@@ -268,7 +277,8 @@ void process_data(Player *p) {
             room->players[room->joined_players++] = approving_player;
 
             SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(approving_player->fd), .players_number = room->players_number,
-                                  .joined_players = room->joined_players, .player_team = approving_player->team, .status = JOIN_OK};
+                                  .joined_players = room->joined_players, .player_team = approving_player->team,
+                                  .world_size = {htons(room->world.x), htons(room->world.y)}, .status = JOIN_OK};
 
             for (int i = 0; i < room->joined_players; i++) {
                 Player *op = room->players[i]; // other_player
@@ -290,6 +300,17 @@ void process_data(Player *p) {
                 if (op != approving_player)
                     send_packet(op->fd, SP_NEW_JOIN, &player_data, sizeof(player_data), 0);
             }
+
+            if (room->joined_players == room->players_number) {
+                while (!is_queue_empty(p->approving_queue)) {
+                    Player *op;
+                    dequeue(p->approving_queue, op);
+
+                    SPJoined send_data = {.status = JOIN_FAILED};
+                    send_packet(op->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+                    break;
+                }
+            }
         }
 
         if (p->approving_queue.size > 0) {
@@ -300,6 +321,32 @@ void process_data(Player *p) {
 
             send_packet(p->fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
         }
+
+        break;
+        }
+    case CP_START_PLACING: {
+        Room *room = p->room;
+        
+        if (p->net.data_len < sizeof(int16_t) || room->players[0]->fd != p->fd ||
+            room->joined_players != room->players_number || room->status != ROOM_AREAS)
+            break;
+
+        int16_t areas_count = ntohs(*(int16_t*)p->net.data_buf);
+        if (areas_count <= 0 || p->net.data_len != (areas_count * sizeof(Area) + sizeof(areas_count)))
+            break;
+        
+        // send a message to all players that admin starts placing boids
+        for (int i = 1; i < room->joined_players; i++) {
+            Player *op = room->players[i];
+            send_packet(op->fd, SP_START_PLACING, p->net.data_buf, p->net.data_len, 0);
+        }
+
+        // send a message to admin of the room
+        areas_count = 0;
+        send_packet(p->fd, SP_START_PLACING, &areas_count, sizeof(areas_count), 0);
+        
+        room->status = ROOM_PLACING;
+        printf("[*] room %06x started placing\n", room->id);
 
         break;
         }

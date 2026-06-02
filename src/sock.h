@@ -1,6 +1,10 @@
-#include <netinet/in.h>
+#ifndef _WIN32
+    #include <sys/socket.h>
+    #include <arpa/inet.h>
+#else
+    #include "winsupport.h"
+#endif
 #include <stddef.h>
-#include <sys/socket.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -23,19 +27,34 @@ ClientSomething - client structure "Something"
 ServerSomething - server structure "Something"
 */
 
+typedef struct {
+    uint16_t x, y;
+} Point;
+
+typedef struct {
+    uint16_t x1, y1, x2, y2;
+} Rec;
+
+typedef struct {
+    Rec rec;
+    uint8_t team;
+} Area;
+
 typedef enum {
     SP_CLOSE,
     SP_APPROVE_PLAYER, // Approve/reject request for new player
     SP_JOIN_PLAYER, // Player joined to the room (sent after the request to create/join to the room)
     SP_NEW_JOIN, // New player joined to the room
-    SP_PLAYER_EXIT // Player left the room
+    SP_PLAYER_EXIT, // Player left the room
+    SP_START_PLACING // Admin of the room starts placing of the boids
 } SPType; // Server packet type
 
 typedef enum {
     CP_CLOSE,
     CP_NEW_ROOM, // Create new room
     CP_JOIN_ROOM, // Join to the room
-    CP_APPROVE_PLAYER // Approve/reject new player
+    CP_APPROVE_PLAYER, // Approve/reject new player
+    CP_START_PLACING // Admin of the room starts placing of the boids
 } CPType; // Client packet type
 
 typedef struct {
@@ -58,6 +77,7 @@ typedef enum {
 typedef struct {
     uint32_t room_id, player_id;
     uint8_t players_number, joined_players, player_team;
+    Point world_size;
     ClientPlayer players[TEAMS_COUNT];
     BoidIndex teams[TEAMS_COUNT];
     uint8_t status;
@@ -65,6 +85,7 @@ typedef struct {
 
 typedef struct {
     uint8_t players_number, player_team;
+    Point world_size;
     BoidIndex boids_number[TEAMS_COUNT];
     char creator[USERNAME_LEN];
 } CPNew;
@@ -90,6 +111,7 @@ static inline int send_all(int fd, void *buf, size_t n, int flags) {
 }
 
 // Send packet_type + len + buf
+// TODO: optimize packet send
 static inline int send_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags) {
     if (send_all(fd, &packet_type, 1, flags))
         return 1;
