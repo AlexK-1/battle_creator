@@ -1,6 +1,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <netinet/tcp.h>
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -18,7 +20,7 @@
 #define MAX_ROOMS 256
 #define MAX_EVENTS 1024
 #define MAX_APPROVING_QUEUE_LEN 10
-#define MAX_PACKET_SIZE 1024
+#define MAX_PACKET_SIZE (1024*64)
 
 /*
 join -> room
@@ -437,6 +439,13 @@ int main(int argc, char **argv) {
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
         perror("setsockopt");
+        close(server_fd);
+        return 1;
+    }
+
+    opt = 1;
+    if (setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt))) {
+        perror("setsockopt TCP_NODELAY");
         close(server_fd);
         return 1;
     }

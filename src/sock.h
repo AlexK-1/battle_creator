@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include "boids.h"
 
 #ifndef SOCK_H
@@ -16,6 +17,7 @@
 #define SERVER "127.0.0.1"
 #define INPUT_PORT 3440
 #define SYNC_PORT 3441
+#define MAX_SEND_BUFFER_SIZE (1024*4)
 
 #define USERNAME_LEN 32
 
@@ -111,16 +113,18 @@ static inline int send_all(int fd, void *buf, size_t n, int flags) {
 }
 
 // Send packet_type + len + buf
-// TODO: optimize packet send
 static inline int send_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags) {
-    if (send_all(fd, &packet_type, 1, flags))
+    uint32_t total_len = 1 + sizeof(len) + len;
+    if (total_len > MAX_SEND_BUFFER_SIZE)
         return 1;
+    
+    uint8_t buffer[MAX_SEND_BUFFER_SIZE];
+    buffer[0] = packet_type;
     uint32_t nlen = htonl(len);
-    if (send_all(fd, &nlen, sizeof(nlen), flags))
-        return 1;
-    if (send_all(fd, buf, len, flags))
-        return 1;
-    return 0;
+    memcpy(buffer+1, &nlen, sizeof(nlen));
+    memcpy(buffer+1+sizeof(nlen), buf, len);
+    
+    return send_all(fd, buffer, total_len, 0);
 }
 
 static inline int recv_all(int fd, void *buf, size_t n, int flags) {

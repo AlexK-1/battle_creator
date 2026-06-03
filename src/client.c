@@ -1,6 +1,7 @@
 #ifndef _WIN32
     #include <sys/socket.h>
     #include <arpa/inet.h>
+    #include <netinet/tcp.h>
 #else
     #include "winsupport.h"
 #endif
@@ -548,6 +549,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    #ifndef _WIN32
+        int opt = 1;
+    #else
+        char opt = 1;
+    #endif
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt))) {
+        perror("setsockopt TCP_NODELAY");
+        close(fd);
+        #ifdef _WIN32
+            WSACleanup();
+        #endif
+        return 1;
+    }
+
     struct sockaddr_in servaddr;
     servaddr.sin_family = AF_INET;
     servaddr.sin_port = htons(INPUT_PORT);
@@ -557,6 +572,9 @@ int main(int argc, char **argv) {
     if (inet_pton(AF_INET, server, &servaddr.sin_addr) <= 0) {
         perror("Invalid address / Address not supported");
         close(fd);
+        #ifdef _WIN32
+            WSACleanup();
+        #endif
         return 1;
     }
 
@@ -564,6 +582,9 @@ int main(int argc, char **argv) {
     if (status < 0) {
         perror("connect");
         close(fd);
+        #ifdef _WIN32
+            WSACleanup();
+        #endif
         return 1;
     }
 
@@ -1013,6 +1034,7 @@ int main(int argc, char **argv) {
     }
 
     pthread_mutex_destroy(&log_mtx);
+    pthread_mutex_destroy(&areas_mtx);
 
     if (get_input) {
         pthread_mutex_lock(&input_mtx);
@@ -1025,11 +1047,12 @@ int main(int argc, char **argv) {
     pthread_cond_destroy(&input_cond);
 
     free(log.items);
-    
+
     close(fd);
     #ifdef _WIN32
         WSACleanup();
     #endif
     CloseWindow();
+
     return 0;
 }
