@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 #include "boids.h"
 
 #ifndef SOCK_H
@@ -17,7 +18,7 @@
 #define SERVER "127.0.0.1"
 #define INPUT_PORT 3440
 #define SYNC_PORT 3441
-#define MAX_SEND_BUFFER_SIZE (1024*4)
+#define MAX_STACK_SEND_BUFFER_SIZE (1024*32)
 
 #define USERNAME_LEN 32
 
@@ -48,7 +49,8 @@ typedef enum {
     SP_JOIN_PLAYER, // Player joined to the room (sent after the request to create/join to the room)
     SP_NEW_JOIN, // New player joined to the room
     SP_PLAYER_EXIT, // Player left the room
-    SP_START_PLACING // Admin of the room starts placing of the boids
+    SP_START_PLACING, // Admin of the room starts placing of the boids
+    SP_START_GAME // When all players have placed their boids
 } SPType; // Server packet type
 
 typedef enum {
@@ -56,7 +58,8 @@ typedef enum {
     CP_NEW_ROOM, // Create new room
     CP_JOIN_ROOM, // Join to the room
     CP_APPROVE_PLAYER, // Approve/reject new player
-    CP_START_PLACING // Admin of the room starts placing of the boids
+    CP_START_PLACING, // Admin of the room starts placing of the boids
+    CP_SEND_BOIDS // Sending player's boids before the game starts
 } CPType; // Client packet type
 
 typedef struct {
@@ -115,16 +118,26 @@ static inline int send_all(int fd, void *buf, size_t n, int flags) {
 // Send packet_type + len + buf
 static inline int send_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags) {
     uint32_t total_len = 1 + sizeof(len) + len;
-    if (total_len > MAX_SEND_BUFFER_SIZE)
-        return 1;
+
+    uint8_t *buffer = NULL;
+    uint8_t stack_buffer[MAX_STACK_SEND_BUFFER_SIZE];
+    bool use_heap = total_len > MAX_STACK_SEND_BUFFER_SIZE;
+    if (use_heap) {
+        buffer = malloc(total_len);
+    } else {
+        buffer = stack_buffer;
+    }
     
-    uint8_t buffer[MAX_SEND_BUFFER_SIZE];
     buffer[0] = packet_type;
     uint32_t nlen = htonl(len);
     memcpy(buffer+1, &nlen, sizeof(nlen));
     memcpy(buffer+1+sizeof(nlen), buf, len);
+
+    int res = send_all(fd, buffer, total_len, 0);
     
-    return send_all(fd, buffer, total_len, 0);
+    if (use_heap) free(buffer);
+
+    return res;
 }
 
 static inline int recv_all(int fd, void *buf, size_t n, int flags) {

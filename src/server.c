@@ -12,6 +12,9 @@
 #include <stdbool.h>
 #include <string.h>
 #include <fcntl.h>
+#include <pthread.h>
+
+#include <raylib.h>
 
 #include "boids.h"
 #include "sock.h"
@@ -31,7 +34,9 @@ typedef struct Player {
     uint32_t fd;
     char name[USERNAME_LEN];
     uint8_t team;
-    bool joined;
+    bool joined, ready;
+    ClientStartNetBoids start_boids[MAX_BOIDS_COUNT*2];
+    int start_boids_len;
     struct Room *room;
     struct {
         struct Player **items;
@@ -52,10 +57,12 @@ typedef struct Player {
 
 typedef struct Room {
     Player *players[TEAMS_COUNT];
-    BoidIndex teams[TEAMS_COUNT];
+    BoidIndex teams[TEAMS_COUNT], total_boids_number;
     uint8_t players_number, joined_players;
     uint32_t id;
     Point world;
+    pthread_t thread;
+    ServerBoid *boids;
     enum {
         ROOM_AREAS,
         ROOM_PLACING,
@@ -84,12 +91,36 @@ Player *find_player(Player **players, int id) {
     return players[i];
 }
 
+void close_client(int, int);
+
+void close_room(int epfd, Room *room) {
+    printf("[*] closed room %06x\n", room->id);
+
+    for (int i = 1; i < room->joined_players; i++) {
+        Player *op = room->players[i]; // other_player
+        op->joined = false;
+        close_client(epfd, op->fd);
+    }
+    while (room->players[0]->approving_queue.size > 0) {
+        Player *op;
+        dequeue(room->players[0]->approving_queue, op);
+        op->joined = false;
+        close_client(epfd, op->fd);
+    }
+
+    if (room->boids != NULL) free(room->boids);
+    free(room);
+    rooms[last_room_idx] = NULL;
+}
+
 void close_client(int epfd, int fd) {
     // close files
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
 
     Player *p = players[fd];
+
+    printf("[-] fd=%d hung up\n", fd);
 
     // room
     if (p->joined && p->room != NULL) {
@@ -98,23 +129,10 @@ void close_client(int epfd, int fd) {
         int player_idx = get_player_idx(room->players, p->fd);
 
         last_room_idx = ((room->id & 0xffff0000) >> 16);
-        if (player_idx == 0) { // room's creator disconected, close entire room
-            printf("[*] closed room %06x\n", room->id);
-
-            for (int i = 1; i < room->joined_players; i++) {
-                Player *op = room->players[i]; // other_player
-                op->joined = false;
-                close_client(epfd, op->fd);
-            }
-            while (p->approving_queue.size > 0) {
-                Player *op;
-                dequeue(p->approving_queue, op);
-                op->joined = false;
-                close_client(epfd, op->fd);
-            }
-
-            free(room);
-            rooms[last_room_idx] = NULL;
+        if ((room->status == ROOM_AREAS && player_idx == 0) || // room's creator disconected
+            (room->status == ROOM_PLACING) ||
+            (room->status == ROOM_GAME && room->joined_players == 1)) {
+            close_room(epfd, room); // close entire room
         } else {
             // delete player from array
             memmove(room->players + player_idx, room->players + player_idx + 1,
@@ -136,18 +154,90 @@ void close_client(int epfd, int fd) {
     if (p->approving_queue.max_len != 0) free(p->approving_queue.items);
     free(p);
     players[fd] = NULL;
-
-    printf("[-] fd=%d hung up\n", fd);
 }
 
-void process_data(Player *p) {
+typedef struct {
+    Room *room;
+    int epfd;
+} RoomThreadArgs;
+
+void *room_thread_fn(void *args) {
+    RoomThreadArgs *nargs = args;
+    
+    Room *room = nargs->room;
+    int epfd = nargs->epfd;
+    
+    room->boids = calloc(room->total_boids_number, sizeof(*room->boids));
+    BoidIndex boids_count = 0;
+    
+    for (int player_idx = 0; player_idx < room->joined_players; player_idx++) {
+        Player *player = room->players[player_idx];
+        
+        int cell = 0, cell_x = 0, cell_y = 0;
+        for (int i = 0; i < player->start_boids_len; i++) {
+            ClientStartNetBoids b = player->start_boids[i];
+            if (b.team < 0) {
+                cell += b.count;
+                cell_x = cell % (room->world.x / BOID_SIZE);
+                cell_y = cell / (room->world.y / BOID_SIZE);
+            } else {
+                for (int i = 0; i < b.count; i++) {
+                    if (boids_count >= room->total_boids_number)
+                        break;
+                    
+                    ServerBoid new_boid = {.b = {.pos = {cell_x*BOID_SIZE + BOID_SIZE/2.0, cell_y*BOID_SIZE + BOID_SIZE/2.0}, .velocity = 0, .speed = GetRandomValue(80, 130)/10.0,
+                                                 .health = BOID_MAX_HEALTH, .xp = GetRandomValue(0, 5), .team = player->team, .action = ACT_STOP}};
+                    room->boids[boids_count++] = new_boid;
+                
+                    cell++;
+                    cell_x++;
+                    if (cell_x >= room->world.x / BOID_SIZE) {
+                        cell_x = 0;
+                        cell_y++;
+                    }
+                }
+            }
+        }
+
+        if (boids_count > room->total_boids_number)
+            break;
+    }
+
+    if (boids_count > room->total_boids_number) {
+        close_room(epfd, room);
+        return NULL;
+    }
+
+    uint32_t packet_size = sizeof(boids_count) + boids_count*sizeof(ServerStartNetBoid);
+    void *data = malloc(packet_size);
+
+    BoidIndex net_boids_count = htons(boids_count);
+    memcpy(data, &net_boids_count, sizeof(boids_count));
+
+    ServerStartNetBoid *boids_data = data + sizeof(boids_count);
+
+    for (int i = 0; i < boids_count; i++) {
+        ServerBoid *orig_boid = &room->boids[i];
+        ServerStartNetBoid boid = {.x = htons(orig_boid->b.pos.x), .y = htons(orig_boid->b.pos.y),
+                                   .speed = orig_boid->b.speed*10.0, .xp = orig_boid->b.xp, .team = orig_boid->b.team};
+        boids_data[i] = boid;
+    }
+
+    for (int i = 0; i < room->joined_players; i++) {
+        send_packet(room->players[i]->fd, SP_START_GAME, data, packet_size, 0);
+    }
+    
+    return NULL;
+}
+
+void process_data(Player *p, int epfd) {
     switch (p->net.type) {
     case CP_NEW_ROOM: {
         CPNew data;
         if (p->net.data_len != sizeof(data))
             break;
         memcpy(&data, p->net.data_buf, sizeof(data));
-        
+
         bool free_rooms =  false;
         for (int j = 1; j < MAX_ROOMS; j++) {
             if (rooms[last_room_idx + j] == NULL) {
@@ -187,6 +277,7 @@ void process_data(Player *p) {
         BoidIndex total_boids_number = 0;
         for (int team_idx = 0; team_idx < TEAMS_COUNT; team_idx++)
             total_boids_number += room->teams[team_idx];
+        room->total_boids_number = total_boids_number;
 
         /* ROOM ID FORMAT
         [ byte 1 ][ byte 2 ][ byte 3 ][ byte 4 ]
@@ -272,6 +363,7 @@ void process_data(Player *p) {
             approving_player->joined = false;
         } else {
             approving_player->joined = true;
+            approving_player->ready = false;
             approving_player->team = data;
             approving_player->room = p->room;
 
@@ -352,10 +444,50 @@ void process_data(Player *p) {
 
         break;
         }
+    case CP_SEND_BOIDS: {
+        Room *room = p->room;
+        
+        if (p->net.data_len < sizeof(uint16_t) ||
+            room->joined_players != room->players_number || room->status != ROOM_PLACING)
+            break;
+
+        uint16_t count = ntohs(*(uint16_t*)p->net.data_buf);
+        if (p->net.data_len != (count*sizeof(ClientStartNetBoids) + sizeof(count)))
+            break;
+
+        ClientStartNetBoids *data = (ClientStartNetBoids*)(p->net.data_buf + sizeof(count));
+
+        for (int i = 0; i < count; i++) {
+            p->start_boids[i] = data[i];
+            p->start_boids[i].count = ntohs(p->start_boids[i].count);
+        }
+
+        p->start_boids_len = count;
+        p->ready = true;
+
+        bool all_ready = true;
+        for (int i = 0; i < room->joined_players; i++) {
+            Player *op = room->players[i];
+            if (!op->ready) {
+                all_ready = false;
+                break;
+            }
+        }
+
+        if (all_ready) {
+            room->status = ROOM_GAME;
+            printf("[*] room %06x started the game\n", room->id);
+
+            RoomThreadArgs args = {.room = room, .epfd = epfd};
+            pthread_create(&room->thread, NULL, room_thread_fn, &args);
+        }
+        
+        break;
+        }
     }
 }
 
-int client_recv(Player *p, int32_t *last_room_idx) {
+int client_recv(Player *p, int epfd) {
     while (1) {
         // Recive data
         int n = recv(p->fd, p->net.recv_buf, sizeof(p->net.recv_buf), 0);
@@ -412,7 +544,7 @@ int client_recv(Player *p, int32_t *last_room_idx) {
                     ptr += copy;
                 }
                 if (p->net.bytes_remaining == 0) {
-                    process_data(p);
+                    process_data(p, epfd);
                     
                     free(p->net.data_buf);
                     p->net.data_buf = NULL;
@@ -519,7 +651,7 @@ int main(int argc, char **argv) {
                     }
 
                     Player *player = malloc(sizeof(Player));
-                    *player = (Player){.fd = client_fd, .joined = false, .approving_queue = { 0 }};
+                    *player = (Player){.fd = client_fd, .joined = false, .ready = false, .approving_queue = { 0 }};
                     // player->fd = client_fd;
                     // player->joined = false;
                     // player->approving_queue.max_len = 0;
@@ -544,7 +676,7 @@ int main(int argc, char **argv) {
                 close_client(epfd, fd);
             } else {
                 Player *player = players[fd];
-                if (client_recv(player, &last_room_idx)) {
+                if (client_recv(player, epfd)) {
                     close_client(epfd, fd);
                 }
             }

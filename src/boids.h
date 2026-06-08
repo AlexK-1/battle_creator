@@ -97,7 +97,7 @@ typedef struct {
     BoidTeam team;
     BoidAction action;
     bool is_fighting;
-} Boid; // Default boids
+} BaseBoid; // Default boid
 
 typedef struct {
     uint16_t id, x, y;
@@ -106,28 +106,28 @@ typedef struct {
 } NetBoid; // Boids sync (server -> clients) every N seconds
 
 typedef struct {
-    uint16_t x, y;
-    uint8_t action, xp;
-} StartNetBoid; // First placement of boids on the map (first clients -> server, then server -> clients)
+    uint16_t count;
+    int8_t team;
+} ClientStartNetBoids; // First placement of boids on the map (client -> server)
 
 typedef struct {
-    Boid b;
-    struct {
-        Vector2 order_vector;
-        uint16_t order_timer;
-        bool direction_order, point_order;
-    } order;
-    
+    uint16_t x, y;
+    uint8_t speed, xp, team;
+} ServerStartNetBoid; // First placement of boids on the map (server -> clients)
+
+typedef struct {
+    BaseBoid b;
+    Vector2 order_vector;
+    uint16_t order_timer;
+    bool direction_order, point_order;
 } ServerBoid; // Boid on server (default boid + order fields)
 
 typedef struct {
-    Boid b;
-    struct {
-        Vector2 direction;
-        uint8_t sprite_timer;
-        uint8_t sprite;
-        bool is_selected, is_used;
-    } visual;
+    BaseBoid b;
+    Vector2 direction;
+    uint8_t sprite_timer;
+    uint8_t sprite;
+    bool is_selected, is_used;
 } ClientBoid; // Boid on client (default boid + fields for visualization and selecting)
 
 typedef uint16_t BoidIndex;

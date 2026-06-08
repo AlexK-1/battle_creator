@@ -31,6 +31,75 @@
 #define MAX(x, y) ((x) > (y)) ? (x) : (y)
 
 
+// <============================================ GRID AND CHUNKS ===========================================>
+
+#define CHUNK_SIZE_BOIDS 1024
+#define CHUNK_SIZE_PIXELS 1050
+
+typedef uint16_t ChunkSize;
+
+typedef struct {
+    BoidIndex boids[CHUNK_SIZE_BOIDS]; // Array of boids
+    ChunkSize count; // Number of boids in the chunk
+} Chunk;
+// TODO: Add dynamic array of areas to Chunk
+
+typedef struct {
+    Chunk *chunks;
+    int screen_width, screen_height;
+    uint16_t rows, cols; // Number of chunks by width/height
+    uint32_t chunks_count;
+} Grid;
+
+// Clear all chunks (set counts to zero)
+void clear_grid(Grid *grid) {
+    for (uint32_t i = 0; i < grid->chunks_count; i++) {
+        grid->chunks[i].count = 0;
+    }
+}
+
+// Fill chunks with boids
+void fill_grid(Grid *grid, ClientBoid *boids, BoidIndex boids_count) {
+    for (BoidIndex i = 0; i < boids_count; i++) {
+        ClientBoid *boid = &boids[i];
+        if ((boid->b.action == ACT_FALL) || (boid->b.action == ACT_SURRENDER || (boid->b.action == ACT_DELETE))) continue;
+
+        float x = boid->b.pos.x;
+        float y = boid->b.pos.y;
+
+        if (x < 0) x = 0;
+        else if (x > grid->screen_width) x = grid->screen_width;
+        if (y < 0) y = 0;
+        else if (y > grid->screen_height) y = grid->screen_height;
+        
+        uint16_t chunk_x = x / CHUNK_SIZE_PIXELS;
+        uint16_t chunk_y = y / CHUNK_SIZE_PIXELS;
+        uint32_t chunk_index = chunk_x + chunk_y*grid->cols;
+
+        Chunk *chunk = &grid->chunks[chunk_index];
+
+        if (chunk->count < CHUNK_SIZE_BOIDS)
+            chunk->boids[chunk->count++] = i;
+    }
+}
+
+// Initialize grid and fully rebuild chunks (delete and recreate all chunks)
+void init_grid(Grid *grid, ClientBoid *boids, BoidIndex boids_count, int width, int height) {
+    grid->screen_width = width;
+    grid->screen_height = height;
+    grid->cols = (uint16_t)(width/CHUNK_SIZE_PIXELS) + 1;
+    grid->rows = (uint16_t)(height/CHUNK_SIZE_PIXELS) + 1;
+    grid->chunks_count = grid->rows * grid->cols;
+
+    if (grid->chunks != NULL) {
+        free(grid->chunks);
+    }
+    grid->chunks = calloc(grid->chunks_count, sizeof(Chunk));
+
+    fill_grid(grid, boids, boids_count);
+}
+
+
 /* <================================================ LOGGING ===============================================> */
 
 #define MAX_LOG_LEN 10
@@ -148,20 +217,30 @@ typedef enum {
     MODE_LINE
 } GameMode;
 
+typedef enum {
+    STAGE_AREAS,
+    STAGE_PLACING,
+    STAGE_GAME
+} GameStage;
+
 typedef struct {
     int fd, players_number, *joined_players, player_team;
-    bool new_room, *ext;
+    bool new_room, *running;
     uint32_t room_id;
     Point *world_size;
-    BoidIndex *boids_number;
+    BoidIndex *boids_number, *boids_count, total_boids_number;
     ClientPlayer *players;
     Log *log;
     int16_t *areas_count;
     Area *areas;
+    ClientBoid *boids;
     GameMode *mode;
+    GameStage *stage;
 } NetThreadArgs;
 
 pthread_mutex_t areas_mtx;
+pthread_mutex_t running_mtx;
+pthread_mutex_t boids_mtx;
 
 void *net_thread_fn(void *args) {
     NetThreadArgs *nargs = args;
@@ -174,12 +253,16 @@ void *net_thread_fn(void *args) {
     uint32_t room_id = nargs->room_id;
     Point *world = nargs->world_size;
     BoidIndex *boids_number = nargs->boids_number;
+    BoidIndex *boids_count = nargs->boids_count;
+    BoidIndex total_boids_number = nargs->total_boids_number;
     ClientPlayer *players = nargs->players;
     Log *log = nargs->log;
-    bool *ext = nargs->ext;
+    bool *running = nargs->running;
     Area *areas = nargs->areas;
     int16_t *areas_count = nargs->areas_count;
+    ClientBoid *boids = nargs->boids;
     GameMode *mode = nargs->mode;
+    GameStage *stage = nargs->stage;
 
     bool ex = false;
     bool start_areas = false;
@@ -300,7 +383,8 @@ void *net_thread_fn(void *args) {
             recv_all(fd, buf, packet_size, 0);
             
             int16_t new_areas_count = ntohs(*(int16_t*)buf);
-            if (new_areas_count < 0) break;
+            if (new_areas_count < 0 || packet_size != (sizeof(new_areas_count) + new_areas_count*sizeof(Area)))
+                break;
 
             if (!new_room) {
                 pthread_mutex_lock(&areas_mtx);
@@ -317,8 +401,40 @@ void *net_thread_fn(void *args) {
                 pthread_mutex_unlock(&areas_mtx);
             }
             *mode = MODE_SPAWN;
+            *stage = STAGE_PLACING;
 
             write_log(log, "[*] now you can spawn boids on your areas");
+            write_log(log, "[*] press ENTER when you will ready to start the game\n");
+            
+            break;
+            }
+        case SP_START_GAME: {
+            uint32_t packet_size;
+            recv_all(fd, &packet_size, sizeof(uint32_t), 0);
+            packet_size = ntohl(packet_size);
+            void *buf = malloc(packet_size);
+
+            recv_all(fd, buf, packet_size, 0);
+
+            uint16_t recv_boids_count = ntohs(*(uint16_t*)buf);
+            if (recv_boids_count != total_boids_number || packet_size != (sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid)))
+                break;
+
+            ServerStartNetBoid *recv_boids = buf + sizeof(recv_boids_count);
+
+            pthread_mutex_lock(&boids_mtx);
+            for (int i = 0; i < recv_boids_count; i++) {
+                ServerStartNetBoid recv_boid = recv_boids[i];
+                ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed, .health = BOID_MAX_HEALTH, .xp = recv_boid.xp,
+                                             .team = recv_boid.team, .action = ACT_STOP}, .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
+                boids[i] = new_boid;
+            }
+            *boids_count = recv_boids_count;
+            pthread_mutex_unlock(&boids_mtx);
+
+            write_log(log, "[*] the game has started\n");
+
+            *mode = MODE_SELECT;
             
             break;
             }
@@ -328,7 +444,10 @@ void *net_thread_fn(void *args) {
             break;
     }
     
-    *ext = true;
+    pthread_mutex_lock(&running_mtx);
+    *running = false;
+    pthread_mutex_unlock(&running_mtx);
+    
     return NULL;
 }
 
@@ -336,6 +455,49 @@ void *net_thread_fn(void *args) {
 /* <================================================= MAIN =================================================> */
 
 #define MAX_AREAS_COUNT 1024
+
+void draw_boid(ClientBoid *boid, Texture2D texture) {
+    static Rectangle sprites[SPRITES_COUNT] = {
+         [SPRITE_NORMAL] = {0, 0, 146, 152},
+         [SPRITE_ANGRY] = {160, 0, 146, 152},
+         [SPRITE_HIT_LEFT] = {320, 0, 146, 152},
+         [SPRITE_HIT_RIGHT] = {480, 0, 146, 152},
+         [SPRITE_OUCH] = {640, 0, 146, 152},
+         [SPRITE_SAD] = {800, 0, 146, 152},
+         [SPRITE_SURRENDER] = {960, 0, 144, 252},
+         [SPRITE_FALL] = {1120, 0, 265, 203},
+    };
+
+    Rectangle sprite = sprites[boid->sprite];
+    sprite.y += 260 * boid->b.team;
+    
+    Rectangle destRec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE, BOID_SIZE};
+    if (boid->sprite == SPRITE_SURRENDER) {
+        destRec.height = BOID_SIZE * (128/75.0);
+    } else if (boid->sprite == SPRITE_FALL) {
+        destRec.width = BOID_SIZE * (132/75.0);
+        destRec.height = BOID_SIZE * (100/75.0);
+    }
+
+    Color tint = WHITE;
+    if (boid->sprite == SPRITE_FALL) {
+        tint.a = 20;
+    } else if ((boid->sprite == SPRITE_SURRENDER) || (boid->sprite == SPRITE_FALL)) {
+        tint.a = (255.0/50.0) * (50 - boid->sprite_timer);
+    }
+    
+    DrawTexturePro(texture, sprite, destRec, (Vector2){BOID_SIZE/2.0, BOID_SIZE/2.0},
+                   atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, tint);
+}
+
+void draw_selection(ClientBoid *boid, Texture2D texture) {
+    static Rectangle white_sprite = {0, 260*TEAMS_COUNT, 146, 149};
+    Rectangle destRec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE*1.2, BOID_SIZE*1.2};
+    Color tint = ORANGE;
+    
+    DrawTexturePro(texture, white_sprite, destRec, (Vector2){BOID_SIZE*1.2/2.0, BOID_SIZE*1.2/2.0},
+                   atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, tint);
+}
 
 int main(int argc, char **argv) {
     /* FORMAT
@@ -695,36 +857,54 @@ int main(int argc, char **argv) {
 
     // Control
     GameMode mode = new_room ? MODE_AREAS : MODE_WAIT;
-    bool pause = false;
+    GameStage stage = STAGE_AREAS;
+    bool show_log = true, show_grid = false, delete_boids = false;
+    
+    // Selection
+    int selecting_team = TEAM_RED;
+    bool selecting = false, select_mode = false, selecting_shift_pressed = false;
+    Vector2 selection_start = { 0 };
     
     // Camera
     Camera2D camera = { 0 };
     camera.zoom = 1.0f;
-    camera.target = (Vector2){world_size.x/2.0, world_size.y/2.0};
+    camera.target = (Vector2){world_size.x/2.0 - GetScreenWidth()/2.0, world_size.y/2.0 - GetScreenHeight()/2.0};
 
     // Keyboard string input
     bool typing_string_input = false;
     int input_len = 0;
 
     // Areas selecting
-    int selecting_team = TEAM_RED;
-    bool selecting = false;
     Point area_start_selecting, area_end_selecting;
     Area areas[MAX_AREAS_COUNT] = { 0 };
     int areas_size[TEAMS_COUNT] = { 0 };
     int16_t areas_count = 0;
 
+    // Boids
+    ClientBoid *boids = calloc(total_boids_number, sizeof(*boids));
+    BoidIndex boids_count = 0; // Number of placed boids
+
+    // Grid of chunks
+    Grid grid = { 0 };
+    init_grid(&grid, boids, boids_count, world_size.x, world_size.y);
+
+    // Textures
+    Texture2D texture = LoadTexture("../resources/texture.png");
+    GenTextureMipmaps(&texture);
+    // SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+
     // Start a thread to recive messages from the server
-    bool ext = false; // Exit game
+    bool running = true;
     pthread_mutex_init(&log_mtx, NULL);
     pthread_mutex_init(&input_mtx, NULL);
     pthread_cond_init(&input_cond, NULL);
+    pthread_mutex_init(&boids_mtx, NULL);
     NetThreadArgs thread_args = {.fd = fd, .players_number = players_number, .joined_players = &joined_players, .player_team = player_team, .new_room = new_room,
-                                 .ext=&ext, .room_id = room_id, .world_size = &world_size, .boids_number = boids_number, .players = players, .log = &log,
-                                 .areas_count = &areas_count, .areas = areas, .mode = &mode};
+                                 .running=&running, .room_id = room_id, .world_size = &world_size, .boids_number = boids_number, .boids_count = &boids_count,
+                                 .total_boids_number = total_boids_number, .players = players, .log = &log, .areas_count = &areas_count,
+                                 .areas = areas, boids = boids, .mode = &mode, .stage = &stage};
     pthread_t net_thread;
     pthread_create(&net_thread, NULL, net_thread_fn, &thread_args);
-    pthread_detach(net_thread);
     
     if (!new_room) {
         write_log(&log, "[*] players:\n");
@@ -737,9 +917,21 @@ int main(int argc, char **argv) {
         }
     }
     
-    while (!WindowShouldClose() && !ext) {
+    while (!WindowShouldClose()) {
+        pthread_mutex_lock(&running_mtx);
+        if (!running) break;
+        pthread_mutex_unlock(&running_mtx);
+        
         // Keys
-        if (IsKeyPressed(KEY_P)) pause = !pause;
+        
+        if (IsKeyPressed(KEY_L)) show_log = !show_log;
+        if (IsKeyPressed(KEY_K)) show_grid = !show_grid;
+        
+        if (stage == STAGE_PLACING) {
+            if (IsKeyPressed(KEY_A)) mode = MODE_SPAWN, select_mode = false;
+            if (IsKeyPressed(KEY_S)) mode = MODE_SELECT, select_mode = true, selecting = false, selecting_shift_pressed = false;
+            if (IsKeyPressed(KEY_X)) delete_boids = true;
+        }
 
         Vector2 mouse_position = GetScreenToWorld2D(GetMousePosition(), camera);
         int screen_width = GetScreenWidth();
@@ -762,7 +954,7 @@ int main(int argc, char **argv) {
         }
 
         // Get string input from keyboard
-        if (get_input) {
+        if (show_log && get_input) {
             if (!typing_string_input) {
                 // Input starts with SPACE
                 if (IsKeyPressed(KEY_SPACE)) {
@@ -847,6 +1039,7 @@ int main(int argc, char **argv) {
                             i--;
 
                             // Divide the old area into nonoverlapping new ones
+                            // TODO: optimize it
                             if (intersection.y1 == r.y1 || intersection.y2 == r.y2) {
                                 if (intersection.x1 != r.x1) areas[areas_count++] = (Area){.rec = {r.x1, r.y1, intersection.x1, r.y2}, .team = rt};
                                 if (intersection.y2 != r.y2 && intersection.y1 == r.y1) areas[areas_count++] = (Area){.rec = {intersection.x1, intersection.y2, intersection.x2, r.y2}, .team = rt};
@@ -917,7 +1110,195 @@ int main(int argc, char **argv) {
                 }
             }
         }
+
+        // Spawn boids
+        static Point prev_pos = {-1, -1};
+        if (mode == MODE_SPAWN) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && boids_count < boids_number[player_team] && \
+                mouse_position.x >= 0 && mouse_position.x <= world_size.x && mouse_position.y >= 0 && mouse_position.y <= world_size.y) {
+
+                Point pos = {(int)mouse_position.x/BOID_SIZE, (int)mouse_position.y/BOID_SIZE};
+                if (pos.x != prev_pos.x || pos.y != prev_pos.y) {
+                    bool can_place = false;
+                    for (int i = 0; i < areas_count; i++) {
+
+                        // Check if new boids is in his team's area
+                        Area *area = &areas[i];
+                        if (area->team == player_team) {
+                            if (pos.x >= area->rec.x1 && pos.x < area->rec.x2 && pos.y >= area->rec.y1 && pos.y < area->rec.y2) {
+                                can_place = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (can_place) {
+                        float x = mouse_position.x;
+                        if (x < 0) x = 0;
+                        else if (x > grid.screen_width) x = grid.screen_width;
+
+                        float y = mouse_position.y;
+                        if (y < 0) y = 0;
+                        else if (y > grid.screen_height) y = grid.screen_height;
+
+                        uint16_t chunk_x = x / CHUNK_SIZE_PIXELS;
+                        uint16_t chunk_y = y / CHUNK_SIZE_PIXELS;
+                        uint32_t chunk_index = chunk_x + chunk_y*grid.cols;
+
+                        Chunk *chunk = &grid.chunks[chunk_index];
+
+                        // Check if there are no another boid on the same place
+                        for (int i = 0; i < chunk->count; i++) {
+                            ClientBoid *boid = &boids[chunk->boids[i]];
+                            Point boid_pos = {(int)boid->b.pos.x/BOID_SIZE, (int)boid->b.pos.y/BOID_SIZE};
+                            if (pos.x == boid_pos.x && pos.y == boid_pos.y) {
+                                can_place = false;
+                                break;
+                            }
+                        }
+
+                        // If all checks are passed, create a new boid
+                        if (can_place) {
+                            ClientBoid new_boid = {.b = {.pos = {pos.x * BOID_SIZE + BOID_SIZE/2.0, pos.y * BOID_SIZE + BOID_SIZE/2.0}, .team = player_team, .action = ACT_STOP},
+                                                   .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
+                            boids[boids_count++] = new_boid;
+                            prev_pos = pos;
+                        }
+                    }
+                }
+            }
+
+            // Send boids and a message that the player is ready to start the game
+            if (IsKeyPressed(KEY_ENTER)) {
+                if (boids_count == boids_number[player_team]) {
+                    ClientStartNetBoids *data = calloc(boids_count + 1, sizeof(*data));
+                    data[0].team = -1;
+                    int index = 0;
+
+                    for (int y = 0; y < world_size.y / BOID_SIZE; y++) {
+                        for (int x = 0; x < world_size.x / BOID_SIZE; x++) {
+                            uint16_t chunk_x = x * BOID_SIZE / CHUNK_SIZE_PIXELS;
+                            uint16_t chunk_y = y * BOID_SIZE / CHUNK_SIZE_PIXELS;
+                            uint32_t chunk_index = chunk_x + chunk_y*grid.cols;
+
+                            Chunk *chunk = &grid.chunks[chunk_index];
+
+                            bool find = false;
+                            for (int i = 0; i < chunk->count; i++) {
+                                ClientBoid *boid = &boids[chunk->boids[i]];
+                                Point boid_pos = {(int)boid->b.pos.x/BOID_SIZE, (int)boid->b.pos.y/BOID_SIZE};
+                                if (boid_pos.x == x && boid_pos.y == y) {
+                                    find = true;
+                                    break;
+                                }
+                            }
+
+                            if (find == (data[index].team >= 0))
+                                data[index].count++;
+                            else
+                                data[++index] = (ClientStartNetBoids){.team = find ? player_team : -1, .count = 1};
+                        }
+                    }
+
+                    uint16_t count = index + 1;
+
+                    for (int i = 0; i < count; i++) {
+                        data[i].count = htons(data[i].count);
+                    }
+                    
+                    uint32_t bufsize = sizeof(count) + count * sizeof(*data);
+                    void *buf = malloc(bufsize);
+
+                    uint16_t ncount = htons(count);
+                    memcpy(buf, &ncount, sizeof(count));
+                    memcpy(buf+sizeof(count), data, count * sizeof(*data));
+
+                    send_packet(fd, CP_SEND_BOIDS, buf, bufsize, 0);
+                    write_log(&log, "[*] wait until other players are ready to start the game\n");
+
+                    free(data);
+                    free(buf);
+                } else {
+                    write_log(&log, "[!] place all your boids before you start the game\n");
+                }
+            }
+        }
+
+        // Select boids
+        if (mode == MODE_SELECT) {
+            if (IsMouseButtonDown(MOUSE_RIGHT_BUTTON)) {
+                if (!selecting) {
+                    selecting = true;
+                    selection_start = mouse_position;
+                }
+            } else if (IsMouseButtonReleased(MOUSE_RIGHT_BUTTON)) {
+                selecting = false;
+                selecting_shift_pressed = false;
+            }
+        }
         
+        // Update boids in selection
+        BoidIndex selected_boids_count = 0;
+        if (select_mode) {
+            int deleted_boids_count = 0;
+            pthread_mutex_lock(&boids_mtx);
+            for (BoidIndex i = 0; i < boids_count; i++) {
+               ClientBoid *boid = &boids[i];
+                if (boid->b.action != ACT_SURRENDER && boid->b.action != ACT_FALL && boid->b.action != ACT_DELETE) {
+                    if (selecting) {
+                        boid->is_selected = (selecting_shift_pressed && boid->is_selected) || (
+                                           (boid->b.pos.x > fmin(selection_start.x, mouse_position.x)) &&
+                                           (boid->b.pos.x < fmax(selection_start.x, mouse_position.x)) &&
+                                           (boid->b.pos.y > fmin(selection_start.y, mouse_position.y)) &&
+                                           (boid->b.pos.y < fmax(selection_start.y, mouse_position.y)));
+                    }
+
+                    if (boid->is_selected) {
+                        // Delete boid
+                        if (delete_boids) {
+                            boid->b.action = ACT_DELETE;
+                            boid->is_selected = false;
+                            deleted_boids_count++;
+                            continue;
+                        }
+                    }
+                    
+                    selected_boids_count += boid->is_selected;
+                }
+            }
+
+            // Remove deleted boids from array
+            if (delete_boids && deleted_boids_count > 0) {
+                int offset = 0;
+                for (int i = 0; i < boids_count; i++) {
+                    boids[i - offset] = boids[i];
+                    ClientBoid *boid = &boids[i];
+                    if (boid->b.action == ACT_DELETE)
+                        offset++;
+                }
+                boids_count -= offset;
+            }
+
+            pthread_mutex_unlock(&boids_mtx);
+            
+            delete_boids = false;
+        }
+        
+        // Update boids
+        /*for (BoidIndex i = 0; i < boids_count; i++) {
+            ClientBoid *boid = &boids[i];
+
+            if (boid->b.action == ACT_DELETE) continue;
+
+            // update the boid and change its ccordinates
+        }*/
+
+        // Update grid
+        pthread_mutex_lock(&boids_mtx);
+        clear_grid(&grid);
+        fill_grid(&grid, boids, boids_count);
+        pthread_mutex_unlock(&boids_mtx);
+
         // Drawing
         BeginDrawing();
             // ClearBackground((Color){255, 235, 206, 255});
@@ -928,26 +1309,59 @@ int main(int argc, char **argv) {
             // Word border
             DrawRectangleLines(0, 0, world_size.x, world_size.y, BLACK);
 
-            float thick = 4/camera.zoom;
-            
             // Draw areas
-            if (mode == MODE_AREAS || mode == MODE_SPAWN) {
+            if (mode == MODE_AREAS || stage == STAGE_PLACING) {
                 pthread_mutex_lock(&areas_mtx);
                 for (int i = 0; i < areas_count; i++) {
                     Area area = areas[i];
                     Color color = RAYWHITE;
                     switch (area.team) {
-                        case TEAM_RED: color = RED; break;
-                        case TEAM_BLUE: color = BLUE; break;
-                        case TEAM_GREEN: color = GREEN; break;
-                        case TEAM_YELLOW: color = ORANGE; break;
+                        case TEAM_RED: color = (Color){RED.r, RED.g, RED.b, (stage == STAGE_AREAS)? 255: 20}; break;
+                        case TEAM_BLUE: color = (Color){BLUE.r, BLUE.g, BLUE.b, (stage == STAGE_AREAS)? 255: 20}; break;
+                        case TEAM_GREEN: color = (Color){GREEN.r, GREEN.g, GREEN.b, (stage == STAGE_AREAS)? 255: 20}; break;
+                        case TEAM_YELLOW: color = (Color){ORANGE.r, ORANGE.g, ORANGE.b, (stage == STAGE_AREAS)? 255: 20}; break;
                     }
-                    DrawRectangle(area.rec.x1 * BOID_SIZE, area.rec.y1 * BOID_SIZE, (area.rec.x2 - area.rec.x1) * BOID_SIZE, (area.rec.y2 - area.rec.y1) * BOID_SIZE, color);
-                    DrawRectangleLines(area.rec.x1 * BOID_SIZE, area.rec.y1 * BOID_SIZE, (area.rec.x2 - area.rec.x1) * BOID_SIZE, (area.rec.y2 - area.rec.y1) * BOID_SIZE, BLACK);
+                    DrawRectangle(area.rec.x1 * BOID_SIZE, area.rec.y1 * BOID_SIZE,
+                                  (area.rec.x2 - area.rec.x1) * BOID_SIZE, (area.rec.y2 - area.rec.y1) * BOID_SIZE, color);
                 }
                 pthread_mutex_unlock(&areas_mtx);
             }
 
+            // Draw grid
+            if (show_grid) {
+                for (int i = 1; i < world_size.x / BOID_SIZE; i++) {
+                    DrawLine(i*BOID_SIZE, 0, i*BOID_SIZE, world_size.y, BLACK);
+                }
+
+                for (int i = 1; i < world_size.x / BOID_SIZE; i++) {
+                    DrawLine(0, i*BOID_SIZE, world_size.x, i*BOID_SIZE, BLACK);
+                }
+            }
+
+            // Draw selection
+            for (BoidIndex i = 0; i < boids_count; i++) {
+                ClientBoid *boid = &boids[i];
+                if ((boid->sprite != SPRITE_FALL) && (boid->is_selected)) {
+                    draw_selection(boid, texture);
+                    // if (boid->pointOrder)
+                        // DrawCircle(boid->orderVector.x, boid->orderVector.y, 20, (Color){0, 0, 0, 50});
+                }
+            }
+            
+            // Draw boids
+            pthread_mutex_lock(&boids_mtx);
+            for (BoidIndex i = 0; i < boids_count; i++) {
+                ClientBoid *boid = &boids[i];
+                if ((boid->sprite != SPRITE_FALL) && (boid->b.action != ACT_DELETE)) {
+                    draw_boid(boid, texture);
+                    // if (show_health)
+                    //     DrawText(TextFormat("%d", boid->b.health), boid->b.pos.x- 5 - ((int)log10(boid->b.health) * 7), boid->b.pos.y - 50, 20, BLACK);
+                }
+            }
+            pthread_mutex_unlock(&boids_mtx);
+
+            float thick = 4/camera.zoom;
+            
             // Draw area selecting
             if (mode == MODE_AREAS && selecting) {
                 float rectangleX = fmin(area_start_selecting.x * BOID_SIZE, area_end_selecting.x * BOID_SIZE);
@@ -957,6 +1371,17 @@ int main(int argc, char **argv) {
                                      abs(area_start_selecting.y * BOID_SIZE - area_end_selecting.y * BOID_SIZE)},
                                      thick, BLACK);
             }
+
+            // Drawing boids slection
+            if ((mode == MODE_SELECT) && selecting) {
+                float rectangleX = fmin(selection_start.x, mouse_position.x);
+                float rectangleY = fmin(selection_start.y, mouse_position.y);
+                DrawText(TextFormat("%d", selected_boids_count), rectangleX, rectangleY-(20/camera.zoom), 20/camera.zoom, BLACK);
+                DrawRectangleLinesEx((Rectangle){rectangleX, rectangleY,
+                                     fabs(mouse_position.x - selection_start.x), fabs(mouse_position.y - selection_start.y)},
+                                 thick, BLACK);
+            }
+            
             
             EndMode2D();
 
@@ -983,19 +1408,21 @@ int main(int argc, char **argv) {
             case MODE_LINE:
                 DrawText("Mode: Line", screen_width - 115, 10, 20, BLACK);
             }
-            if (pause)
-                DrawText("Paused", screen_width - 85, 40, 20, BLACK);
+            // if (pause)
+            //     DrawText("Paused", screen_width - 85, 40, 20, BLACK);
             
 
             // Draw log
-            int line = typing_string_input, idx = log.front;
-            pthread_mutex_lock(&log_mtx);
-            for (int i = 0; i < log.size; i++) {
-                line += log.items[idx].lines;
-                DrawText(log.items[idx].string, 10, screen_height - line*22 - 5, 20, BLACK);
-                idx = (idx > 0)? (idx - 1) : log.max_len-1;
+            if (show_log) {
+                int line = typing_string_input, idx = log.front;
+                pthread_mutex_lock(&log_mtx);
+                for (int i = 0; i < log.size; i++) {
+                    line += log.items[idx].lines;
+                    DrawText(log.items[idx].string, 10, screen_height - line*22 - 5, 20, BLACK);
+                    idx = (idx > 0)? (idx - 1) : log.max_len-1;
+                }
+                pthread_mutex_unlock(&log_mtx);
             }
-            pthread_mutex_unlock(&log_mtx);
 
             // Draw keyboard input
             if (typing_string_input) {
@@ -1024,18 +1451,26 @@ int main(int argc, char **argv) {
                     case TEAM_YELLOW: team_color = ORANGE; break;
                 }
 
-                // <player_name>: <boids_count> (<areas_size><! if boids_count less than areas_size>)
-                DrawText(TextFormat("%s: %d (%d%s", player_joined ? players[player_idx].name : "-", boids_number[team], areas_size[team],
-                                    (boids_number[team] < areas_size[team])? ")" : "!)"), 10, 40 + (l++)*20, 20, team_color);
+                char *str;
+                if (stage == STAGE_AREAS) {
+                    // <player_name>: <target_boids_number> (<areas_size><! if boids_count less than areas_size>)
+                    str = (char*)TextFormat("%s: %d%c(%d%s", player_joined ? players[player_idx].name : "-", boids_number[team], new_room ? ' ' : '\0',
+                                            areas_size[team], (boids_number[team] < areas_size[team])? ")" : "!)");
+                } else if (stage == STAGE_PLACING) {
+                    if (team == player_team) {
+                        str = (char*)TextFormat("%s: %d (%d left)", players[player_idx].name, boids_count, boids_number[team]-boids_count);
+                    } else {
+                        str = (char*)TextFormat("%s: -", players[player_idx].name);
+                    }
+                }
+                DrawText(str, 10, 40 + (l++)*20, 20, team_color);
             }
 
             DrawFPS(10, 10);
         EndDrawing();
     }
 
-    pthread_mutex_destroy(&log_mtx);
-    pthread_mutex_destroy(&areas_mtx);
-
+    // Close input
     if (get_input) {
         pthread_mutex_lock(&input_mtx);
         get_input = false;
@@ -1043,15 +1478,32 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&input_mtx);
         
     }
-    pthread_mutex_destroy(&input_mtx);
-    pthread_cond_destroy(&input_cond);
-
-    free(log.items);
-
+    
+    // Close the second (network) thread
+    pthread_cancel(net_thread);
+    pthread_join(net_thread, NULL);
+    
+    // Close soketd
     close(fd);
     #ifdef _WIN32
         WSACleanup();
     #endif
+
+    // Destroy all mutexes and conditions
+    pthread_mutex_destroy(&input_mtx);
+    pthread_cond_destroy(&input_cond);
+    pthread_mutex_destroy(&log_mtx);
+    pthread_mutex_destroy(&areas_mtx);
+    pthread_mutex_destroy(&running_mtx);
+    pthread_mutex_destroy(&boids_mtx);
+
+    // Free allocated memory
+    free(log.items);
+    free(grid.chunks);
+    free(boids);
+
+    // Close Raylib
+    UnloadTexture(texture);
     CloseWindow();
 
     return 0;
