@@ -35,8 +35,16 @@ typedef struct {
 } Point;
 
 typedef struct {
+    int32_t x, y;
+} SPoint; // signed Pint
+
+typedef struct {
     uint16_t x1, y1, x2, y2;
 } Rec;
+
+typedef struct {
+    int32_t x1, y1, x2, y2;
+} SRec; // signed Rec
 
 typedef struct {
     Rec rec;

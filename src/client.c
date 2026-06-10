@@ -27,8 +27,8 @@
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 450
 
-#define MIN(x, y) ((x) < (y)) ? (x) : (y)
-#define MAX(x, y) ((x) > (y)) ? (x) : (y)
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
 
 
 // <============================================ GRID AND CHUNKS ===========================================>
@@ -211,6 +211,7 @@ typedef enum {
     MODE_WAIT,
     MODE_AREAS,
     MODE_SPAWN,
+    MODE_DELETE,
     MODE_SELECT,
     MODE_DIRECTION,
     MODE_POINT,
@@ -435,6 +436,7 @@ void *net_thread_fn(void *args) {
             write_log(log, "[*] the game has started\n");
 
             *mode = MODE_SELECT;
+            *stage = STAGE_GAME;
             
             break;
             }
@@ -859,6 +861,7 @@ int main(int argc, char **argv) {
     GameMode mode = new_room ? MODE_AREAS : MODE_WAIT;
     GameStage stage = STAGE_AREAS;
     bool show_log = true, show_grid = false, delete_boids = false;
+    int brush_size = 1;
     
     // Selection
     int selecting_team = TEAM_RED;
@@ -923,14 +926,19 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&running_mtx);
         
         // Keys
+        if (!show_log || !get_input) {
+            if (IsKeyPressed(KEY_L)) show_log = !show_log;
+            if (IsKeyPressed(KEY_K)) show_grid = !show_grid;
         
-        if (IsKeyPressed(KEY_L)) show_log = !show_log;
-        if (IsKeyPressed(KEY_K)) show_grid = !show_grid;
-        
-        if (stage == STAGE_PLACING) {
-            if (IsKeyPressed(KEY_A)) mode = MODE_SPAWN, select_mode = false;
-            if (IsKeyPressed(KEY_S)) mode = MODE_SELECT, select_mode = true, selecting = false, selecting_shift_pressed = false;
-            if (IsKeyPressed(KEY_X)) delete_boids = true;
+            if (stage == STAGE_PLACING) {
+                if (IsKeyPressed(KEY_A)) mode = MODE_SPAWN, select_mode = false;
+                if (IsKeyPressed(KEY_S)) mode = MODE_SELECT, select_mode = true, selecting = false, selecting_shift_pressed = false;
+                if (IsKeyPressed(KEY_D)) mode = MODE_DELETE, select_mode = false;
+                if (IsKeyPressed(KEY_X)) delete_boids = true;
+            }
+
+            if (IsKeyPressed(KEY_P)) brush_size += MAX(1, log10f(brush_size));
+            if (IsKeyPressed(KEY_O) && brush_size > 1) brush_size -= MAX(1, log10f(brush_size));
         }
 
         Vector2 mouse_position = GetScreenToWorld2D(GetMousePosition(), camera);
@@ -942,10 +950,17 @@ int main(int argc, char **argv) {
         if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) wheel = -1.0;
         if (IsKeyPressed(KEY_KP_ADD) || (IsKeyPressed(KEY_EQUAL) && (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)))) wheel = 1.0;
         if (wheel != 0) {
-            camera.offset = GetMousePosition();
-            camera.target = mouse_position;
-            float scale = 0.2f*wheel;
-            camera.zoom = Clamp(expf(logf(camera.zoom)+scale), 0.125f, 64.0f);
+            if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
+                // Change size of the brush
+                brush_size += wheel * MAX(1, roundf(logf(brush_size)));
+                if (brush_size < 1) brush_size = 1;
+            } else {
+                // Zoom
+                camera.offset = GetMousePosition();
+                camera.target = mouse_position;
+                float scale = 0.2f*wheel;
+                camera.zoom = Clamp(expf(logf(camera.zoom)+scale), 1/16.0f, 64.0f);
+            }
         }
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             Vector2 delta = GetMouseDelta();
@@ -1070,11 +1085,13 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (IsKeyPressed(KEY_Q)) selecting_team = TEAM_RED;
-            if (IsKeyPressed(KEY_W)) selecting_team = TEAM_BLUE;
-            if (IsKeyPressed(KEY_E)) selecting_team = TEAM_GREEN;
-            if (IsKeyPressed(KEY_R)) selecting_team = TEAM_YELLOW;
-            if (IsKeyPressed(KEY_Z)) selecting_team = -1;
+            if (!show_log || !get_input) {
+                if (IsKeyPressed(KEY_Q)) selecting_team = TEAM_RED;
+                if (IsKeyPressed(KEY_W)) selecting_team = TEAM_BLUE;
+                if (IsKeyPressed(KEY_E)) selecting_team = TEAM_GREEN;
+                if (IsKeyPressed(KEY_R)) selecting_team = TEAM_YELLOW;
+                if (IsKeyPressed(KEY_Z)) selecting_team = -1;
+            }
 
             // Start placing
             if (IsKeyPressed(KEY_ENTER) && new_room && players_number == joined_players) {
@@ -1112,62 +1129,176 @@ int main(int argc, char **argv) {
         }
 
         // Spawn boids
-        static Point prev_pos = {-1, -1};
-        if (mode == MODE_SPAWN) {
-            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && boids_count < boids_number[player_team] && \
-                mouse_position.x >= 0 && mouse_position.x <= world_size.x && mouse_position.y >= 0 && mouse_position.y <= world_size.y) {
+        BoidIndex deleted_boids_count = 0;
+        static SPoint spawn_prev_pos = {-1, -1};
+        if (stage == STAGE_PLACING) {
+            if (mode == MODE_SPAWN && IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && boids_count < boids_number[player_team] && \
+                mouse_position.x + (int)(brush_size - brush_size/2) * BOID_SIZE >= 0 &&
+                mouse_position.x - (int)(brush_size/2) * BOID_SIZE <= world_size.x &&
+                mouse_position.y + (int)(brush_size - brush_size/2) * BOID_SIZE >= 0 &&
+                mouse_position.y - (int)(brush_size/2) * BOID_SIZE <= world_size.y) {
 
-                Point pos = {(int)mouse_position.x/BOID_SIZE, (int)mouse_position.y/BOID_SIZE};
-                if (pos.x != prev_pos.x || pos.y != prev_pos.y) {
-                    bool can_place = false;
-                    for (int i = 0; i < areas_count; i++) {
+                SPoint pos = {(int)mouse_position.x/BOID_SIZE, (int)mouse_position.y/BOID_SIZE};
+                
+                if (pos.x != spawn_prev_pos.x || pos.y != spawn_prev_pos.y) {
+                    SRec brush_rec = {pos.x - brush_size/2, pos.y - brush_size/2,
+                                     pos.x - brush_size/2 + brush_size, pos.y - brush_size/2 + brush_size};
 
-                        // Check if new boids is in his team's area
-                        Area *area = &areas[i];
-                        if (area->team == player_team) {
-                            if (pos.x >= area->rec.x1 && pos.x < area->rec.x2 && pos.y >= area->rec.y1 && pos.y < area->rec.y2) {
+                    enum {
+                        CELL_UNCHEKED,
+                        CELL_USED,
+                        CELL_FREE
+                    } *cells = calloc(brush_size*brush_size, sizeof(*cells));
+                    
+                    Area *area = NULL;
+                    for (int cell_x = brush_rec.x1; cell_x < brush_rec.x2; cell_x++) {
+                        if (cell_x < 0 || cell_x >= world_size.x / BOID_SIZE)
+                            continue;
+                        if (boids_count >= boids_number[player_team])
+                            break;
+
+                        for (int cell_y = brush_rec.y1; cell_y < brush_rec.y2; cell_y++) {
+                            if (cell_y < 0 || cell_y >= world_size.y / BOID_SIZE)
+                                continue;
+                            if (boids_count >= boids_number[player_team])
+                                break;
+                            
+                            bool can_place = false;
+
+                            // Check if new boids is in his team's area
+                            if (area != NULL && area->team == player_team &&
+                                cell_x >= area->rec.x1 && cell_x < area->rec.x2 && cell_y >= area->rec.y1 && cell_y < area->rec.y2) {
                                 can_place = true;
-                                break;
+                            } else {
+                                for (int i = 0; i < areas_count; i++) {
+                                    Area *area = &areas[i];
+                                    if (area->team == player_team &&
+                                        cell_x >= area->rec.x1 && cell_x < area->rec.x2 && cell_y >= area->rec.y1 && cell_y < area->rec.y2) {
+                                        can_place = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (can_place) {
+                                float x = cell_x * BOID_SIZE + BOID_SIZE/2.0;
+                                float y = cell_y * BOID_SIZE + BOID_SIZE/2.0;
+
+                                uint16_t chunk_x = x / CHUNK_SIZE_PIXELS;
+                                uint16_t chunk_y = y / CHUNK_SIZE_PIXELS;
+                                uint32_t chunk_index = chunk_x + chunk_y*grid.cols;
+
+                                Chunk *chunk = &grid.chunks[chunk_index];
+
+                                // Check if there are no another boid on the same place
+                                int cell_idx = (cell_x - brush_rec.x1) + (cell_y - brush_rec.y1)*brush_size;
+                                int cell_status = cells[cell_idx];
+                                if (cell_status == CELL_FREE) {
+                                    can_place = true;
+                                } else if (cell_status == CELL_UNCHEKED) {
+                                    for (int i = 0; i < chunk->count; i++) {
+                                        ClientBoid *boid = &boids[chunk->boids[i]];
+                                        Point boid_pos = {(int)boid->b.pos.x/BOID_SIZE, (int)boid->b.pos.y/BOID_SIZE};
+                                        int cell_idx = (boid_pos.x - brush_rec.x1) + (boid_pos.y - brush_rec.y1)*brush_size;
+                                        if (boid_pos.x >= brush_rec.x1 && boid_pos.x < brush_rec.x2 && boid_pos.y >= brush_rec.y1 && boid_pos.y < brush_rec.y2)
+                                            cells[cell_idx] = CELL_USED;
+                                    }
+
+                                    Rec check_border = {MAX(brush_rec.x1, chunk_x*CHUNK_SIZE_PIXELS/BOID_SIZE),
+                                                        MAX(brush_rec.y1, chunk_y*CHUNK_SIZE_PIXELS/BOID_SIZE),
+                                                        MIN(brush_rec.x2, (chunk_x+1)*CHUNK_SIZE_PIXELS/BOID_SIZE),
+                                                        MIN(brush_rec.y2, (chunk_y+1)*CHUNK_SIZE_PIXELS/BOID_SIZE)};
+                                    for (int check_cell_x = check_border.x1; check_cell_x < check_border.x2; check_cell_x++) {
+                                        for (int check_cell_y = check_border.y1; check_cell_y < check_border.y2; check_cell_y++) {
+                                            int check_cell_idx = (check_cell_x - brush_rec.x1) + (check_cell_y - brush_rec.y1)*brush_size;
+                                            if (cells[check_cell_idx] == CELL_UNCHEKED)
+                                                cells[check_cell_idx] = CELL_FREE;
+                                        }
+                                    }
+                                } else {
+                                    can_place = false;
+                                }
+
+                                if (can_place && cells[cell_idx] == CELL_FREE) {
+                                // If all checks are passed, create a new boid
+                                    ClientBoid new_boid = {.b = {.pos = {x, y}, .team = player_team, .action = ACT_STOP},
+                                                           .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
+                                    boids[boids_count++] = new_boid;
+                                    cells[cell_idx] = CELL_USED;
+                                }
                             }
                         }
                     }
 
-                    if (can_place) {
-                        float x = mouse_position.x;
-                        if (x < 0) x = 0;
-                        else if (x > grid.screen_width) x = grid.screen_width;
+                    free(cells);
 
-                        float y = mouse_position.y;
-                        if (y < 0) y = 0;
-                        else if (y > grid.screen_height) y = grid.screen_height;
-
-                        uint16_t chunk_x = x / CHUNK_SIZE_PIXELS;
-                        uint16_t chunk_y = y / CHUNK_SIZE_PIXELS;
-                        uint32_t chunk_index = chunk_x + chunk_y*grid.cols;
-
-                        Chunk *chunk = &grid.chunks[chunk_index];
-
-                        // Check if there are no another boid on the same place
-                        for (int i = 0; i < chunk->count; i++) {
-                            ClientBoid *boid = &boids[chunk->boids[i]];
-                            Point boid_pos = {(int)boid->b.pos.x/BOID_SIZE, (int)boid->b.pos.y/BOID_SIZE};
-                            if (pos.x == boid_pos.x && pos.y == boid_pos.y) {
-                                can_place = false;
-                                break;
-                            }
-                        }
-
-                        // If all checks are passed, create a new boid
-                        if (can_place) {
-                            ClientBoid new_boid = {.b = {.pos = {pos.x * BOID_SIZE + BOID_SIZE/2.0, pos.y * BOID_SIZE + BOID_SIZE/2.0}, .team = player_team, .action = ACT_STOP},
-                                                   .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
-                            boids[boids_count++] = new_boid;
-                            prev_pos = pos;
-                        }
-                    }
+                    spawn_prev_pos = pos;
                 }
             }
 
+            // Delete boids
+            static SPoint delete_prev_pos = {-1, -1};
+            if (mode == MODE_DELETE && IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && boids_count > 0 &&
+                mouse_position.x + (int)(brush_size - brush_size/2) * BOID_SIZE >= 0 &&
+                mouse_position.x - (int)(brush_size/2) * BOID_SIZE <= world_size.x &&
+                mouse_position.y + (int)(brush_size - brush_size/2) * BOID_SIZE >= 0 &&
+                mouse_position.y - (int)(brush_size/2) * BOID_SIZE <= world_size.y) {
+                
+                SPoint pos = {(int)mouse_position.x/BOID_SIZE, (int)mouse_position.y/BOID_SIZE};
+                
+                if (pos.x != spawn_prev_pos.x || pos.y != spawn_prev_pos.y) {
+                    SRec brush_rec = {pos.x - brush_size/2, pos.y - brush_size/2,
+                                     pos.x - brush_size/2 + brush_size, pos.y - brush_size/2 + brush_size};
+
+                    int *used_chunks = calloc(pow(ceilf((float)brush_size*BOID_SIZE/CHUNK_SIZE_PIXELS) + 1, 2), sizeof(*used_chunks));
+                    int used_chunks_count = 0;
+                    
+                    for (int cell_x = brush_rec.x1; cell_x < brush_rec.x2; cell_x++) {
+                        if (cell_x < 0 || cell_x >= world_size.x / BOID_SIZE)
+                            continue;
+
+                        for (int cell_y = brush_rec.y1; cell_y < brush_rec.y2; cell_y++) {
+                            if (cell_y < 0 || cell_y >= world_size.y / BOID_SIZE)
+                                continue;
+
+                            float x = cell_x * BOID_SIZE + BOID_SIZE/2.0;
+                            float y = cell_y * BOID_SIZE + BOID_SIZE/2.0;
+
+                            uint16_t chunk_x = x / CHUNK_SIZE_PIXELS;
+                            uint16_t chunk_y = y / CHUNK_SIZE_PIXELS;
+                            uint32_t chunk_index = chunk_x + chunk_y*grid.cols;
+
+                            Chunk *chunk = &grid.chunks[chunk_index];
+
+                            bool chunk_used = false;
+                            for (int i = 0; i < used_chunks_count; i++) {
+                                if (chunk_index == used_chunks[i]) {
+                                    chunk_used = true;
+                                    break;
+                                }
+                            }
+
+                            if (!chunk_used) {
+                                for (int i = 0; i < chunk->count; i++) {
+                                    ClientBoid *boid = &boids[chunk->boids[i]];
+                                    if (boid->b.pos.x >= brush_rec.x1*BOID_SIZE && boid->b.pos.x < brush_rec.x2*BOID_SIZE &&
+                                        boid->b.pos.y >= brush_rec.y1*BOID_SIZE && boid->b.pos.y < brush_rec.y2*BOID_SIZE) {
+                                        boid->b.action = ACT_DELETE;
+                                        deleted_boids_count++;
+                                    }
+                                }
+                                used_chunks[used_chunks_count++] = chunk_index;
+                            }
+                        }
+                    }
+
+                    free(used_chunks);
+
+                    delete_prev_pos = pos;
+                }
+            }
+
+            
             // Send boids and a message that the player is ready to start the game
             if (IsKeyPressed(KEY_ENTER)) {
                 if (boids_count == boids_number[player_team]) {
@@ -1240,7 +1371,6 @@ int main(int argc, char **argv) {
         // Update boids in selection
         BoidIndex selected_boids_count = 0;
         if (select_mode) {
-            int deleted_boids_count = 0;
             pthread_mutex_lock(&boids_mtx);
             for (BoidIndex i = 0; i < boids_count; i++) {
                ClientBoid *boid = &boids[i];
@@ -1267,22 +1397,24 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // Remove deleted boids from array
-            if (delete_boids && deleted_boids_count > 0) {
-                int offset = 0;
-                for (int i = 0; i < boids_count; i++) {
-                    boids[i - offset] = boids[i];
-                    ClientBoid *boid = &boids[i];
-                    if (boid->b.action == ACT_DELETE)
-                        offset++;
-                }
-                boids_count -= offset;
-            }
-
             pthread_mutex_unlock(&boids_mtx);
             
             delete_boids = false;
         }
+        
+        // Remove deleted boids from array
+        pthread_mutex_lock(&boids_mtx);
+        if (deleted_boids_count > 0) {
+            int offset = 0;
+            for (int i = 0; i < boids_count; i++) {
+                boids[i - offset] = boids[i];
+                ClientBoid *boid = &boids[i];
+                if (boid->b.action == ACT_DELETE)
+                    offset++;
+            }
+            boids_count -= offset;
+        }
+        pthread_mutex_unlock(&boids_mtx);
         
         // Update boids
         /*for (BoidIndex i = 0; i < boids_count; i++) {
@@ -1381,6 +1513,13 @@ int main(int argc, char **argv) {
                                      fabs(mouse_position.x - selection_start.x), fabs(mouse_position.y - selection_start.y)},
                                  thick, BLACK);
             }
+
+            // Draw brush
+            if (mode == MODE_SPAWN || mode == MODE_DELETE) {
+                SPoint pos = {(int)mouse_position.x/BOID_SIZE, (int)mouse_position.y/BOID_SIZE};
+                DrawRectangle(pos.x*BOID_SIZE - brush_size/2*BOID_SIZE, pos.y*BOID_SIZE - brush_size/2*BOID_SIZE,
+                              brush_size*BOID_SIZE, brush_size*BOID_SIZE, (Color){20, 20, 20, 20});
+            }
             
             
             EndMode2D();
@@ -1388,25 +1527,21 @@ int main(int argc, char **argv) {
             // Draw "Paused" and "Mode" labels
             switch (mode) {
             case MODE_WAIT:
-                DrawText("Mode: Wait", screen_width - 115, 10, 20, BLACK);
-                break;
+                DrawText("Mode: Wait", screen_width - 115, 10, 20, BLACK); break;
             case MODE_AREAS:
-                DrawText("Mode: Areas", screen_width - 140, 10, 20, BLACK);
-                break;
+                DrawText("Mode: Areas", screen_width - 140, 10, 20, BLACK); break;
             case MODE_SPAWN:
-                DrawText("Mode: Spawn", screen_width - 140, 10, 20, BLACK);
-                break;
+                DrawText("Mode: Spawn", screen_width - 140, 10, 20, BLACK); break;
+            case MODE_DELETE:
+                DrawText("Mode: Delete", screen_width - 140, 10, 20, BLACK); break;
             case MODE_SELECT:
-                DrawText("Mode: Select", screen_width - 140, 10, 20, BLACK);
-                break;
+                DrawText("Mode: Select", screen_width - 140, 10, 20, BLACK); break;
             case MODE_DIRECTION:
-                DrawText("Mode: Direction", screen_width - 165, 10, 20, BLACK);
-                break;
+                DrawText("Mode: Direction", screen_width - 165, 10, 20, BLACK); break;
             case MODE_POINT:
-                DrawText("Mode: Point", screen_width - 125, 10, 20, BLACK);
-                break;
+                DrawText("Mode: Point", screen_width - 125, 10, 20, BLACK); break;
             case MODE_LINE:
-                DrawText("Mode: Line", screen_width - 115, 10, 20, BLACK);
+                DrawText("Mode: Line", screen_width - 115, 10, 20, BLACK); break;
             }
             // if (pause)
             //     DrawText("Paused", screen_width - 85, 40, 20, BLACK);
@@ -1462,6 +1597,8 @@ int main(int argc, char **argv) {
                     } else {
                         str = (char*)TextFormat("%s: -", players[player_idx].name);
                     }
+                } else if (stage == STAGE_GAME) {
+                    str = (char*)TextFormat("%s: %d", players[player_idx].name, boids_number[team]);
                 }
                 DrawText(str, 10, 40 + (l++)*20, 20, team_color);
             }
