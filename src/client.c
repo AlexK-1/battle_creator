@@ -404,6 +404,8 @@ void *net_thread_fn(void *args) {
             *mode = MODE_SPAWN;
             *stage = STAGE_PLACING;
 
+            free(buf);
+
             write_log(log, "[*] now you can spawn boids on your areas");
             write_log(log, "[*] press ENTER when you will ready to start the game\n");
             
@@ -433,10 +435,12 @@ void *net_thread_fn(void *args) {
             *boids_count = recv_boids_count;
             pthread_mutex_unlock(&boids_mtx);
 
-            write_log(log, "[*] the game has started\n");
-
             *mode = MODE_SELECT;
             *stage = STAGE_GAME;
+
+            free(buf);
+
+            write_log(log, "[*] the game has started\n");
             
             break;
             }
@@ -521,6 +525,7 @@ int main(int argc, char **argv) {
     BoidIndex boids_number[TEAMS_COUNT] = { 0 }, total_boids_number = 0;
     char *username = NULL, *server = "127.0.0.1", *player_team_name = NULL;
     Point world_size = {10050, 10050};
+    short tcp_port = INPUT_PORT;;
     
     if (argc < 2) {
         fputs("missed argument: new/join\n", stderr);
@@ -540,21 +545,38 @@ int main(int argc, char **argv) {
         char *arg = *(++argv);
 
         if (arg[0] == '-') {
-            if (argc == 1) {
+            if (argc == 1 && !(arg[1] == 'p' && isdigit(arg[2]))) {
                 fprintf(stderr, "no value for option '%s'\n", arg);
                 return 1;
             }
             if (strcmp(arg, "--server") == 0 || strcmp(arg, "-s") == 0) {
                 server = *(++argv);
                 argc--;
+            } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-t") == 0) {
+                char *value_str = *(++argv);
+                argc--;
+
+                char *endp;
+                tcp_port = strtoul(value_str, &endp, 10);
+                if (*endp != '\0') {
+                    fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                    return 1;
+                }
             } else if (strcmp(arg, "--name") == 0 || strcmp(arg, "-n") == 0) {
                 username = *(++argv);
                 argc--;
             } else if (new_room) {
-                if (strcmp(arg, "--players") == 0 || strcmp(arg, "-p") == 0) {
-                    char *value_str = *(++argv);
-                    argc--;
-                
+                if (strcmp(arg, "--players") == 0 || (arg[1] == 'p' && isdigit(arg[2]))) {
+                    int s = strlen(arg);
+
+                    char *value_str;
+                    if (arg[1] == 'p' && s >= 3) {
+                        value_str = arg+2;
+                    } else {
+                        value_str = *(++argv);
+                        argc--;
+                    }
+
                     char *endp;
                     players_number = strtoul(value_str, &endp, 10);
                     if (*endp != '\0') {
@@ -587,7 +609,7 @@ int main(int argc, char **argv) {
                     world_size.x = ceilf((float)world_size.x / BOID_SIZE) * BOID_SIZE;
                     world_size.y = ceilf((float)world_size.y / BOID_SIZE) * BOID_SIZE;
                 } else {
-                    fprintf(stderr, "unexpected argument '%s'\n", argv[1]);
+                    fprintf(stderr, "unexpected argument '%s'\n", arg);
                     return 1;
                 }
                 
@@ -603,7 +625,7 @@ int main(int argc, char **argv) {
                         return 1;
                     }
                 } else {
-                    fprintf(stderr, "unexpected argument '%s'\n", argv[1]);
+                    fprintf(stderr, "unexpected argument '%s'\n", arg);
                     return 1;
                 }
             }
@@ -632,7 +654,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (err) {
+            if (err || teams_count == 0) {
                 fprintf(stderr, "illegal value '%s' for number of boids option\n", arg);
                 return 1;
             }
@@ -647,10 +669,11 @@ int main(int argc, char **argv) {
                 boids_number[teams[i]] = boids;
             
         } else {
-            fprintf(stderr, "unexpected argument '%s'\n", argv[1]);
+            fprintf(stderr, "unexpected argument '%s'\n", arg);
             return 1;
         }
     }
+
     if (new_room) {
         player_team_name = get_team_name(player_team);
         if (boids_number[player_team] == 0) {
@@ -673,7 +696,7 @@ int main(int argc, char **argv) {
         }
 
         if (teams_number != players_number) {
-            fprintf(stderr, "number of players (%d) is not equal to number of teams (%d)\n", players_number, teams_number);
+            fprintf(stderr, "you have not set the number of boids for all players\n");
             return 1;
         }
         if (total_boids_number > MAX_BOIDS_COUNT) {
@@ -683,7 +706,7 @@ int main(int argc, char **argv) {
         
     }
 
-    printf("server: %s\n", server);
+    printf("server %s:%d\n", server, tcp_port);
     // printf("name: %s\n", username);
     // if (new_room) {
     //     printf("team: %s\n", player_team_name);
@@ -729,7 +752,7 @@ int main(int argc, char **argv) {
 
     struct sockaddr_in servaddr;
     servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(INPUT_PORT);
+    servaddr.sin_port = htons(tcp_port);
     socklen_t addrlen = sizeof(servaddr);
 
     // Convert IPv4 and IPv6 addresses from text to binary form
@@ -1122,6 +1145,8 @@ int main(int argc, char **argv) {
                     pthread_mutex_unlock(&areas_mtx);
                 
                     send_packet(fd, CP_START_PLACING, buf, buf_size, 0);
+
+                    free(buf);
                 } else {
                     write_log(&log, "[!] you cannot atart placing if size of areas of all teams is less than the number of boids\n");
                 }

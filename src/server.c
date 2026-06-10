@@ -13,6 +13,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <string.h>
 
 #include <raylib.h>
 
@@ -168,6 +169,10 @@ void *room_thread_fn(void *args) {
     int epfd = nargs->epfd;
     
     room->boids = calloc(room->total_boids_number, sizeof(*room->boids));
+    if (room->boids == NULL) {
+        close_room(epfd, room);
+        return NULL;
+    }
     BoidIndex boids_count = 0;
     
     for (int player_idx = 0; player_idx < room->joined_players; player_idx++) {
@@ -268,11 +273,12 @@ void process_data(Player *p, int epfd) {
         room->joined_players = 1;
         room->players[0] = p;
         room->world = (Point){ntohs(data.world_size.x), ntohs(data.world_size.y)};
+        room->boids = NULL;
         for (int j = 0; j < TEAMS_COUNT; j++)
             room->teams[j] = ntohs(data.boids_number[j]);
-        p->room = room;
         room->status = ROOM_AREAS;
         rooms[last_room_idx] = room;
+        p->room = room;
 
         BoidIndex total_boids_number = 0;
         for (int team_idx = 0; team_idx < TEAMS_COUNT; team_idx++)
@@ -558,6 +564,32 @@ int client_recv(Player *p, int epfd) {
 }
 
 int main(int argc, char **argv) {
+    short tcp_port = INPUT_PORT;;
+
+    while (--argc) {
+        char *arg = *(++argv);
+
+        if (arg[0] == '-') {
+            if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-t") == 0) {
+                char *value_str = *(++argv);
+                argc--;
+
+                char *endp;
+                tcp_port = strtoul(value_str, &endp, 10);
+                if (*endp != '\0') {
+                    fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                    return 1;
+                }
+            }  else {
+                fprintf(stderr, "unexpected argument '%s'\n", arg);
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "unexpected argument '%s'\n", arg);
+            return 1;
+        }
+    }
+    
     const long max_fd = sysconf(_SC_OPEN_MAX);
     players = calloc(max_fd, sizeof(Player*));
     
@@ -584,7 +616,7 @@ int main(int argc, char **argv) {
     
     struct sockaddr_in servaddr = { 0 };
     servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(INPUT_PORT);
+    servaddr.sin_port = htons(tcp_port);
     servaddr.sin_family = AF_INET;
     socklen_t addrlen = sizeof(servaddr);
 
@@ -619,9 +651,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("epoll server on 0.0.0.0:%d\n", INPUT_PORT);
+    // Make stdin nonblocking
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     
-    while (1) {
+    // Add stdin to epoll
+    event.events = EPOLLIN;
+    event.data.fd = STDIN_FILENO;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &event)) {
+        perror("epoll_ctl stdin");
+        close(server_fd);
+        close(epfd);
+        return 1;
+    }
+
+    printf("epoll server on 0.0.0.0:%d\n", tcp_port);
+
+    bool running = true;
+    while (running) {
         int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -671,6 +718,21 @@ int main(int argc, char **argv) {
                         close(client_fd);
                     }
                 }
+            } else if (events[i].data.fd == STDIN_FILENO) {
+                // Process standart input
+                char buf[256];
+                ssize_t r = read(STDIN_FILENO, buf, sizeof(buf) - 1);
+                if (r > 0) {
+                    buf[r] = '\0';
+                    if (strcmp(buf, "quit\n") == 0 || strcmp(buf, "q\n") == 0) {
+                        printf("[!] shutting down server\n");
+                        running = false;
+                        break;
+                    }
+                } else {
+                    running = false;
+                    break;
+                }
             } else if (events[i].events & EPOLLERR) {
                 // Disconnect client
                 close_client(epfd, fd);
@@ -691,12 +753,6 @@ int main(int argc, char **argv) {
     }
     free(players);
 
-    for (int i = 0; i < MAX_ROOMS; i++) {
-        if (rooms[i] != NULL) {
-            free(rooms[i]);
-        }
-    }
-        
     close(epfd);
     close(server_fd);
 }
