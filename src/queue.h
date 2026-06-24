@@ -7,8 +7,7 @@
 Example:
 struct ExampleQueue {
     int *items;
-    int front, rear, size;
-    size_t max_len;
+    int front, rear, size, max_len;
 };
 */
 
@@ -50,8 +49,7 @@ struct ExampleQueue {
 Example:
 struct ExampleCStack {
     int *items;
-    int front, rear, size;
-    size_t max_len;
+    int front, rear, size, max_len;
 };
 */
 

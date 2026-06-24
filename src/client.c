@@ -2,6 +2,7 @@
     #include <sys/socket.h>
     #include <arpa/inet.h>
     #include <netinet/tcp.h>
+    #include <fcntl.h>
 #else
     #include "winsupport.h"
 #endif
@@ -16,12 +17,14 @@
 #include <pthread.h>
 #include <math.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <time.h>
 
 #include <raylib.h>
 #include <raymath.h>
 
 #include "boids.h"
-#include "sock.h"
+#include "network.h"
 #include "queue.h"
 
 #define WINDOW_WIDTH 800
@@ -29,75 +32,6 @@
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
-
-
-// <============================================ GRID AND CHUNKS ===========================================>
-
-#define CHUNK_SIZE_BOIDS 1024
-#define CHUNK_SIZE_PIXELS 1050
-
-typedef uint16_t ChunkSize;
-
-typedef struct {
-    BoidIndex boids[CHUNK_SIZE_BOIDS]; // Array of boids
-    ChunkSize count; // Number of boids in the chunk
-} Chunk;
-// TODO: Add dynamic array of areas to Chunk
-
-typedef struct {
-    Chunk *chunks;
-    int screen_width, screen_height;
-    uint16_t rows, cols; // Number of chunks by width/height
-    uint32_t chunks_count;
-} Grid;
-
-// Clear all chunks (set counts to zero)
-void clear_grid(Grid *grid) {
-    for (uint32_t i = 0; i < grid->chunks_count; i++) {
-        grid->chunks[i].count = 0;
-    }
-}
-
-// Fill chunks with boids
-void fill_grid(Grid *grid, ClientBoid *boids, BoidIndex boids_count) {
-    for (BoidIndex i = 0; i < boids_count; i++) {
-        ClientBoid *boid = &boids[i];
-        if ((boid->b.action == ACT_FALL) || (boid->b.action == ACT_SURRENDER || (boid->b.action == ACT_DELETE))) continue;
-
-        float x = boid->b.pos.x;
-        float y = boid->b.pos.y;
-
-        if (x < 0) x = 0;
-        else if (x > grid->screen_width) x = grid->screen_width;
-        if (y < 0) y = 0;
-        else if (y > grid->screen_height) y = grid->screen_height;
-        
-        uint16_t chunk_x = x / CHUNK_SIZE_PIXELS;
-        uint16_t chunk_y = y / CHUNK_SIZE_PIXELS;
-        uint32_t chunk_index = chunk_x + chunk_y*grid->cols;
-
-        Chunk *chunk = &grid->chunks[chunk_index];
-
-        if (chunk->count < CHUNK_SIZE_BOIDS)
-            chunk->boids[chunk->count++] = i;
-    }
-}
-
-// Initialize grid and fully rebuild chunks (delete and recreate all chunks)
-void init_grid(Grid *grid, ClientBoid *boids, BoidIndex boids_count, int width, int height) {
-    grid->screen_width = width;
-    grid->screen_height = height;
-    grid->cols = (uint16_t)(width/CHUNK_SIZE_PIXELS) + 1;
-    grid->rows = (uint16_t)(height/CHUNK_SIZE_PIXELS) + 1;
-    grid->chunks_count = grid->rows * grid->cols;
-
-    if (grid->chunks != NULL) {
-        free(grid->chunks);
-    }
-    grid->chunks = calloc(grid->chunks_count, sizeof(Chunk));
-
-    fill_grid(grid, boids, boids_count);
-}
 
 
 /* <================================================ LOGGING ===============================================> */
@@ -112,8 +46,7 @@ typedef struct {
 
 typedef struct {
     LogEntry *items;
-    int front, rear, size;
-    size_t max_len;
+    int front, rear, size, max_len;
 } Log;
 
 pthread_mutex_t log_mtx;
@@ -129,51 +62,22 @@ void write_log(Log *log, const char *format, ...) {
 
     printf("%s", buf.string);
 
-    // Count lines in message
-    char *c = buf.string;
-    while (*c != '\0') {
-        if (*c == '\n') buf.lines++;
-        c++;
+    if (log->items != NULL) {
+        // Count lines in message
+        char *c = buf.string;
+        while (*c != '\0') {
+            if (*c == '\n') buf.lines++;
+            c++;
+        }
+        if (buf.lines == 0 || *(c-1) != '\n') {
+            putchar('\n');
+            buf.lines++;
+        }
+
+        pthread_mutex_lock(&log_mtx);
+        cstack_push(*log, buf);
+        pthread_mutex_unlock(&log_mtx);
     }
-    if (buf.lines == 0 || *(c-1) != '\n') {
-        putchar('\n');
-        buf.lines++;
-    }
-
-    pthread_mutex_lock(&log_mtx);
-    cstack_push(*log, buf);
-    pthread_mutex_unlock(&log_mtx);
-}
-
-
-/* <============================================ KEYBOARD INPUT ============================================> */
-
-#define INPUT_STRING_LEN 1024
-
-pthread_mutex_t input_mtx;
-pthread_cond_t input_cond;
-char input_string[INPUT_STRING_LEN];
-bool get_input;
-
-char *get_input_string() {
-    get_input = true;
-    pthread_mutex_lock(&input_mtx);
-    while (get_input)
-        pthread_cond_wait(&input_cond, &input_mtx);
-    pthread_mutex_unlock(&input_mtx);
-
-    return input_string;
-}
-
-int get_one_char() {
-    int c = getchar();
-    if (c != EOF && c != '\n') {
-        int ch;
-        do {
-            ch = getchar();
-        } while (ch != EOF && ch != '\n');
-    }
-    return c;
 }
 
 
@@ -189,7 +93,7 @@ char *get_team_name(int team) {
     }
 }
 
-int get_player_idx(ClientPlayer *players, int id) {
+int64_t get_player_idx(ClientPlayer *players, uint32_t id) {
     for (int i = 0; i < TEAMS_COUNT; i++) {
         if (players[i].id == id)
             return i;
@@ -197,8 +101,8 @@ int get_player_idx(ClientPlayer *players, int id) {
     return -1;
 }
 
-ClientPlayer *find_player(ClientPlayer *players, int id) {
-    int i = get_player_idx(players, id);
+ClientPlayer *find_player(ClientPlayer *players, uint32_t id) {
+    int64_t i = get_player_idx(players, id);
     if (i < 0)
         return NULL;
     return &players[i];
@@ -206,6 +110,11 @@ ClientPlayer *find_player(ClientPlayer *players, int id) {
 
 
 /* <============================================ NETWORK THREAD ============================================> */
+
+#define INPUT_STRING_LEN 1024
+
+char input_string[INPUT_STRING_LEN];
+bool get_input = false, input_received = false, typing_string_input = false, running = true;
 
 typedef enum {
     MODE_WAIT,
@@ -225,13 +134,13 @@ typedef enum {
 } GameStage;
 
 typedef struct {
-    int fd, players_number, *joined_players, player_team;
-    bool new_room, *running;
-    uint32_t room_id;
+    int fd, players_number, *joined_players, chunk_size;
+    bool new_room, *select_mode;
     Point *world_size;
     BoidIndex *boids_number, *boids_count, total_boids_number;
     ClientPlayer *players;
     Log *log;
+    Grid *grid;
     int16_t *areas_count;
     Area *areas;
     ClientBoid *boids;
@@ -240,8 +149,9 @@ typedef struct {
 } NetThreadArgs;
 
 pthread_mutex_t areas_mtx;
-pthread_mutex_t running_mtx;
 pthread_mutex_t boids_mtx;
+pthread_mutex_t running_mtx;
+pthread_mutex_t input_mtx;
 
 void *net_thread_fn(void *args) {
     NetThreadArgs *nargs = args;
@@ -250,30 +160,111 @@ void *net_thread_fn(void *args) {
     bool new_room = nargs->new_room;
     int players_number = nargs->players_number;
     int *joined_players = nargs->joined_players;
-    int player_team = nargs->player_team;
-    uint32_t room_id = nargs->room_id;
+    int chunk_size = nargs->chunk_size;
     Point *world = nargs->world_size;
     BoidIndex *boids_number = nargs->boids_number;
     BoidIndex *boids_count = nargs->boids_count;
     BoidIndex total_boids_number = nargs->total_boids_number;
     ClientPlayer *players = nargs->players;
     Log *log = nargs->log;
-    bool *running = nargs->running;
     Area *areas = nargs->areas;
     int16_t *areas_count = nargs->areas_count;
+    bool *select_mode = nargs->select_mode;
+    Grid *grid = nargs->grid;
     ClientBoid *boids = nargs->boids;
     GameMode *mode = nargs->mode;
     GameStage *stage = nargs->stage;
 
+    uint32_t approved_player_id = 0;
+    char approved_player_username[USERNAME_LEN];
+    
     bool ex = false;
-    bool start_areas = false;
     while (1) {
-        uint8_t packet_type;
-        if (recv(fd, &packet_type, 1, 0) <= 0)
+        pthread_mutex_lock(&running_mtx);
+        if (!running) {
+            pthread_mutex_unlock(&running_mtx);
             break;
+        }
+        pthread_mutex_unlock(&running_mtx);
+        
+        pthread_mutex_lock(&input_mtx);
+        if (input_received) {
+            if (approved_player_id != 0) { // 0 is an invalid player id
+                bool ok = true;
+                int8_t team = -1;
+                char team_char = *input_string;
+            
+                if (team_char == 'r')
+                    team = TEAM_RED;
+                else if (team_char == 'b')
+                    team = TEAM_BLUE;
+                else if (team_char == 'g')
+                    team = TEAM_GREEN;
+                else if (team_char == 'y')
+                    team = TEAM_YELLOW;
+                else if (team_char == 'n')
+                    team = -1;
+                else if (team_char == EOF) {
+                    putchar('\n');
+                    ex = true;
+                    break;
+                } else {
+                    write_log(log, "[!] enter valid team\n");
+                    get_input = true;
+                    ok = false;
+                }
+
+                if (team >= 0) {
+                    if (boids_number[team] == 0) {
+                        write_log(log, "[!] enter valid team\n");
+                        get_input = true;
+                        ok = false;
+                    }
+
+                    bool team_used = false;
+                    for (int i = 0; i < *joined_players; i++) {
+                        if (players[i].team == team) {
+                            team_used = true;
+                            break;
+                        }
+                    }
+                    if (team_used) {
+                        write_log(log, "[!] enter an unused team\n");
+                        get_input = true;
+                        ok = false;
+                    }
+                }
+
+                if (ok) {
+                    CPApprove send_data = {.id = htonl(approved_player_id), .team = team};
+                    send_packet(fd, CP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
+                }
+            }
+            
+            input_received = false;
+        }
+        pthread_mutex_unlock(&input_mtx);
+        
+        uint8_t packet_type;
+        int r = recv(fd, &packet_type, 1, 0);
+        if (r == 0) break;
+        if (r < 0) {
+            bool err_wouldblock;
+            #ifdef _WIN32
+                int err = WSAGetLastError();
+                err_wouldblock = (err == WSAEWOULDBLOCK);
+            #else
+                err_wouldblock = (errno == EWOULDBLOCK);
+            #endif
+            if (err_wouldblock) {
+                WaitTime(0.01);
+                continue;
+            } else
+                break;
+        }
 
         switch (packet_type) {
-        case SP_APPROVE_PLAYER: { // Approje/reject new player
+        case SP_APPROVE_PLAYER: { // Approve/reject new player
             SPApprove other_player;
             uint32_t packet_len;
             if (recv_packet(fd, &other_player, &packet_len, 0)) {
@@ -284,51 +275,16 @@ void *net_thread_fn(void *args) {
                 ex = true;
                 break;
             }
-            other_player.fd = ntohl(other_player.fd);
 
-            write_log(log, "[?] team of new player '%s' (id=%d) (r/b/g/y or n for reject):\n", other_player.username, other_player.fd);
-            
-            int8_t other_team = -2;
-            while (other_team == -2) {
-                char other_team_char = *get_input_string();
+            approved_player_id = ntohl(other_player.id);
+            strcpy(approved_player_username, other_player.username);
 
-                if (other_team_char == 'r')
-                    other_team = TEAM_RED;
-                else if (other_team_char == 'b')
-                    other_team = TEAM_BLUE;
-                else if (other_team_char == 'g')
-                    other_team = TEAM_GREEN;
-                else if (other_team_char == 'y')
-                    other_team = TEAM_YELLOW;
-                else if (other_team_char == 'n')
-                    other_team = -1;
-                else if (other_team_char == EOF) {
-                    putchar('\n');
-                    ex = true;
-                    break;
-                }
-                
-                if ((other_team != -1) && ((other_team == -2)? (other_team_char != '\n' && other_team_char != '\r') : (boids_number[other_team] == 0))) {
-                    printf("enter valid team\n");
-                    other_team = -2;
-                } else {
-                    bool team_used = false;
-                    for (int i = 0; i < *joined_players; i++) {
-                        if (players[i].team == other_team) {
-                            team_used = true;
-                            break;
-                        }
-                    }
-                    if (team_used) {
-                        printf("enter an unused team\n");
-                        other_team = -2;
-                    }
-                }
-            }
+            pthread_mutex_lock(&input_mtx);
+            get_input = true;
+            pthread_mutex_unlock(&input_mtx);
 
-            if (other_team != -2)
-                send_packet(fd, CP_APPROVE_PLAYER, &other_team, 1, 0);
-            
+            write_log(log, "[?] team of new player '%s' (r/b/g/y or n for reject):\n", other_player.username);
+
             break;   
             }
         case SP_NEW_JOIN: {
@@ -345,7 +301,7 @@ void *net_thread_fn(void *args) {
             new_player.id = ntohl(new_player.id);
 
             players[(*joined_players)++] = new_player;
-            write_log(log, "[+] new player '%s' (id=%d) - %s\n", new_player.name, new_player.id, get_team_name(new_player.team));
+            write_log(log, "[+] new player '%s' - %s\n", new_player.name, get_team_name(new_player.team));
 
             if (new_room && players_number == *joined_players) {
                 write_log(log, "[*] press ENTER to start placing boids\n");
@@ -365,13 +321,23 @@ void *net_thread_fn(void *args) {
             }
             exited_player = ntohl(exited_player);
 
-            int player_idx = get_player_idx(players, exited_player);
-            write_log(log, "[-] disconnected player '%s' (id=%d)\n", players[player_idx].name, exited_player);
+            if (*stage == STAGE_AREAS && exited_player != approved_player_id) {
+                write_log(log, "[-] player '%s' disconnected\n", approved_player_username);
+                approved_player_id = 0;
+
+                pthread_mutex_lock(&input_mtx);
+                get_input = false;
+                typing_string_input = false;
+                pthread_mutex_unlock(&input_mtx);
+            } else {
+                int player_idx = get_player_idx(players, exited_player);
+                write_log(log, "[-] player '%s' disconnected\n", players[player_idx].name);
             
-            // delete player from array
-            memmove(players + player_idx, players + player_idx + 1,
-                    sizeof(players[0]) * (*joined_players - player_idx - 1));
-            (*joined_players)--;
+                // delete player from array
+                memmove(players + player_idx, players + player_idx + 1,
+                        sizeof(players[0]) * (*joined_players - player_idx - 1));
+                (*joined_players)--;
+            }
             
             break;
             }
@@ -379,18 +345,21 @@ void *net_thread_fn(void *args) {
             uint32_t packet_size;
             recv_all(fd, &packet_size, sizeof(uint32_t), 0);
             packet_size = ntohl(packet_size);
-            void *buf = malloc(packet_size);
+            char *buf = malloc(packet_size);
 
             recv_all(fd, buf, packet_size, 0);
             
             int16_t new_areas_count = ntohs(*(int16_t*)buf);
-            if (new_areas_count < 0 || packet_size != (sizeof(new_areas_count) + new_areas_count*sizeof(Area)))
+            if (new_areas_count < 0 || packet_size != (sizeof(new_areas_count) + new_areas_count*sizeof(Area))) {
+                ex = true;
+                free(buf);
                 break;
+            }
 
             if (!new_room) {
                 pthread_mutex_lock(&areas_mtx);
                 *areas_count = new_areas_count;
-                Area *a = buf + sizeof(*areas_count);
+                Area *a = (Area*)(buf + sizeof(*areas_count));
                 for (int i = 0; i < *areas_count; i++) {
                     areas[i] = *a;
                     areas[i].rec.x1 = ntohs(a->rec.x1);
@@ -415,32 +384,100 @@ void *net_thread_fn(void *args) {
             uint32_t packet_size;
             recv_all(fd, &packet_size, sizeof(uint32_t), 0);
             packet_size = ntohl(packet_size);
-            void *buf = malloc(packet_size);
+            char *buf = malloc(packet_size);
 
             recv_all(fd, buf, packet_size, 0);
 
             uint16_t recv_boids_count = ntohs(*(uint16_t*)buf);
-            if (recv_boids_count != total_boids_number || packet_size != (sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid)))
+            if (recv_boids_count != total_boids_number || packet_size != (sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid))) {
+                ex = true;
+                free(buf);
                 break;
+            }
 
-            ServerStartNetBoid *recv_boids = buf + sizeof(recv_boids_count);
+            ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(buf + sizeof(recv_boids_count));
 
             pthread_mutex_lock(&boids_mtx);
             for (int i = 0; i < recv_boids_count; i++) {
                 ServerStartNetBoid recv_boid = recv_boids[i];
-                ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed, .health = BOID_MAX_HEALTH, .xp = recv_boid.xp,
-                                             .team = recv_boid.team, .action = ACT_STOP}, .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
+                ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed/100.0f, .health = BOID_MAX_HEALTH, .xp = recv_boid.xp,
+                                             .team = recv_boid.team, .action = ACT_STOP},
+                                       .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
                 boids[i] = new_boid;
             }
             *boids_count = recv_boids_count;
+
+            // Reinit grid
+            init_grid(grid, boids, *boids_count, world->x, world->y, chunk_size);
+
             pthread_mutex_unlock(&boids_mtx);
 
             *mode = MODE_SELECT;
             *stage = STAGE_GAME;
+            *select_mode = true;
 
             free(buf);
 
             write_log(log, "[*] the game has started\n");
+            
+            break;
+            }
+        case SP_BOIDS_SYNC: {
+            uint32_t packet_size;
+            recv_all(fd, &packet_size, sizeof(uint32_t), 0);
+            packet_size = ntohl(packet_size);
+            char *buf = malloc(packet_size);
+
+            /* PACKET FORMAT
+            [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
+            */
+            recv_all(fd, buf, packet_size, 0);
+
+            BoidIndex recv_boids_count = ntohs(*(BoidIndex*)buf);
+            if (packet_size != (sizeof(recv_boids_count)*2 + recv_boids_count*sizeof(NetBoid))) {
+                free(buf);
+                break;
+            }
+            BoidIndex boids_first_index = ntohs(*(BoidIndex*)(buf+sizeof(BoidIndex)));
+
+            NetBoid *recv_boids = (NetBoid*)(buf + sizeof(recv_boids_count)*2);
+
+            pthread_mutex_lock(&boids_mtx);
+            for (int i = 0; i < recv_boids_count; i++) {
+                NetBoid *recv_boid = &recv_boids[i];
+                ClientBoid *boid = &boids[boids_first_index + i];
+                boid->b.health = recv_boid->health;
+                boid->b.xp = recv_boid->xp;
+                if (recv_boid->action == ACT_FALL || recv_boid->action == ACT_SURRENDER) {
+                    boid->is_selected = false;
+                    if ((recv_boid->action == ACT_FALL && boid->b.action != ACT_FALL) ||
+                        (recv_boid->action == ACT_SURRENDER && boid->b.action != ACT_SURRENDER))
+                        boid->sprite_timer = 0;
+                    boid->b.action = recv_boid->action;
+                    continue;
+                }
+                boid->b.action = recv_boid->action;
+                boid->target_pos = (Vector2){ntohs(recv_boid->x), ntohs(recv_boid->y)};
+                boid->b.velocity.x = recv_boid->vel/255.0*BOID_MAX_SPEED * cos(recv_boid->angle/127.0*PI);
+                boid->b.velocity.y = recv_boid->vel/255.0*BOID_MAX_SPEED * sin(recv_boid->angle/127.0*PI);
+                // if (recv_boid->vel > 0 && !boid->b.is_fighting)
+                //     boid->direction = boid->b.velocity;
+                boid->go_target = true;
+            }
+
+            // Update grid
+            clear_grid(grid);
+            fill_grid(grid, boids, *boids_count);
+
+            pthread_mutex_unlock(&boids_mtx);
+
+            free(buf);
+
+            break;
+            }
+        case SP_ROOM_CLOSED: {
+            write_log(log, "[*] room closed\n");
+            ex = true;
             
             break;
             }
@@ -451,16 +488,55 @@ void *net_thread_fn(void *args) {
     }
     
     pthread_mutex_lock(&running_mtx);
-    *running = false;
+    running = false;
     pthread_mutex_unlock(&running_mtx);
     
     return NULL;
 }
 
 
-/* <================================================= MAIN =================================================> */
+/* <============================================ BOIDS AND MAIN ============================================> */
 
 #define MAX_AREAS_COUNT 1024
+
+void update_boid_sprite(ClientBoid *boids, BoidIndex boid_index) {
+    ClientBoid *boid = &boids[boid_index];
+    
+    if (boid->b.action == ACT_FALL) {
+        boid->sprite = SPRITE_FALL;
+        if (boid->sprite_timer < 45)
+            boid->sprite_timer++;
+        return;
+    }
+    if (boid->b.action == ACT_SURRENDER) {
+        boid->sprite = SPRITE_SURRENDER;
+        if (boid->sprite_timer < 50)
+            boid->sprite_timer++;
+        return;
+    }
+
+    // Determine if the boid should fall
+    if (boid->sprite_timer > 0) boid->sprite_timer--;
+
+    if (boid->b.is_fighting && boid->sprite_timer == 0 && boid->b.fighting_timer == BOID_MAX_FIGHTING_TIMER) {
+        boid->sprite_timer = 5;
+        if (boid->b.hit) {
+            boid->sprite = SPRITE_OUCH;
+        } else {
+            boid->sprite = (rand()%2)? SPRITE_HIT_LEFT : SPRITE_HIT_RIGHT;
+        }
+    }
+
+    if (((boid->sprite == SPRITE_HIT_LEFT || boid->sprite == SPRITE_HIT_RIGHT || boid->sprite == SPRITE_OUCH) && boid->sprite_timer == 0) || !boid->b.is_fighting) {
+        if (boid->b.action == ACT_ATTACK) boid->sprite = SPRITE_ANGRY;
+        if (boid->b.action == ACT_RETREAT) boid->sprite = SPRITE_SAD;
+        if (boid->b.action == ACT_STOP) boid->sprite = SPRITE_NORMAL;
+        boid->b.hit = false;
+    }
+    if (boid->b.is_fighting) {
+        boid->direction = Vector2Add(boid->direction, Vector2Scale(Vector2Subtract(boids[boid->b.nearest_enemy_idx].b.pos, boid->b.pos), BOID_FIGHTING_FACTOR));
+    }
+}
 
 void draw_boid(ClientBoid *boid, Texture2D texture) {
     static Rectangle sprites[SPRITES_COUNT] = {
@@ -486,9 +562,9 @@ void draw_boid(ClientBoid *boid, Texture2D texture) {
     }
 
     Color tint = WHITE;
-    if (boid->sprite == SPRITE_FALL) {
+    /*if (boid->sprite == SPRITE_FALL) {
         tint.a = 20;
-    } else if ((boid->sprite == SPRITE_SURRENDER) || (boid->sprite == SPRITE_FALL)) {
+    } else*/ if ((boid->sprite == SPRITE_SURRENDER) || (boid->sprite == SPRITE_FALL)) {
         tint.a = (255.0/50.0) * (50 - boid->sprite_timer);
     }
     
@@ -496,21 +572,23 @@ void draw_boid(ClientBoid *boid, Texture2D texture) {
                    atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, tint);
 }
 
-void draw_selection(ClientBoid *boid, Texture2D texture) {
+void draw_selection(ClientBoid *boid, Texture2D texture, float scale, Color color) {
     static Rectangle white_sprite = {0, 260*TEAMS_COUNT, 146, 149};
-    Rectangle destRec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE*1.2, BOID_SIZE*1.2};
-    Color tint = ORANGE;
+    Rectangle dest_rec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE*scale, BOID_SIZE*scale};
     
-    DrawTexturePro(texture, white_sprite, destRec, (Vector2){BOID_SIZE*1.2/2.0, BOID_SIZE*1.2/2.0},
-                   atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, tint);
+    DrawTexturePro(texture, white_sprite, dest_rec, (Vector2){BOID_SIZE*1.2/2.0, BOID_SIZE*1.2/2.0},
+                   atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, color);
 }
 
 int main(int argc, char **argv) {
     /* FORMAT
      Join to the room:
-         ./client join [-s|--server] <server_ip> [--room|-r] <room_id> [--name|-n] <username>
+         ./client join [-s|--server] <server_ip> [-t|--tcp-port] <server_port> [-c|--chunk] <chunk_size> \
+             [--name|-n] <username> <room_id>
      Create new room:
-         ./client new [-s|--server] <server_ip> [--players|-p] <players_count> [--world|-w] <wold_size> <boids_count>
+         ./client new [-s|--server] <server_ip> [-T|--tcp-port] <server_port> [-c|--chunk] <chunk_size> \
+             [--players|-p] <players_count> [-t|--team] <player_team> [--world|-w] <wold_size> <boids_count>
+         <player_team> is a letter indicating the player's team: r, g, b or y
          <boids_count> is in the format <team>:<count>, setting <count> to the number of boids in <team>
              Example (4 teams, red and blue - 2000 boids, green - 1000 boids, yellow - 500 boids):
              ./client new 4 r:b:2000 g:1000 y:500
@@ -521,11 +599,13 @@ int main(int argc, char **argv) {
     // room/player settings, argparse
     bool new_room;
     uint32_t room_id = 0;
-    int players_number = 0, player_team = TEAM_RED;
+    int players_number = 0;
+    BoidTeam player_team = TEAM_RED;
     BoidIndex boids_number[TEAMS_COUNT] = { 0 }, total_boids_number = 0;
     char *username = NULL, *server = "127.0.0.1", *player_team_name = NULL;
     Point world_size = {10050, 10050};
-    short tcp_port = INPUT_PORT;;
+    short tcp_port = INPUT_PORT;
+    int chunk_size = 300;
     
     if (argc < 2) {
         fputs("missed argument: new/join\n", stderr);
@@ -552,7 +632,7 @@ int main(int argc, char **argv) {
             if (strcmp(arg, "--server") == 0 || strcmp(arg, "-s") == 0) {
                 server = *(++argv);
                 argc--;
-            } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-t") == 0) {
+            } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
                 char *value_str = *(++argv);
                 argc--;
 
@@ -562,6 +642,25 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
                     return 1;
                 }
+            } else if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
+                char *value_str = *(++argv);
+                argc--;
+
+                char *endp;
+                chunk_size = strtoul(value_str, &endp, 10);
+                if (*endp != '\0') {
+                    fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                    return 1;
+                }
+
+                if (chunk_size < BOID_SIZE) {
+                    fprintf(stderr, "size of chunk must be greater than or equal to %d\n", BOID_SIZE);
+                    return 1;
+                } else if (chunk_size > CHUNK_SIZE_PIXELS) {
+                    fprintf(stderr, "size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
+                    return 1;
+                }
+                chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
             } else if (strcmp(arg, "--name") == 0 || strcmp(arg, "-n") == 0) {
                 username = *(++argv);
                 argc--;
@@ -614,24 +713,12 @@ int main(int argc, char **argv) {
                 }
                 
             } else {
-                if (strcmp(arg, "--room") == 0 || strcmp(arg, "-r") == 0) {
-                    char *value_str = *(++argv);
-                    argc--;
-                
-                    char *endp;
-                    room_id = strtoul(value_str, &endp, 16);
-                    if (*endp != '\0') {
-                        fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
-                        return 1;
-                    }
-                } else {
-                    fprintf(stderr, "unexpected argument '%s'\n", arg);
-                    return 1;
-                }
+                fprintf(stderr, "unexpected argument '%s'\n", arg);
+                return 1;
             }
         } else if (new_room) {
-            char teams[TEAMS_COUNT] = { 0 }, *c;
-            int teams_count = 0;
+            char *c;
+            int teams[TEAMS_COUNT] = { 0 }, teams_count = 0;
             bool err = false;
 
             for (c = arg; *c != '\0'; c++) {
@@ -667,7 +754,13 @@ int main(int argc, char **argv) {
             }
             for (int i = 0; i < teams_count; i++)
                 boids_number[teams[i]] = boids;
-            
+        } else if (!new_room) {
+            char *endp;
+            room_id = strtoul(arg, &endp, 16);
+            if (*endp != '\0') {
+                fprintf(stderr, "illegal value '%s' for option 'room'\n", arg);
+                return 1;
+            }
         } else {
             fprintf(stderr, "unexpected argument '%s'\n", arg);
             return 1;
@@ -683,7 +776,7 @@ int main(int argc, char **argv) {
     }
 
     if (server == NULL)
-        server = "127.0.0.1";
+        server = BASE_SERVER;
     if (username == NULL)
         username = "noname";
     if (new_room) {
@@ -703,10 +796,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "number of boids (%u) is greater than max boids count (%u)\n", total_boids_number, MAX_BOIDS_COUNT);
             return 1;
         }
-        
     }
 
     printf("server %s:%d\n", server, tcp_port);
+
+    // Init log
+    Log log;
+    init_cstack(log, MAX_LOG_LEN);
+
     // printf("name: %s\n", username);
     // if (new_room) {
     //     printf("team: %s\n", player_team_name);
@@ -831,7 +928,6 @@ int main(int argc, char **argv) {
 
     room_id = ntohl(recv_data.room_id);
     players_number = recv_data.players_number;
-    uint8_t player_id = ntohl(recv_data.player_id);
     int joined_players = recv_data.joined_players;
     world_size.x = ntohs(recv_data.world_size.x);
     world_size.y = ntohs(recv_data.world_size.y);
@@ -853,55 +949,82 @@ int main(int argc, char **argv) {
         team_used[i] = boids > 0;
     }
 
-    // Init log
-    Log log;
-    init_cstack(log, MAX_LOG_LEN);
+    // Make socket nonblocking
+    #ifdef _WIN32
+        u_long flag = 1;
+        if (ioctlsocket(fd, FIONBIO, &flag) != 0) {
+            perror("ioctlsocket FIONBIO");
+            close(fd);
+            WSACleanup();
+            return 1;
+        }
+    #else
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            perror("fcntl O_NONBLOCK");
+            close(fd);
+            return 1;
+        }
+    #endif
 
-    write_log(&log, "[*] %s\n    id: %06x\n    teams: %d\n    world: %dx%d\n    creator: %s (id=%d)\n    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
+    write_log(&log, "[*] %s\n    id: %06x\n    teams: %d\n    world: %dx%d\n    chunk: %d\n    creator: %s\n    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
            new_room? "created a room" : "joined to the room",
-           room_id, players_number, world_size.x, world_size.y, players[0].name, players[0].id, total_boids_number,
+           room_id, players_number, world_size.x, world_size.y, chunk_size, players[0].name, total_boids_number,
            boids_number[TEAM_RED],
            boids_number[TEAM_BLUE],
            boids_number[TEAM_GREEN],
            boids_number[TEAM_YELLOW]);
 
+    if (!new_room) {
+        write_log(&log, "[*] players:\n");
+        for (int i = 0; i < joined_players; i++) {
+            ClientPlayer *op = &players[i];
+
+            char *team = get_team_name(op->team);
+
+            write_log(&log, "    %s - %s\n", op->name, team);
+        }
+    }
+
     // Init Raylib
     SetTraceLogLevel(LOG_WARNING);
-    #ifdef _WIN32
-        SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_BORDERLESS_WINDOWED_MODE);
-        InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Battle creator");
-        ToggleFullscreen();
-
-        int monitor = GetCurrentMonitor();
-        SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
-    #else
-        SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_FULLSCREEN_MODE);
-        InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Battle creator");
-    #endif
+    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_FULLSCREEN_MODE);
+    
+    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Battle creator");
     SetTargetFPS(60);
 
     // Control
     GameMode mode = new_room ? MODE_AREAS : MODE_WAIT;
     GameStage stage = STAGE_AREAS;
-    bool show_log = true, show_grid = false, delete_boids = false;
+    bool show_log = true, show_grid = false, show_health = false, delete_boids = false;
     int brush_size = 1;
+    BoidAction action = ACT_STOP;
+
+    bool show_arrow = false, change_boids_direction = false; // Delete a variable change_boids_direction?
+    Vector2 arrow_start = { 0 };
+
+    bool show_line = false;
+    Vector2 line_points[ORDER_LINE_MAX_POINT];
+    int line_points_count = 0;
+    float line_len = 0;
     
     // Selection
     int selecting_team = TEAM_RED;
-    bool selecting = false, select_mode = false, selecting_shift_pressed = false;
+    bool selecting = false, select_mode = false, selecting_shift_pressed = false,
+         clear_order = false, change_boids_action = false;
     Vector2 selection_start = { 0 };
-    
+
     // Camera
     Camera2D camera = { 0 };
     camera.zoom = 1.0f;
     camera.target = (Vector2){world_size.x/2.0 - GetScreenWidth()/2.0, world_size.y/2.0 - GetScreenHeight()/2.0};
 
     // Keyboard string input
-    bool typing_string_input = false;
+    // bool typing_string_input = false;
     int input_len = 0;
 
     // Areas selecting
-    Point area_start_selecting, area_end_selecting;
+    Point area_start_selecting = { 0 }, area_end_selecting = { 0 };
     Area areas[MAX_AREAS_COUNT] = { 0 };
     int areas_size[TEAMS_COUNT] = { 0 };
     int16_t areas_count = 0;
@@ -912,36 +1035,23 @@ int main(int argc, char **argv) {
 
     // Grid of chunks
     Grid grid = { 0 };
-    init_grid(&grid, boids, boids_count, world_size.x, world_size.y);
+    init_grid(&grid, boids, boids_count, world_size.x, world_size.y, CHUNK_SIZE_PIXELS);
 
     // Textures
-    Texture2D texture = LoadTexture("../resources/texture.png");
+    Texture2D texture = LoadTexture("resources/texture.png");
     GenTextureMipmaps(&texture);
-    // SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+    SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
 
-    // Start a thread to recive messages from the server
-    bool running = true;
+    // Start a thread to receive messages from the server
     pthread_mutex_init(&log_mtx, NULL);
     pthread_mutex_init(&input_mtx, NULL);
-    pthread_cond_init(&input_cond, NULL);
     pthread_mutex_init(&boids_mtx, NULL);
-    NetThreadArgs thread_args = {.fd = fd, .players_number = players_number, .joined_players = &joined_players, .player_team = player_team, .new_room = new_room,
-                                 .running=&running, .room_id = room_id, .world_size = &world_size, .boids_number = boids_number, .boids_count = &boids_count,
-                                 .total_boids_number = total_boids_number, .players = players, .log = &log, .areas_count = &areas_count,
-                                 .areas = areas, boids = boids, .mode = &mode, .stage = &stage};
+    NetThreadArgs thread_args = {.fd = fd, .players_number = players_number, .joined_players = &joined_players, .chunk_size = chunk_size, .new_room = new_room,
+                                 .select_mode = &select_mode, .world_size = &world_size, .boids_number = boids_number, .boids_count = &boids_count,
+                                 .total_boids_number = total_boids_number, .players = players, .log = &log, .grid = &grid, .areas_count = &areas_count,
+                                 .areas = areas, .boids = boids, .mode = &mode, .stage = &stage};
     pthread_t net_thread;
     pthread_create(&net_thread, NULL, net_thread_fn, &thread_args);
-    
-    if (!new_room) {
-        write_log(&log, "[*] players:\n");
-        for (int i = 0; i < joined_players; i++) {
-            ClientPlayer *op = &players[i];
-
-            char *team = get_team_name(op->team);
-
-            write_log(&log, "    %s (id=%d) - %s\n", op->name, op->id, team);
-        }
-    }
     
     while (!WindowShouldClose()) {
         pthread_mutex_lock(&running_mtx);
@@ -949,19 +1059,45 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&running_mtx);
         
         // Keys
-        if (!show_log || !get_input) {
+        if (!show_log || !typing_string_input) {
             if (IsKeyPressed(KEY_L)) show_log = !show_log;
             if (IsKeyPressed(KEY_K)) show_grid = !show_grid;
+
+            if (mode == MODE_SELECT)
+                selecting_shift_pressed |= IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         
+            if (mode == MODE_AREAS) {
+                if (!show_log || !get_input) {
+                    if (IsKeyPressed(KEY_Q)) selecting_team = TEAM_RED;
+                    if (IsKeyPressed(KEY_W)) selecting_team = TEAM_BLUE;
+                    if (IsKeyPressed(KEY_E)) selecting_team = TEAM_GREEN;
+                    if (IsKeyPressed(KEY_R)) selecting_team = TEAM_YELLOW;
+                    if (IsKeyPressed(KEY_Z)) selecting_team = -1;
+                }
+            }
             if (stage == STAGE_PLACING) {
                 if (IsKeyPressed(KEY_A)) mode = MODE_SPAWN, select_mode = false;
                 if (IsKeyPressed(KEY_S)) mode = MODE_SELECT, select_mode = true, selecting = false, selecting_shift_pressed = false;
                 if (IsKeyPressed(KEY_D)) mode = MODE_DELETE, select_mode = false;
+                
                 if (IsKeyPressed(KEY_X)) delete_boids = true;
+            } else if (stage == STAGE_GAME) {
+                if (IsKeyPressed(KEY_S)) mode = MODE_SELECT, select_mode = true, selecting = false, selecting_shift_pressed = false;
+                if (IsKeyPressed(KEY_D)) mode = MODE_DIRECTION, select_mode = true;
+                if (IsKeyPressed(KEY_F)) mode = MODE_POINT, select_mode = true;
+                if (IsKeyPressed(KEY_G)) mode = MODE_LINE, select_mode = true, show_line = false;
+                
+                if (IsKeyPressed(KEY_ONE)) action = ACT_STOP, change_boids_action = select_mode;
+                else if (IsKeyPressed(KEY_TWO)) action = ACT_ATTACK, change_boids_action = select_mode;
+                else if (IsKeyPressed(KEY_THREE)) action = ACT_RETREAT, change_boids_action = select_mode;
+                
+                if (IsKeyPressed(KEY_H)) show_health = !show_health;
+                if (IsKeyPressed(KEY_Z) && select_mode) clear_order = true;
+                if (IsKeyPressed(KEY_T) && (mode == MODE_LINE)) change_boids_direction = true, show_line = false;
             }
 
-            if (IsKeyPressed(KEY_P)) brush_size += MAX(1, log10f(brush_size));
-            if (IsKeyPressed(KEY_O) && brush_size > 1) brush_size -= MAX(1, log10f(brush_size));
+            if (IsKeyPressed(KEY_P) || IsKeyPressedRepeat(KEY_P)) brush_size += MAX(1, log10f(brush_size));
+            if ((IsKeyPressed(KEY_O) || IsKeyPressedRepeat(KEY_O)) && brush_size > 1) brush_size -= MAX(1, log10f(brush_size));
         }
 
         Vector2 mouse_position = GetScreenToWorld2D(GetMousePosition(), camera);
@@ -970,8 +1106,8 @@ int main(int argc, char **argv) {
 
         // Camera
         float wheel = GetMouseWheelMove();
-        if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) wheel = -1.0;
-        if (IsKeyPressed(KEY_KP_ADD) || (IsKeyPressed(KEY_EQUAL) && (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)))) wheel = 1.0;
+        if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT) || IsKeyPressedRepeat(KEY_MINUS) || IsKeyPressedRepeat(KEY_KP_SUBTRACT)) wheel = -1.0;
+        if (IsKeyPressed(KEY_KP_ADD) || IsKeyPressedRepeat(KEY_KP_ADD) || ((IsKeyPressed(KEY_EQUAL) || IsKeyPressedRepeat(KEY_EQUAL)) && (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)))) wheel = 1.0;
         if (wheel != 0) {
             if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
                 // Change size of the brush
@@ -992,22 +1128,23 @@ int main(int argc, char **argv) {
         }
 
         // Get string input from keyboard
+        pthread_mutex_lock(&input_mtx);
         if (show_log && get_input) {
             if (!typing_string_input) {
                 // Input starts with SPACE
                 if (IsKeyPressed(KEY_SPACE)) {
                     typing_string_input = true;
                     input_len = 0;
+                    input_string[0] = '\0';
                 }
             } else {
                 // Input ends with ENTER
-                if (IsKeyPressed(KEY_ENTER)) {
+                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
                     typing_string_input = false;
                     write_log(&log, input_string);
-                    pthread_mutex_lock(&input_mtx);
+
                     get_input = false;
-                    pthread_cond_signal(&input_cond);
-                    pthread_mutex_unlock(&input_mtx);
+                    input_received = true;
                 } else {
                     int key = GetCharPressed();
                     while (key > 0) {
@@ -1026,11 +1163,12 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        pthread_mutex_unlock(&input_mtx);
         
         // Areas mode
         if (mode == MODE_AREAS) {
             // Selecting
-            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && areas_count < MAX_AREAS_COUNT - 3) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && areas_count < MAX_AREAS_COUNT - 3 && team_used[selecting_team]) {
                 int x = roundf(mouse_position.x/BOID_SIZE);
                 if (x < 0) x = 0;
                 if (x > world_size.x/BOID_SIZE) x = world_size.x/BOID_SIZE;
@@ -1044,7 +1182,7 @@ int main(int argc, char **argv) {
                     area_start_selecting = area_end_selecting;
                     selecting = true;
                 }
-            } else if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) {
+            } else if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) && team_used[selecting_team]) {
                 // Create new area
                 
                 selecting = false;
@@ -1108,16 +1246,8 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (!show_log || !get_input) {
-                if (IsKeyPressed(KEY_Q)) selecting_team = TEAM_RED;
-                if (IsKeyPressed(KEY_W)) selecting_team = TEAM_BLUE;
-                if (IsKeyPressed(KEY_E)) selecting_team = TEAM_GREEN;
-                if (IsKeyPressed(KEY_R)) selecting_team = TEAM_YELLOW;
-                if (IsKeyPressed(KEY_Z)) selecting_team = -1;
-            }
-
             // Start placing
-            if (IsKeyPressed(KEY_ENTER) && new_room && players_number == joined_players) {
+            if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && !typing_string_input && new_room && players_number == joined_players) {
                 bool ok = true;
                 for (int team = 0; team < TEAMS_COUNT; team++) {
                     if (team_used[team] && boids_number[team] > areas_size[team]) {
@@ -1129,11 +1259,11 @@ int main(int argc, char **argv) {
                 // Send data to the server only if size of areas of all teams is greater than or equal to the number of boids
                 if (ok) {
                     uint32_t buf_size = areas_count * sizeof(*areas) + sizeof(areas_count);
-                    void *buf = malloc(buf_size);
+                    char *buf = malloc(buf_size);
 
                     pthread_mutex_lock(&areas_mtx);
                     *(uint16_t*)buf = htons(areas_count);
-                    Area *a = buf + sizeof(areas_count);
+                    Area *a = (Area*)(buf + sizeof(areas_count));
                     for (int i = 0; i < areas_count; i++) {
                         *a = areas[i];
                         a->rec.x1 = htons(a->rec.x1);
@@ -1155,7 +1285,7 @@ int main(int argc, char **argv) {
 
         // Spawn boids
         BoidIndex deleted_boids_count = 0;
-        static SPoint spawn_prev_pos = {-1, -1};
+        static SPoint spawn_prev_pos = {-1, -1}, delete_prev_pos = {-1, -1};
         if (stage == STAGE_PLACING) {
             if (mode == MODE_SPAWN && IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && boids_count < boids_number[player_team] && \
                 mouse_position.x + (int)(brush_size - brush_size/2) * BOID_SIZE >= 0 &&
@@ -1258,11 +1388,11 @@ int main(int argc, char **argv) {
                     free(cells);
 
                     spawn_prev_pos = pos;
+                    delete_prev_pos = (SPoint){-1, -1};
                 }
             }
 
-            // Delete boids
-            static SPoint delete_prev_pos = {-1, -1};
+            // Delete boids (place stage)
             if (mode == MODE_DELETE && IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && boids_count > 0 &&
                 mouse_position.x + (int)(brush_size - brush_size/2) * BOID_SIZE >= 0 &&
                 mouse_position.x - (int)(brush_size/2) * BOID_SIZE <= world_size.x &&
@@ -1271,11 +1401,11 @@ int main(int argc, char **argv) {
                 
                 SPoint pos = {(int)mouse_position.x/BOID_SIZE, (int)mouse_position.y/BOID_SIZE};
                 
-                if (pos.x != spawn_prev_pos.x || pos.y != spawn_prev_pos.y) {
+                if (pos.x != delete_prev_pos.x || pos.y != delete_prev_pos.y) {
                     SRec brush_rec = {pos.x - brush_size/2, pos.y - brush_size/2,
                                      pos.x - brush_size/2 + brush_size, pos.y - brush_size/2 + brush_size};
 
-                    int *used_chunks = calloc(pow(ceilf((float)brush_size*BOID_SIZE/CHUNK_SIZE_PIXELS) + 1, 2), sizeof(*used_chunks));
+                    uint32_t *used_chunks = calloc(pow(ceilf((float)brush_size*BOID_SIZE/CHUNK_SIZE_PIXELS) + 1, 2), sizeof(*used_chunks));
                     int used_chunks_count = 0;
                     
                     for (int cell_x = brush_rec.x1; cell_x < brush_rec.x2; cell_x++) {
@@ -1319,15 +1449,16 @@ int main(int argc, char **argv) {
 
                     free(used_chunks);
 
+                    spawn_prev_pos = (SPoint){-1, -1};
                     delete_prev_pos = pos;
                 }
             }
 
             
             // Send boids and a message that the player is ready to start the game
-            if (IsKeyPressed(KEY_ENTER)) {
+            if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && !typing_string_input) {
                 if (boids_count == boids_number[player_team]) {
-                    ClientStartNetBoids *data = calloc(boids_count + 1, sizeof(*data));
+                    ClientStartNetBoids *data = calloc((boids_count + 1)*2, sizeof(*data));
                     data[0].team = -1;
                     int index = 0;
 
@@ -1352,7 +1483,7 @@ int main(int argc, char **argv) {
                             if (find == (data[index].team >= 0))
                                 data[index].count++;
                             else
-                                data[++index] = (ClientStartNetBoids){.team = find ? player_team : -1, .count = 1};
+                                data[++index] = (ClientStartNetBoids){.team = find ? (signed)player_team : -1, .count = 1};
                         }
                     }
 
@@ -1363,7 +1494,7 @@ int main(int argc, char **argv) {
                     }
                     
                     uint32_t bufsize = sizeof(count) + count * sizeof(*data);
-                    void *buf = malloc(bufsize);
+                    char *buf = malloc(bufsize);
 
                     uint16_t ncount = htons(count);
                     memcpy(buf, &ncount, sizeof(count));
@@ -1399,7 +1530,7 @@ int main(int argc, char **argv) {
             pthread_mutex_lock(&boids_mtx);
             for (BoidIndex i = 0; i < boids_count; i++) {
                ClientBoid *boid = &boids[i];
-                if (boid->b.action != ACT_SURRENDER && boid->b.action != ACT_FALL && boid->b.action != ACT_DELETE) {
+                if (boid->b.team == player_team && boid->b.action != ACT_SURRENDER && boid->b.action != ACT_FALL && boid->b.action != ACT_DELETE) {
                     if (selecting) {
                         boid->is_selected = (selecting_shift_pressed && boid->is_selected) || (
                                            (boid->b.pos.x > fmin(selection_start.x, mouse_position.x)) &&
@@ -1415,6 +1546,16 @@ int main(int argc, char **argv) {
                             boid->is_selected = false;
                             deleted_boids_count++;
                             continue;
+                        } else {
+                            /*if (change_boids_action) {
+                                if ((boid->b.action == ACT_STOP) && (action != ACT_STOP)) // Randomize boid's speed, if it stops
+                                    boid->b.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+
+                                boid->b.action = action;
+                                if (action == ACT_STOP) boid->sprite = SPRITE_NORMAL;
+                                if (action == ACT_ATTACK) boid->sprite = SPRITE_ANGRY;
+                                if (action == ACT_RETREAT) boid->sprite = SPRITE_SAD;
+                            }*/
                         }
                     }
                     
@@ -1426,10 +1567,10 @@ int main(int argc, char **argv) {
             
             delete_boids = false;
         }
-        
+
         // Remove deleted boids from array
-        pthread_mutex_lock(&boids_mtx);
         if (deleted_boids_count > 0) {
+            pthread_mutex_lock(&boids_mtx);
             int offset = 0;
             for (int i = 0; i < boids_count; i++) {
                 boids[i - offset] = boids[i];
@@ -1438,17 +1579,174 @@ int main(int argc, char **argv) {
                     offset++;
             }
             boids_count -= offset;
+            pthread_mutex_unlock(&boids_mtx);
         }
-        pthread_mutex_unlock(&boids_mtx);
-        
+
+        // Direction mode
+        Vector2 arrow_vector = Vector2Subtract(mouse_position, arrow_start);
+        Vector2 arrow_vector_norm = Vector2Normalize(arrow_vector);
+        if (mode == MODE_DIRECTION) {
+            show_arrow = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+            if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) {
+                show_arrow = false;
+                change_boids_direction = Vector2LengthSqr(arrow_vector) >= 40*40;
+            }
+            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
+                arrow_start = mouse_position;
+        }
+
+        // Point mode
+        if (mode == MODE_POINT) {
+            if (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON))
+                change_boids_direction= true;
+        }
+
+        // Line mode
+        if (mode == MODE_LINE) {
+            // Building a line from segments
+            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+                float x = mouse_position.x;
+                if (x < 0) x = 0;
+                else if (x > world_size.x) x = world_size.x;
+
+                float y = mouse_position.y;
+                if (y < 0) y = 0;
+                else if (y > world_size.y) y = world_size.y;
+
+                Vector2 point_pos = {x, y};
+
+                if (show_line && (line_points_count < ORDER_LINE_MAX_POINT)) {
+                    line_len += Vector2Distance(point_pos, line_points[line_points_count-1]);
+                    line_points[line_points_count++] = point_pos;
+                } else if (!show_line) { // First point
+                    show_line = true;
+                    line_points[0] = point_pos;
+                    line_len = 0;
+                    line_points_count = 1;
+                }
+            }
+        }
+
+        if (stage == STAGE_GAME && (change_boids_action || change_boids_direction || clear_order)) {
+            BoidIndex selected_boids[MAX_BOIDS_COUNT] = { 0 };
+            BoidIndex selected_boids_count = 0;
+            for (BoidIndex i = 0; i < boids_count; i++) {
+                ClientBoid *boid = &boids[i];
+                if (boid->b.team == player_team && boid->is_selected)
+                    selected_boids[selected_boids_count++] = htons(i);
+            }
+
+            /* PACKET FORMAT
+            ORDER_CLEAR - [int8 order_type] [uint16 boids_count] [uint16[boids_count] boids]
+            ORDER_ACTION - [int8 order_type] [int8 new_action] [uint16 boids_count] [uint16[boids_count] boids]
+            ORDER_DIRECTION - [int8 order_type] [int32 vector.x*65535] [int32 vector.y*65535] [uint16 boids_count] [uint16[boids_count] boids]
+            ORDER_POINT - [int8 order_type] [uint16 point.x] [uint16 point.y] [uint16 boids_count] [uint16[boids_count] boids]
+            ORDER_LINE - [int8 order_type] [uint8 points_count] [{uint16 x, y}[points_count] points] [uint16 boids_count] [uint16[boids_count] boids]
+            */
+
+            uint32_t base_packet_size = 1 + sizeof(BoidIndex) + sizeof(BoidIndex)*selected_boids_count; // order_type + boids_count + boids
+            uint32_t packet_size = base_packet_size;
+            char *data = NULL;
+
+            if (clear_order) { // ORDER_CLEAR
+                packet_size += 0;
+                data = malloc(packet_size);
+
+                *(int8_t*)(data) = ORDER_CLEAR;
+            } else if (change_boids_action) { // ORDER_ACTION
+                packet_size += 1;
+                data = malloc(packet_size);
+
+                *(int8_t*)(data) = ORDER_ACTION;
+                *(int8_t*)(data+1) = action;
+            } else if (mode == MODE_DIRECTION) { // ORDER_DIRECTION
+                packet_size += 4 + 4;
+                data = malloc(packet_size);
+
+                *(int8_t*)(data) = ORDER_DIRECTION;
+                *(int32_t*)(data+1) = htonl(arrow_vector_norm.x*65535);
+                *(int32_t*)(data+1+4) = htonl(arrow_vector_norm.y*65535);
+            } else if (mode == MODE_POINT) { // ORDER_POINT
+                packet_size += 2 + 2;
+                data = malloc(packet_size);
+
+                int x = mouse_position.x;
+                if (x < 0) x = 0;
+                else if (x > world_size.x) x = world_size.x;
+
+                int y = mouse_position.y;
+                if (y < 0) y = 0;
+                else if (y > world_size.y) y = world_size.y;
+
+                *(int8_t*)(data) = ORDER_POINT;
+                *(uint16_t*)(data+1) = htons(x);
+                *(uint16_t*)(data+1+2) = htons(y);
+            } else if (mode == MODE_LINE) { // ORDER_LINE
+                packet_size += 1 + sizeof(Point)*line_points_count;
+                data = malloc(packet_size);
+
+                *(int8_t*)(data) = ORDER_LINE;
+                *(uint8_t*)(data+1) = line_points_count;
+
+                Point *points = (Point*)(data+1+1);
+                for (int i = 0; i < line_points_count; i++) {
+                    points[i].x = htons(line_points[i].x);
+                    points[i].y = htons(line_points[i].y);
+                }
+            }
+
+            if (data != NULL) {
+                *(BoidIndex*)(data + (packet_size - base_packet_size + 1)) = htons(selected_boids_count);
+                memcpy(data + (packet_size - base_packet_size + 1 + sizeof(BoidIndex)), selected_boids, sizeof(BoidIndex)*selected_boids_count);
+
+                send_packet(fd, CP_ORDER, data, packet_size, 0);
+                free(data);
+            }
+
+            change_boids_action = false;
+            change_boids_direction = false;
+            clear_order = false;
+        }
+
         // Update boids
-        /*for (BoidIndex i = 0; i < boids_count; i++) {
-            ClientBoid *boid = &boids[i];
+        if (stage == STAGE_GAME) {
+            memset(boids_number, 0, sizeof(boids_number)); // Clear boids_number
 
-            if (boid->b.action == ACT_DELETE) continue;
+            pthread_mutex_lock(&boids_mtx);
+            for (BoidIndex i = 0; i < boids_count; i++) {
+                ClientBoid *boid = &boids[i];
 
-            // update the boid and change its ccordinates
-        }*/
+                if (boid->b.action == ACT_DELETE) continue;
+
+                update_base_boid(boids, &grid, i, sizeof(*boids), /*can_change_action*/ true, /*can_fall*/ false);
+                update_boid_sprite(boids, i);
+
+                if (boid->b.action != ACT_SURRENDER && boid->b.action != ACT_FALL) {
+                    if (boid->go_target) {
+                        Vector2 target_dir = Vector2Subtract(boid->target_pos, boid->b.pos);
+                        if (Vector2LengthSqr(target_dir) >= BOID_SIZE*BOID_SIZE) {
+                            target_dir = Vector2Normalize(target_dir);
+                            boid->b.velocity = Vector2Add(boid->b.velocity, Vector2Scale(target_dir, BOID_TARGET_FACTOR));
+                        } else {
+                            boid->go_target = false;
+                        }
+                    }
+                    
+                    boid_normal_speed(&boid->b);
+                    boid_bound(&boid->b, world_size.x, world_size.y);
+
+                    boid->direction.x = boid->direction.x*0.97f + boid->b.velocity.x*0.03f;
+                    boid->direction.y = boid->direction.y*0.97f + boid->b.velocity.y*0.03f;
+
+                    boids_number[boid->b.team]++;
+                } else {
+                    boid->is_selected = false;
+                }
+
+                boid->b.pos = Vector2Add(boid->b.pos, Vector2Scale(boid->b.velocity, boid->b.speed));
+            }
+            pthread_mutex_unlock(&boids_mtx);
+        }
 
         // Update grid
         pthread_mutex_lock(&boids_mtx);
@@ -1495,11 +1793,18 @@ int main(int argc, char **argv) {
                 }
             }
 
+            // Draw fallen boids
+            for (BoidIndex i = 0; i < boids_count; i++) {
+                ClientBoid *boid = &boids[i];
+                if (boid->sprite == SPRITE_FALL)
+                    draw_boid(boid, texture);
+            }
+
             // Draw selection
             for (BoidIndex i = 0; i < boids_count; i++) {
                 ClientBoid *boid = &boids[i];
                 if ((boid->sprite != SPRITE_FALL) && (boid->is_selected)) {
-                    draw_selection(boid, texture);
+                    draw_selection(boid, texture, 1.2, ORANGE);
                     // if (boid->pointOrder)
                         // DrawCircle(boid->orderVector.x, boid->orderVector.y, 20, (Color){0, 0, 0, 50});
                 }
@@ -1512,7 +1817,7 @@ int main(int argc, char **argv) {
                 if ((boid->sprite != SPRITE_FALL) && (boid->b.action != ACT_DELETE)) {
                     draw_boid(boid, texture);
                     // if (show_health)
-                    //     DrawText(TextFormat("%d", boid->b.health), boid->b.pos.x- 5 - ((int)log10(boid->b.health) * 7), boid->b.pos.y - 50, 20, BLACK);
+                    //     DrawText(TextFormat("%d", boid->b.health), boid->b.pos.x - 5 - ((int)log10(boid->b.health) * 7), boid->b.pos.y - 50, 20, BLACK);
                 }
             }
             pthread_mutex_unlock(&boids_mtx);
@@ -1529,7 +1834,7 @@ int main(int argc, char **argv) {
                                      thick, BLACK);
             }
 
-            // Drawing boids slection
+            // Drawing boids slection box
             if ((mode == MODE_SELECT) && selecting) {
                 float rectangleX = fmin(selection_start.x, mouse_position.x);
                 float rectangleY = fmin(selection_start.y, mouse_position.y);
@@ -1539,6 +1844,32 @@ int main(int argc, char **argv) {
                                  thick, BLACK);
             }
 
+            // Draw arrow (in direction mode)
+            if ((mode == MODE_DIRECTION) && show_arrow && (Vector2LengthSqr(arrow_vector) >= powf(40/camera.zoom, 2))) {
+                DrawLineEx(arrow_start, mouse_position, thick, BLACK);
+                DrawLineEx(mouse_position, Vector2Add(mouse_position, Vector2Scale(Vector2Rotate(arrow_vector_norm,  160*DEG2RAD), 40/camera.zoom)), thick, BLACK);
+                DrawLineEx(mouse_position, Vector2Add(mouse_position, Vector2Scale(Vector2Rotate(arrow_vector_norm, -160*DEG2RAD), 40/camera.zoom)), thick, BLACK);
+            }
+            
+            // Draw point (in point mode)
+            if (mode == MODE_POINT) {
+                DrawCircle(mouse_position.x, mouse_position.y, 20/camera.zoom, (Color){0, 0, 0, 50});
+            }
+
+            // Draw lines (in line mode)
+            if (mode == MODE_LINE) {
+                if (show_line) {
+                    DrawCircle(line_points[0].x, line_points[0].y, 10/camera.zoom, (Color){0, 0, 0, 50});
+                    for (uint8_t i = 1; i < line_points_count; i++) {
+                        DrawCircle(line_points[i].x, line_points[i].y, 10/camera.zoom, (Color){0, 0, 0, 50});
+                        DrawLineEx(line_points[i-1], line_points[i], 10/camera.zoom, (Color){0, 0, 0, 50});
+                    }
+                    if (line_points_count < ORDER_LINE_MAX_POINT)
+                        DrawLineEx(line_points[line_points_count-1], mouse_position, 10/camera.zoom, (Color){0, 0, 0, 10});
+                }
+                DrawCircle(mouse_position.x, mouse_position.y, 10/camera.zoom, (Color){0, 0, 0, 50});
+            }
+            
             // Draw brush
             if (mode == MODE_SPAWN || mode == MODE_DELETE) {
                 SPoint pos = {(int)mouse_position.x/BOID_SIZE, (int)mouse_position.y/BOID_SIZE};
@@ -1549,7 +1880,7 @@ int main(int argc, char **argv) {
             
             EndMode2D();
 
-            // Draw "Paused" and "Mode" labels
+            // Draw "Mode" label
             switch (mode) {
             case MODE_WAIT:
                 DrawText("Mode: Wait", screen_width - 115, 10, 20, BLACK); break;
@@ -1585,9 +1916,11 @@ int main(int argc, char **argv) {
             }
 
             // Draw keyboard input
+            pthread_mutex_lock(&input_mtx);
             if (typing_string_input) {
                 DrawText(input_string, 10, screen_height - 22 - 5, 20, BLACK);
             }
+            pthread_mutex_unlock(&input_mtx);
 
             // Draw boids number
             int l = 0; // line
@@ -1611,13 +1944,13 @@ int main(int argc, char **argv) {
                     case TEAM_YELLOW: team_color = ORANGE; break;
                 }
 
-                char *str;
+                char *str = NULL;
                 if (stage == STAGE_AREAS) {
                     // <player_name>: <target_boids_number> (<areas_size><! if boids_count less than areas_size>)
                     str = (char*)TextFormat("%s: %d%c(%d%s", player_joined ? players[player_idx].name : "-", boids_number[team], new_room ? ' ' : '\0',
                                             areas_size[team], (boids_number[team] < areas_size[team])? ")" : "!)");
                 } else if (stage == STAGE_PLACING) {
-                    if (team == player_team) {
+                    if (team == (signed)player_team) {
                         str = (char*)TextFormat("%s: %d (%d left)", players[player_idx].name, boids_count, boids_number[team]-boids_count);
                     } else {
                         str = (char*)TextFormat("%s: -", players[player_idx].name);
@@ -1625,35 +1958,32 @@ int main(int argc, char **argv) {
                 } else if (stage == STAGE_GAME) {
                     str = (char*)TextFormat("%s: %d", players[player_idx].name, boids_number[team]);
                 }
-                DrawText(str, 10, 40 + (l++)*20, 20, team_color);
+
+                if (str != NULL)
+                    DrawText(str, 10, 40 + (l++)*20, 20, team_color);
             }
 
             DrawFPS(10, 10);
         EndDrawing();
     }
 
-    // Close input
-    if (get_input) {
-        pthread_mutex_lock(&input_mtx);
-        get_input = false;
-        pthread_cond_signal(&input_cond);
-        pthread_mutex_unlock(&input_mtx);
-        
-    }
-    
-    // Close the second (network) thread
-    pthread_cancel(net_thread);
-    pthread_join(net_thread, NULL);
-    
     // Close soketd
     close(fd);
     #ifdef _WIN32
         WSACleanup();
     #endif
 
+    // Close the second (network) thread
+    // pthread_cancel(net_thread);
+    pthread_mutex_lock(&running_mtx);
+    running = false;
+    pthread_mutex_unlock(&running_mtx);
+    pthread_join(net_thread, NULL);
+
+    write_log(&log, "[*] exit\n");
+    
     // Destroy all mutexes and conditions
     pthread_mutex_destroy(&input_mtx);
-    pthread_cond_destroy(&input_cond);
     pthread_mutex_destroy(&log_mtx);
     pthread_mutex_destroy(&areas_mtx);
     pthread_mutex_destroy(&running_mtx);
@@ -1661,6 +1991,7 @@ int main(int argc, char **argv) {
 
     // Free allocated memory
     free(log.items);
+    log.items = NULL;
     free(grid.chunks);
     free(boids);
 
