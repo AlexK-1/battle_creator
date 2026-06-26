@@ -5,9 +5,9 @@
 #ifndef NETWORK_H
 #define NETWORK_H
 
-#define BASE_SERVER "127.0.0.1"
-#define INPUT_PORT 3440
-#define SYNC_PORT 3441
+#define DEFAULT_SERVER "127.0.0.1"
+#define TCP_PORT 3440
+#define UDP_PORT 3441
 
 #define USERNAME_LEN 32
 

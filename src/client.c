@@ -18,7 +18,6 @@
 #include <math.h>
 #include <stdarg.h>
 #include <errno.h>
-#include <time.h>
 
 #include <raylib.h>
 #include <raymath.h>
@@ -32,6 +31,9 @@
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
+
+#define ERR(str) fprintf(stderr, "%s: " str, prog)
+#define ERRF(format, ...) fprintf(stderr, "%s: " format, prog, __VA_ARGS__)
 
 
 /* <================================================ LOGGING ===============================================> */
@@ -498,6 +500,10 @@ void *net_thread_fn(void *args) {
 /* <============================================ BOIDS AND MAIN ============================================> */
 
 #define MAX_AREAS_COUNT 1024
+#define DEFAULT_PLAYERS_COUNT 2
+#define DEFAULT_WORLD_SIZE_X 10050
+#define DEFAULT_WORLD_SIZE_Y 10050
+#define DEFAULT_USERNAME "noname"
 
 void update_boid_sprite(ClientBoid *boids, BoidIndex boid_index) {
     ClientBoid *boid = &boids[boid_index];
@@ -562,9 +568,7 @@ void draw_boid(ClientBoid *boid, Texture2D texture) {
     }
 
     Color tint = WHITE;
-    /*if (boid->sprite == SPRITE_FALL) {
-        tint.a = 20;
-    } else*/ if ((boid->sprite == SPRITE_SURRENDER) || (boid->sprite == SPRITE_FALL)) {
+    if ((boid->sprite == SPRITE_SURRENDER) || (boid->sprite == SPRITE_FALL)) {
         tint.a = (255.0/50.0) * (50 - boid->sprite_timer);
     }
     
@@ -581,91 +585,87 @@ void draw_selection(ClientBoid *boid, Texture2D texture, float scale, Color colo
 }
 
 int main(int argc, char **argv) {
-    /* FORMAT
-     Join to the room:
-         ./client join [-s|--server] <server_ip> [-t|--tcp-port] <server_port> [-c|--chunk] <chunk_size> \
-             [--name|-n] <username> <room_id>
-     Create new room:
-         ./client new [-s|--server] <server_ip> [-T|--tcp-port] <server_port> [-c|--chunk] <chunk_size> \
-             [--players|-p] <players_count> [-t|--team] <player_team> [--world|-w] <wold_size> <boids_count>
-         <player_team> is a letter indicating the player's team: r, g, b or y
-         <boids_count> is in the format <team>:<count>, setting <count> to the number of boids in <team>
-             Example (4 teams, red and blue - 2000 boids, green - 1000 boids, yellow - 500 boids):
-             ./client new 4 r:b:2000 g:1000 y:500
-         <world_size> is in format <width>x<height>
-        
-    */
-
     // room/player settings, argparse
-    bool new_room;
+    bool new_room, show_global_help = false, show_command_help = false;
     uint32_t room_id = 0;
-    int players_number = 0;
+    int players_number = DEFAULT_PLAYERS_COUNT;
     BoidTeam player_team = TEAM_RED;
     BoidIndex boids_number[TEAMS_COUNT] = { 0 }, total_boids_number = 0;
-    char *username = NULL, *server = "127.0.0.1", *player_team_name = NULL;
-    Point world_size = {10050, 10050};
-    short tcp_port = INPUT_PORT;
-    int chunk_size = 300;
+    char *prog = argv[0], *username = NULL, *server = "127.0.0.1", *player_team_name = NULL;
+    Point world_size = {DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y};
+    unsigned short tcp_port = TCP_PORT;
+    int chunk_size = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS;
     
     if (argc < 2) {
-        fputs("missed argument: new/join\n", stderr);
+        ERR("missed argument: new/join\n");
         return 1;
     }
     if (strcmp(argv[1], "new") == 0 || strcmp(argv[1], "n") == 0)
         new_room = true;
     else if (strcmp(argv[1], "join") == 0 || strcmp(argv[1], "j") == 0)
         new_room = false;
-    else {
-        fprintf(stderr, "unexpected argument '%s'\n", argv[1]);
+    else if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        show_global_help = true;
+    } else {
+        ERRF("unexpected argument '%s'\n", argv[1]);
         return 1;
     }
     argv++; argc--;
 
-    while (--argc) {
+    while (--argc && !show_global_help) {
         char *arg = *(++argv);
 
         if (arg[0] == '-') {
-            if (argc == 1 && !(arg[1] == 'p' && isdigit(arg[2]))) {
-                fprintf(stderr, "no value for option '%s'\n", arg);
-                return 1;
-            }
-            if (strcmp(arg, "--server") == 0 || strcmp(arg, "-s") == 0) {
+            if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+                show_command_help = true;
+                break;
+            } else if (strcmp(arg, "--server") == 0 || strcmp(arg, "-s") == 0) {
+                if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+
                 server = *(++argv);
                 argc--;
             } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
+                if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+
                 char *value_str = *(++argv);
                 argc--;
 
                 char *endp;
                 tcp_port = strtoul(value_str, &endp, 10);
                 if (*endp != '\0') {
-                    fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                     return 1;
                 }
             } else if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
+                if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+
                 char *value_str = *(++argv);
                 argc--;
 
                 char *endp;
                 chunk_size = strtoul(value_str, &endp, 10);
                 if (*endp != '\0') {
-                    fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                     return 1;
                 }
 
                 if (chunk_size < BOID_SIZE) {
-                    fprintf(stderr, "size of chunk must be greater than or equal to %d\n", BOID_SIZE);
+                    ERRF("size of chunk must be greater than or equal to %d\n", BOID_SIZE);
                     return 1;
                 } else if (chunk_size > CHUNK_SIZE_PIXELS) {
-                    fprintf(stderr, "size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
+                    ERRF("size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
                     return 1;
                 }
                 chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
             } else if (strcmp(arg, "--name") == 0 || strcmp(arg, "-n") == 0) {
+                if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+
                 username = *(++argv);
                 argc--;
             } else if (new_room) {
                 if (strcmp(arg, "--players") == 0 || (arg[1] == 'p' && isdigit(arg[2]))) {
+                    if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+
                     int s = strlen(arg);
 
                     char *value_str;
@@ -679,14 +679,16 @@ int main(int argc, char **argv) {
                     char *endp;
                     players_number = strtoul(value_str, &endp, 10);
                     if (*endp != '\0') {
-                        fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                         return 1;
                     }
                     if (players_number == 0 || players_number > 4) {
-                        fprintf(stderr, "number of players must be from 1 to 4\n");
+                        ERR("number of players must be from 1 to 4\n");
                         return 1;
                     }
                 } else if (strcmp(arg, "--team") == 0 || strcmp(arg, "-t") == 0) {
+                    if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+
                     char *value_str = *(++argv);
                     argc--;
 
@@ -695,25 +697,27 @@ int main(int argc, char **argv) {
                     else if (*value_str == 'g') player_team = TEAM_GREEN;
                     else if (*value_str == 'y') player_team = TEAM_YELLOW;
                     else {
-                        fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                         return 1;
                     }
                 } else if (strcmp(arg, "--world") == 0 || strcmp(arg, "-w") == 0) {
+                    if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+
                     char *value_str = *(++argv);
                     argc--;
                     if (sscanf(value_str, "%hux%hu", &world_size.x, &world_size.y) < 2) {
-                        fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                         return 1;
                     }
                     world_size.x = ceilf((float)world_size.x / BOID_SIZE) * BOID_SIZE;
                     world_size.y = ceilf((float)world_size.y / BOID_SIZE) * BOID_SIZE;
                 } else {
-                    fprintf(stderr, "unexpected argument '%s'\n", arg);
+                    ERRF("unexpected argument '%s'\n", arg);
                     return 1;
                 }
                 
             } else {
-                fprintf(stderr, "unexpected argument '%s'\n", arg);
+                ERRF("unexpected argument '%s'\n", arg);
                 return 1;
             }
         } else if (new_room) {
@@ -742,14 +746,14 @@ int main(int argc, char **argv) {
             }
 
             if (err || teams_count == 0) {
-                fprintf(stderr, "illegal value '%s' for number of boids option\n", arg);
+                ERRF("illegal value '%s' for number of boids option\n", arg);
                 return 1;
             }
 
             char *endp;
             BoidIndex boids = strtoul(c, &endp, 10);
             if (*endp != '\0') {
-                fprintf(stderr, "illegal value '%s' for number of boids option\n", arg);
+                ERRF("illegal value '%s' for number of boids option\n", arg);
                 return 1;
             }
             for (int i = 0; i < teams_count; i++)
@@ -758,27 +762,118 @@ int main(int argc, char **argv) {
             char *endp;
             room_id = strtoul(arg, &endp, 16);
             if (*endp != '\0') {
-                fprintf(stderr, "illegal value '%s' for option 'room'\n", arg);
+                ERRF("illegal value '%s' for option 'room'\n", arg);
                 return 1;
             }
         } else {
-            fprintf(stderr, "unexpected argument '%s'\n", arg);
+            ERRF("unexpected argument '%s'\n", arg);
             return 1;
         }
     }
 
+    if (show_global_help) {
+        printf(
+            "Usage: %s COMMAND [OPTIONS]\n"
+            "\n"
+            "A game's client app.\n"
+            "\n"
+            "Commands:\n"
+            "  new - create a new game room\n"
+            "  join - join to an existing room\n"
+            "\n"
+            "Options:\n"
+            "  -h, --help\n"
+            "    Show this message and exit\n"
+            "\n"
+            "Run '%s COMMAND --help' for command-specific help.\n",
+            prog, prog);
+        exit(0);
+    }
+
+    if (show_command_help) {
+        if (new_room) { // new
+            printf(
+                "Usage: %s new [OPTIONS] BOIDS...\n"
+                "\n"
+                "Create a new game room.\n"
+                "\n"
+                "Arguments:\n"
+                "  <BOIDS>...\n"
+                "    Format: [<team>...]:<count>\n"
+                "    - <team> is one of: r, b, g, ot y\n"
+                "    - Teams can be stacked, for example \"r:b:100\" means teams r and b \n"
+                "      share count 100\n"
+                "\n"
+                "Options:\n"
+                "  -h, --help\n"
+                "    Show this message and exit\n"
+                "  -s, --server <IP>\n"
+                "    Server's IP address (default: %s)\n"
+                "  -T, --tcp-server <NUM>\n"
+                "    TCP port of the game server (default: %d)\n"
+                "  -n, --name <STR>\n"
+                "    Username (default: %s)\n"
+                "  -c, --chunk <NUM>\n"
+                "    Size of chunk in pixels, rounded down to the nearest multiple of %d\n"
+                "    (default: %d)\n"
+                "  -p, --players <NUM>\n"
+                "    Number of player in new room (default: %d)\n"
+                "  -t, --team\n"
+                "    A letter indicating the player's team: r, g, b or y (default: r)\n"
+                "  -w, --world <NUM>x<NUM>\n"
+                "    Size of the game world in pixels in the <width>x<height> format,\n"
+                "    rounded up to the nearest number divisible by %d\n"
+                "    (default: %dx%d)\n"
+                "\n"
+                "Examples:\n"
+                "  %s new --name bebob --world 1050x1050 -p2 r:30 b:40\n"
+                "  %s new -s 192.168.0.1 --chunk 525 -p4 r:b:1500 g:y:1000\n",
+                prog, DEFAULT_SERVER, TCP_PORT, DEFAULT_USERNAME, BOID_SIZE, DEFAULT_CLIENT_CHUNK_SIZE_PIXELS, DEFAULT_PLAYERS_COUNT, BOID_SIZE,
+                DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y, prog, prog);
+        } else { // join
+            printf(
+                "Usage: %s new [OPTIONS] ROOM\n"
+                "\n"
+                "Join to an existing room.\n"
+                "\n"
+                "Arguments:\n"
+                "  ROOM\n"
+                "    6-digit hex number of room id\n"
+                "\n"
+                "Options:\n"
+                "  -h, --help\n"
+                "    Show this message and exit\n"
+                "  -s, --server <IP>\n"
+                "    Server's IP address (default: %s)\n"
+                "  -T, --tcp-server <NUM>\n"
+                "    TCP port of the game server (default: %d)\n"
+                "  -n, --name <STR>\n"
+                "    Username (default: %s)\n"
+                "  -c, --chunk <NUM>\n"
+                "    Size of chunk in pixels, rounded down to the nearest multiple of %d\n"
+                "    (default: %d)\n"
+                "\n"
+                "Examples:\n"
+                "  %s join --name glug -c 525 015dc2\n"
+                "  %s join -s 192.168.0.1 -T 1234 1012c4\n",
+                prog, DEFAULT_SERVER, TCP_PORT, DEFAULT_USERNAME, BOID_SIZE, DEFAULT_CLIENT_CHUNK_SIZE_PIXELS, prog, prog);
+        }
+
+        exit(0);
+    }
+    
     if (new_room) {
         player_team_name = get_team_name(player_team);
         if (boids_number[player_team] == 0) {
-            fprintf(stderr, "number of boids in the player's team (%s) is not set\n", player_team_name);
+            ERRF("number of boids in the player's team (%s) is not set\n", player_team_name);
             return 1;
         }
     }
 
     if (server == NULL)
-        server = BASE_SERVER;
+        server = DEFAULT_SERVER;
     if (username == NULL)
-        username = "noname";
+        username = DEFAULT_USERNAME;
     if (new_room) {
         int teams_number = 0;
         for (int i = 0; i < TEAMS_COUNT; i++) {
@@ -789,11 +884,11 @@ int main(int argc, char **argv) {
         }
 
         if (teams_number != players_number) {
-            fprintf(stderr, "you have not set the number of boids for all players\n");
+            ERR("you have not set the number of boids for all players\n");
             return 1;
         }
         if (total_boids_number > MAX_BOIDS_COUNT) {
-            fprintf(stderr, "number of boids (%u) is greater than max boids count (%u)\n", total_boids_number, MAX_BOIDS_COUNT);
+            ERRF("number of boids (%u) is greater than max boids count (%u)\n", total_boids_number, MAX_BOIDS_COUNT);
             return 1;
         }
     }
@@ -1194,7 +1289,7 @@ int main(int argc, char **argv) {
                     pthread_mutex_lock(&areas_mtx);
                     bool insert_area = true;
                     int orig_areas_count = areas_count;
-                    // Compare a new area with exeisting ones
+                    // Compare a new area with existing ones
                     for (int i = 0; i < orig_areas_count; i++) {
                         int rt = areas[i].team; // Team of the area
                         Rec r = areas[i].rec; // Rectangle of the area
@@ -1214,7 +1309,7 @@ int main(int argc, char **argv) {
                             orig_areas_count--;
                             i--;
 
-                            // Divide the old area into nonoverlapping new ones
+                            // Divide the old area into non-overlapping new ones
                             // TODO: optimize it
                             if (intersection.y1 == r.y1 || intersection.y2 == r.y2) {
                                 if (intersection.x1 != r.x1) areas[areas_count++] = (Area){.rec = {r.x1, r.y1, intersection.x1, r.y2}, .team = rt};
@@ -1278,7 +1373,7 @@ int main(int argc, char **argv) {
 
                     free(buf);
                 } else {
-                    write_log(&log, "[!] you cannot atart placing if size of areas of all teams is less than the number of boids\n");
+                    write_log(&log, "[!] you cannot start placing if size of areas of all teams is less than the number of boids\n");
                 }
             }
         }
@@ -1300,7 +1395,7 @@ int main(int argc, char **argv) {
                                      pos.x - brush_size/2 + brush_size, pos.y - brush_size/2 + brush_size};
 
                     enum {
-                        CELL_UNCHEKED,
+                        CELL_UNCHECKED,
                         CELL_USED,
                         CELL_FREE
                     } *cells = calloc(brush_size*brush_size, sizeof(*cells));
@@ -1350,7 +1445,8 @@ int main(int argc, char **argv) {
                                 int cell_status = cells[cell_idx];
                                 if (cell_status == CELL_FREE) {
                                     can_place = true;
-                                } else if (cell_status == CELL_UNCHEKED) {
+                                    // UNCHECKED
+                                } else if (cell_status == CELL_UNCHECKED) {
                                     for (int i = 0; i < chunk->count; i++) {
                                         ClientBoid *boid = &boids[chunk->boids[i]];
                                         Point boid_pos = {(int)boid->b.pos.x/BOID_SIZE, (int)boid->b.pos.y/BOID_SIZE};
@@ -1366,7 +1462,7 @@ int main(int argc, char **argv) {
                                     for (int check_cell_x = check_border.x1; check_cell_x < check_border.x2; check_cell_x++) {
                                         for (int check_cell_y = check_border.y1; check_cell_y < check_border.y2; check_cell_y++) {
                                             int check_cell_idx = (check_cell_x - brush_rec.x1) + (check_cell_y - brush_rec.y1)*brush_size;
-                                            if (cells[check_cell_idx] == CELL_UNCHEKED)
+                                            if (cells[check_cell_idx] == CELL_UNCHECKED)
                                                 cells[check_cell_idx] = CELL_FREE;
                                         }
                                     }
@@ -1834,7 +1930,7 @@ int main(int argc, char **argv) {
                                      thick, BLACK);
             }
 
-            // Drawing boids slection box
+            // Drawing boids selection box
             if ((mode == MODE_SELECT) && selecting) {
                 float rectangleX = fmin(selection_start.x, mouse_position.x);
                 float rectangleY = fmin(selection_start.y, mouse_position.y);
@@ -1967,7 +2063,7 @@ int main(int argc, char **argv) {
         EndDrawing();
     }
 
-    // Close soketd
+    // Close socket
     close(fd);
     #ifdef _WIN32
         WSACleanup();

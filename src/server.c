@@ -33,6 +33,9 @@
 #define MAX_PACKET_SIZE (1024*64)
 #define TPS 15
 
+#define ERR(str) fprintf(stderr, "%s: " str, prog)
+#define ERRF(format, ...) fprintf(stderr, "%s: " format, prog, __VA_ARGS__)
+
 /*
 join -> room
 connect -> server
@@ -144,7 +147,7 @@ void close_client(int epfd, int fd) {
         int player_idx = get_player_idx(room->players, p->fd);
 
         last_room_idx = ((room->id & 0xffff0000) >> 16);
-        if ((room->status == ROOM_AREAS && player_idx == 0) || // room's creator disconected
+        if ((room->status == ROOM_AREAS && player_idx == 0) || // room's creator disconnected
             (room->status == ROOM_PLACING) ||
             (room->status == ROOM_GAME && room->joined_players == 1)) {
             close_room(epfd, room); // close entire room
@@ -921,49 +924,77 @@ int main(int argc, char **argv) {
       ./server [-T|--tcp-port] <port> [-c|--chunk] <chunk_size>
     */
     
-    short tcp_port = INPUT_PORT;
+    unsigned short tcp_port = TCP_PORT;
+    bool show_help = false;
+    char *prog = argv[0];
 
     while (--argc) {
         char *arg = *(++argv);
 
         if (arg[0] == '-') {
-            if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
+            if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+                show_help = true;
+                break;
+            } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
+                if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+                
                 char *value_str = *(++argv);
                 argc--;
 
                 char *endp;
                 tcp_port = strtoul(value_str, &endp, 10);
                 if (*endp != '\0') {
-                    fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                     return 1;
                 }
             } else if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
+                if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+
                 char *value_str = *(++argv);
                 argc--;
 
                 char *endp;
                 chunk_size = strtoul(value_str, &endp, 10);
                 if (*endp != '\0') {
-                    fprintf(stderr, "illegal value '%s' for option '%s'\n", value_str, arg);
+                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                     return 1;
                 }
 
                 if (chunk_size < BOID_SIZE) {
-                    fprintf(stderr, "size of chunk must be greater than or equal to %d\n", BOID_SIZE);
+                    ERRF("size of chunk must be greater than or equal to %d\n", BOID_SIZE);
                     return 1;
                 } else if (chunk_size > CHUNK_SIZE_PIXELS) {
-                    fprintf(stderr, "size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
+                    ERRF("size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
                     return 1;
                 }
                 chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
             } else {
-                fprintf(stderr, "unexpected argument '%s'\n", arg);
+                ERRF("unexpected argument '%s'\n", arg);
                 return 1;
             }
         } else {
-            fprintf(stderr, "unexpected argument '%s'\n", arg);
+            ERRF("unexpected argument '%s'\n", arg);
             return 1;
         }
+    }
+
+    if (show_help) {
+        printf(
+            "Usage: %s [OPTIONS]\n"
+            "\n"
+            "A game's server program.\n"
+            "\n"
+            "Options:\n"
+            "  -h, --help\n"
+            "    Show this message and exit\n"
+            "  -T, --tcp-port\n"
+            "    TCP port of the game server (default: %d)\n"
+            "  -c, --chunk <NUM>\n"
+            "    Size of chunk in pixels, rounded down to the nearest multiple of %d\n"
+            "    (default: %d)\n",
+            prog, TCP_PORT, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS);
+
+        exit(0);
     }
 
     printf("chunk: %d pixels\n", chunk_size);
@@ -1010,7 +1041,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Create epool instance
+    // Create epoll instance
     int epfd = epoll_create1(0);
     if (epfd < 0) {
         perror("epoll_create1");
@@ -1092,7 +1123,7 @@ int main(int argc, char **argv) {
                     }
                 }
             } else if (events[i].data.fd == STDIN_FILENO) {
-                // Process standart input
+                // Process standard input
                 char buf[256];
                 ssize_t r = read(STDIN_FILENO, buf, sizeof(buf) - 1);
                 if (r > 0) {

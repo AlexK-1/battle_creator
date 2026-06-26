@@ -43,6 +43,11 @@
 #define BOID_FIGHTING_RADIUS_SQ (BOID_FIGHTING_RADIUS * BOID_FIGHTING_RADIUS)
 #define BOID_STOP_RADIUS_SQ (BOID_STOP_RADIUS * BOID_STOP_RADIUS)
 
+#define CHUNK_SIZE_BOIDS 1024
+#define CHUNK_SIZE_PIXELS 1050
+#define DEFAULT_SERVER_CHUNK_SIZE_PIXELS 1050
+#define DEFAULT_CLIENT_CHUNK_SIZE_PIXELS 300
+
 /*
 ClientSomething - client structure "Something"
 ServerSomething - server structure "Something"
@@ -146,9 +151,6 @@ typedef enum {
 } OrderType;
 
 /* Grig and chunks */
-
-#define CHUNK_SIZE_BOIDS 1024
-#define CHUNK_SIZE_PIXELS 1050
 
 typedef uint16_t ChunkSize;
 
