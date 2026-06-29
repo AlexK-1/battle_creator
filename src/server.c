@@ -33,8 +33,18 @@
 #define MAX_PACKET_SIZE (1024*64)
 #define TPS 15
 
-#define ERR(str) fprintf(stderr, "%s: " str, prog)
-#define ERRF(format, ...) fprintf(stderr, "%s: " format, prog, __VA_ARGS__)
+#define ERR(str)                                                              \
+    do {                                                                      \
+        fprintf(stderr, "%s: " str, prog);                                    \
+        exit(EXIT_FAILURE);                                                   \
+    } while (0)
+
+#define ERRF(format, ...)                                                     \
+    do {                                                                      \
+        fprintf(stderr, "%s: " format, prog, __VA_ARGS__);                    \
+        exit(EXIT_FAILURE);                                                   \
+    } while (0)
+
 
 /*
 join -> room
@@ -936,7 +946,7 @@ int main(int argc, char **argv) {
                 show_help = true;
                 break;
             } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
-                if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+                if (argc == 1) ERRF("no value for option '%s'\n", arg);
                 
                 char *value_str = *(++argv);
                 argc--;
@@ -945,10 +955,9 @@ int main(int argc, char **argv) {
                 tcp_port = strtoul(value_str, &endp, 10);
                 if (*endp != '\0') {
                     ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
-                    return 1;
                 }
             } else if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
-                if (argc == 1) {ERRF("no value for option '%s'\n", arg); exit(1);}
+                if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
                 char *value_str = *(++argv);
                 argc--;
@@ -957,24 +966,19 @@ int main(int argc, char **argv) {
                 chunk_size = strtoul(value_str, &endp, 10);
                 if (*endp != '\0') {
                     ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
-                    return 1;
                 }
 
                 if (chunk_size < BOID_SIZE) {
                     ERRF("size of chunk must be greater than or equal to %d\n", BOID_SIZE);
-                    return 1;
                 } else if (chunk_size > CHUNK_SIZE_PIXELS) {
                     ERRF("size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
-                    return 1;
                 }
                 chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
             } else {
                 ERRF("unexpected argument '%s'\n", arg);
-                return 1;
             }
         } else {
             ERRF("unexpected argument '%s'\n", arg);
-            return 1;
         }
     }
 
