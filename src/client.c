@@ -258,7 +258,10 @@ void *net_thread_fn(void *args) {
         
         uint8_t packet_type;
         int r = recv(fd, &packet_type, 1, 0);
-        if (r == 0) break;
+        if (r == 0) {
+            write_log(log, "[!] connection closed\n");
+            break;
+        }
         if (r < 0) {
             bool err_wouldblock;
             #ifdef _WIN32
@@ -666,8 +669,8 @@ int main(int argc, char **argv) {
                 strcpy(username, *(++argv));
                 argc--;
             } else if (new_room) {
-                if (strcmp(arg, "--players") == 0 || (arg[1] == 'p' && isdigit(arg[2]))) {
-                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
+                if (strcmp(arg, "--players") == 0 || strcmp(arg, "-p") == 0 || (arg[1] == 'p' && isdigit(arg[2]))) {
+                    if (argc == 1 && !isdigit(arg[2])) ERRF("no value for option '%s'\n", arg);
 
                     int s = strlen(arg);
 
@@ -880,10 +883,6 @@ int main(int argc, char **argv) {
 
     printf("server %s:%d\n", server, tcp_port);
 
-    // Init log
-    Log log;
-    init_cstack(log, MAX_LOG_LEN);
-
     // printf("name: %s\n", username);
     // if (new_room) {
     //     printf("team: %s\n", player_team_name);
@@ -1047,6 +1046,10 @@ int main(int argc, char **argv) {
         }
     #endif
 
+    // Init log
+    Log log;
+    init_cstack(log, MAX_LOG_LEN);
+    
     write_log(&log, "[*] %s\n    id: %06x\n    teams: %d\n    world: %dx%d\n    chunk: %d\n    creator: %s\n    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
            new_room? "created a room" : "joined to the room",
            room_id, players_number, world_size.x, world_size.y, chunk_size, players[0].name, total_boids_number,
@@ -1135,7 +1138,10 @@ int main(int argc, char **argv) {
     
     while (!WindowShouldClose()) {
         pthread_mutex_lock(&running_mtx);
-        if (!running) break;
+        if (!running) {
+            pthread_mutex_unlock(&running_mtx);
+            break;
+        }
         pthread_mutex_unlock(&running_mtx);
         
         // Keys
@@ -1248,7 +1254,7 @@ int main(int argc, char **argv) {
         // Areas mode
         if (mode == MODE_AREAS) {
             // Selecting
-            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && areas_count < MAX_AREAS_COUNT - 3 && team_used[selecting_team]) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && areas_count < MAX_AREAS_COUNT && (selecting_team == -1 || team_used[selecting_team])) {
                 int x = roundf(mouse_position.x/BOID_SIZE);
                 if (x < 0) x = 0;
                 if (x > world_size.x/BOID_SIZE) x = world_size.x/BOID_SIZE;
@@ -1262,7 +1268,7 @@ int main(int argc, char **argv) {
                     area_start_selecting = area_end_selecting;
                     selecting = true;
                 }
-            } else if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) && team_used[selecting_team]) {
+            } else if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) && (selecting_team == -1 || team_used[selecting_team])) {
                 // Create new area
                 
                 selecting = false;

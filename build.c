@@ -21,7 +21,7 @@
 
 #define CFLAGS_COMMON "-std=c99 "
 #ifdef DEBUG
-    #define CFLAGS CFLAGS_COMMON "-Wall -Wextra -pedantic -fsanitize=address "
+    #define CFLAGS CFLAGS_COMMON "-Wall -Wextra -pedantic -g -fsanitize=address "
 #else
     #define CFLAGS CFLAGS_COMMON "-O2 "
 #endif
@@ -176,8 +176,8 @@ int link_prog(char **obj_files, int files_count, char *out) {
     for (int i = 0; i < files_count; i++)
         obj_files_len += /*'*/ 1 + strlen(obj_files[i]) + /*'*/ 1 + /* */ 1;
     
-    char format[] = CC CFLAGS LDFLAGS "-o %s ";
-    char *buffer = calloc(sizeof(format) + obj_files_len + strlen(out), sizeof(*buffer));
+    char format[] = CC CFLAGS "-o %s ";
+    char *buffer = calloc(sizeof(format) + obj_files_len + strlen(out) + sizeof(LDFLAGS), sizeof(*buffer));
     sprintf(buffer, format, out);
 
     for (int i = 0; i < files_count; i++) {
@@ -185,6 +185,8 @@ int link_prog(char **obj_files, int files_count, char *out) {
         strcat(buffer, obj_files[i]);
         strcat(buffer, "' ");
     }
+
+    strcat(buffer, LDFLAGS);
 
     printf("$ %s\n", buffer);
 
