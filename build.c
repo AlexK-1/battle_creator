@@ -29,8 +29,10 @@
 #ifdef _WIN32
     #define LDFLAGS "-lraylib -lopengl32 -lgdi32 -lwinmm -lkernel32 -luser32 -lshell32 -lws2_32 -static -static-libgcc -s "
 #else
-    #define LDFLAGS "-lm -lraylib -pthread "
+    #define LDFLAGS "-lm -pthread "
 #endif
+#define LRAYLIB "-lraylib "
+#define IRAYLIB "-I ./raylib "
 
 #ifdef _WIN32
     #define PATH_SEP "\\"
@@ -74,6 +76,7 @@ void clean(void) {
                 char *file = calloc(sizeof(BUILD_DIR) + strlen(FindFileData.cFileName), sizeof(*file));
                 sprintf(file, BUILD_DIR "%s", FindFileData.cFileName);
                 remove(file);
+                free(file);
             } while (FindNextFile(hFind, &FindFileData));
             FindClose(hFind);
         }
@@ -125,7 +128,7 @@ int create_dir(char *dir_name) {
     }
 }
 
-int compile_file(char *src_file, char *dependency_files, char *out) {
+int compile_file(char *src_file, char *dependency_files, char *include_paths, char *out) {
     struct stat st_src, st_obj;
     if (stat(src_file, &st_src) != 0) {
         printf("source file %s does not exist\n", src_file);
@@ -144,6 +147,7 @@ int compile_file(char *src_file, char *dependency_files, char *out) {
                 struct stat st_dep;
                 if (stat(dependency, &st_dep) != 0) {
                     printf("dependency file %s does not exist\n", dependency);
+                    free(dependency_files_copy);
                     return 1;
                 }
                 if (FILE_NEWER(st_dep, st_obj)) {
@@ -160,9 +164,9 @@ int compile_file(char *src_file, char *dependency_files, char *out) {
             return 0;
     }
 
-    char format[] = CC CFLAGS "'%s' -c -o '%s'";
-    char *buffer = calloc(sizeof(format) + strlen(src_file) + strlen(out), sizeof(*buffer));
-    sprintf(buffer, format, src_file, out);
+    char format[] = CC CFLAGS "%s '%s' -c -o '%s'";
+    char *buffer = calloc(sizeof(format) + strlen(include_paths) + strlen(src_file) + strlen(out), sizeof(*buffer));
+    sprintf(buffer, format, include_paths, src_file, out);
 
     printf("$ %s\n", buffer);
 
@@ -171,13 +175,13 @@ int compile_file(char *src_file, char *dependency_files, char *out) {
     return r;
 }
 
-int link_prog(char **obj_files, int files_count, char *out) {
+int link_prog(char **obj_files, int files_count, char *link_paths, char *out) {
     int obj_files_len = 0;
     for (int i = 0; i < files_count; i++)
         obj_files_len += /*'*/ 1 + strlen(obj_files[i]) + /*'*/ 1 + /* */ 1;
     
     char format[] = CC CFLAGS "-o %s ";
-    char *buffer = calloc(sizeof(format) + obj_files_len + strlen(out) + sizeof(LDFLAGS), sizeof(*buffer));
+    char *buffer = calloc(sizeof(format) + obj_files_len + strlen(out) + strlen(link_paths) + sizeof(LDFLAGS), sizeof(*buffer));
     sprintf(buffer, format, out);
 
     for (int i = 0; i < files_count; i++) {
@@ -186,6 +190,7 @@ int link_prog(char **obj_files, int files_count, char *out) {
         strcat(buffer, "' ");
     }
 
+    strcat(buffer, link_paths);
     strcat(buffer, LDFLAGS);
 
     printf("$ %s\n", buffer);
@@ -208,7 +213,7 @@ char *src_to_build_path(char *src_file) {
     return buffer;
 }
 
-BuildStatus build_prog(char **files, int files_count, char *out) {
+BuildStatus build_prog(char **files, int files_count, char *include_paths, char *link_paths, char *out) {
     printf("building %s...\n", out);
     
     char *obj_files[files_count];
@@ -217,7 +222,7 @@ BuildStatus build_prog(char **files, int files_count, char *out) {
     }
 
     for (int i = 0; i < files_count; i++) {
-        if (compile_file(files[i*2], files[i*2 + 1], obj_files[i]) != 0) {
+        if (compile_file(files[i*2], files[i*2 + 1], include_paths, obj_files[i]) != 0) {
             for (int j = 0; j < files_count; j++)
                 free(obj_files[j]);
             printf("%s compilation error!\n", out);
@@ -225,7 +230,7 @@ BuildStatus build_prog(char **files, int files_count, char *out) {
         }
     }
 
-    int link_res = link_prog(obj_files, files_count, out);
+    int link_res = link_prog(obj_files, files_count, link_paths, out);
 
     for (int j = 0; j < files_count; j++)
         free(obj_files[j]);
@@ -283,8 +288,9 @@ int main(int argc, char **argv) {
             "\n"
             "Examples:\n"
             "  %s all # equivalent of '%s server client'\n"
-            "  %s clean\n",
-            prog, prog, prog, prog);
+            "  %s clean\n"
+            "  %s clean all # recompile and link all .o files\n",
+            prog, prog, prog, prog, prog);
         return 0;
     }
 
@@ -293,7 +299,6 @@ int main(int argc, char **argv) {
     
     if (clean_cmd) {
         clean();
-        return 0;
     }
     
     if (create_dir(BUILD_DIR) != 0)
@@ -318,7 +323,7 @@ int main(int argc, char **argv) {
         };
         int server_files_count = sizeof(server_files) / sizeof(*server_files) / 2;
 
-        if (build_prog(server_files, server_files_count, SERVER) != BUILD_OK)
+        if (build_prog(server_files, server_files_count, IRAYLIB, "", SERVER) != BUILD_OK)
             return 1;
     }
 
@@ -330,7 +335,7 @@ int main(int argc, char **argv) {
         };
         int client_files_count = sizeof(client_files) / sizeof(*client_files) / 2;
 
-        if (build_prog(client_files, client_files_count, CLIENT) != BUILD_OK)
+        if (build_prog(client_files, client_files_count, "", LRAYLIB, CLIENT) != BUILD_OK)
             return 1;
     }
 

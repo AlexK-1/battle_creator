@@ -117,6 +117,10 @@ Player *find_player(Player **players, int id) {
     return players[i];
 }
 
+static inline int random_value(int min, int max) {
+    return rand() % (max-min) + min;
+}
+
 void close_client(int, int);
 
 void close_room(int epfd, Room *room) {
@@ -257,7 +261,7 @@ void *room_thread_fn(void *args) {
                         break;
                     
                     ServerBoid new_boid = {.b = {.pos = {cell_x*BOID_SIZE + (int)(BOID_SIZE/2.0), cell_y*BOID_SIZE + (int)(BOID_SIZE/2.0)}, .velocity = { 0 },
-                                                 .speed = GetRandomValue(80, 130)/100.0, .health = BOID_MAX_HEALTH, .xp = GetRandomValue(0, 5),
+                                                 .speed = random_value(80, 130)/100.0, .health = BOID_MAX_HEALTH, .xp = random_value(0, 5),
                                                  .team = player->team, .action = ACT_STOP}};
                     room->boids[boids_count++] = new_boid;
                 
@@ -725,10 +729,10 @@ void process_data(Player *p, int epfd) {
                 ServerBoid *boid = &room->boids[idx];
                 
                 if ((boid->b.action == ACT_STOP) && (action != ACT_STOP)) // Randomize boid's speed, if it stops
-                    boid->b.velocity = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0};
+                    boid->b.velocity = (Vector2){random_value(-10, 10)/10.0, random_value(-10, 10)/10.0};
 
                 boid->b.action = action;
-                boid->order_timer = GetRandomValue(20, 30)*TPS; // 20-30 seconds
+                boid->order_timer = random_value(20, 30)*TPS; // 20-30 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -749,7 +753,7 @@ void process_data(Player *p, int epfd) {
                 boid->order_vector = direction;
                 boid->direction_order = true;
                 boid->point_order = false;
-                boid->order_timer = GetRandomValue(30, 45)*TPS; // 30-45 seconds
+                boid->order_timer = random_value(30, 45)*TPS; // 30-45 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -770,7 +774,7 @@ void process_data(Player *p, int epfd) {
                 boid->order_vector = point;
                 boid->direction_order = false;
                 boid->point_order = true;
-                boid->order_timer = GetRandomValue(30, 45)*TPS; // 30-45 seconds
+                boid->order_timer = random_value(30, 45)*TPS; // 30-45 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);

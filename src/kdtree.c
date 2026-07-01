@@ -6,14 +6,14 @@
 
 #include "kdtree.h"
 
-int comp_x(const void *a, const void *b) {
+static int comp_x(const void *a, const void *b) {
     ServerBoid *boid_a = *(ServerBoid**)a;
     ServerBoid *boid_b = *(ServerBoid**)b;
 
     return boid_a->b.pos.x - boid_b->b.pos.x;
 }
 
-int comp_y(const void *a, const void *b) {
+static int comp_y(const void *a, const void *b) {
     ServerBoid *boid_a = *(ServerBoid**)a;
     ServerBoid *boid_b = *(ServerBoid**)b;
 

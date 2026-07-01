@@ -90,7 +90,7 @@ The server will output logs about main events. You can enter the `quit` or `q` c
 
 ## Build
 
-I decided not to use make ans wrote my build system in C. So, before building server/client you must firstly compile build.c:
+I decided not to use make and wrote my build system in C. So, before building server/client you must firstly compile build.c:
 ```sh
 cc build.c -o build
 ```
@@ -105,3 +105,6 @@ or
 ```sh
 ./build all # build both server and client
 ```
+
+> [!NOTE]
+> The client requires [**Raylib**](https://www.raylib.com) installed
