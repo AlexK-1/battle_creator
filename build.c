@@ -15,6 +15,12 @@
 #include <string.h>
 #include <stdbool.h>
 
+#ifdef _WIN32
+    #define PATH_SEP "\\"
+#else
+    #define PATH_SEP "/"
+#endif
+
 #ifndef CC
     #define CC "cc "
 #endif
@@ -27,24 +33,23 @@
 #endif
 
 #ifdef _WIN32
-    #define LDFLAGS "-lraylib -lopengl32 -lgdi32 -lwinmm -lkernel32 -luser32 -lshell32 -lws2_32 -static -static-libgcc -s "
+    #define LDFLAGS "-lopengl32 -lgdi32 -lwinmm -lkernel32 -luser32 -lshell32 -lws2_32 -static -static-libgcc -s "
 #else
     #define LDFLAGS "-lm -pthread "
 #endif
 #define LRAYLIB "-lraylib "
-#define IRAYLIB "-I ./raylib "
-
-#ifdef _WIN32
-    #define PATH_SEP "\\"
-#else
-    #define PATH_SEP "/"
-#endif
+#define IRAYLIB "-I ." PATH_SEP "raylib "
 
 #define SRC_DIR "src" PATH_SEP
 #define BUILD_DIR ".build" PATH_SEP
 
-#define SERVER "server"
-#define CLIENT "client"
+#ifdef _WIN32
+    #define SERVER "server.exe"
+    #define CLIENT "client.exe"
+#else
+    #define SERVER "server"
+    #define CLIENT "client"
+#endif
 
 #define ERR(str)                                                              \
     do {                                                                      \
@@ -128,7 +133,7 @@ int create_dir(char *dir_name) {
     }
 }
 
-int compile_file(char *src_file, char *dependency_files, char *include_paths, char *out) {
+int compile_file(char *src_file, char **dependency_files, char *include_paths, char *out) {
     struct stat st_src, st_obj;
     if (stat(src_file, &st_src) != 0) {
         printf("source file %s does not exist\n", src_file);
@@ -140,33 +145,26 @@ int compile_file(char *src_file, char *dependency_files, char *include_paths, ch
         if (FILE_NEWER(st_src, st_obj)) {
             recompile = true;
         } else {
-            char *dependency_files_copy = strdup(dependency_files);
-
-            char *dependency = strtok(dependency_files_copy, " ");
-            while (dependency != NULL) {
+            for (char **dependency = dependency_files; *dependency != NULL; dependency++) {
                 struct stat st_dep;
-                if (stat(dependency, &st_dep) != 0) {
-                    printf("dependency file %s does not exist\n", dependency);
-                    free(dependency_files_copy);
+                if (stat(*dependency, &st_dep) != 0) {
+                    printf("dependency file %s does not exist\n", *dependency);
                     return 1;
                 }
                 if (FILE_NEWER(st_dep, st_obj)) {
                     recompile = true;
                     break;
                 }
-                dependency = strtok(NULL, " ");
             }
-
-            free(dependency_files_copy);
         }
 
         if (!recompile)
             return 0;
     }
 
-    char format[] = CC CFLAGS "%s '%s' -c -o '%s'";
+    char format[] = CC CFLAGS "%s -c -o \"%s\" \"%s\"";
     char *buffer = calloc(sizeof(format) + strlen(include_paths) + strlen(src_file) + strlen(out), sizeof(*buffer));
-    sprintf(buffer, format, include_paths, src_file, out);
+    sprintf(buffer, format, include_paths, out, src_file);
 
     printf("$ %s\n", buffer);
 
@@ -178,16 +176,16 @@ int compile_file(char *src_file, char *dependency_files, char *include_paths, ch
 int link_prog(char **obj_files, int files_count, char *link_paths, char *out) {
     int obj_files_len = 0;
     for (int i = 0; i < files_count; i++)
-        obj_files_len += /*'*/ 1 + strlen(obj_files[i]) + /*'*/ 1 + /* */ 1;
+        obj_files_len += /*"*/ 1 + strlen(obj_files[i]) + /*"*/ 1 + /* */ 1;
     
-    char format[] = CC CFLAGS "-o %s ";
+    char format[] = CC CFLAGS "-o \"%s\" ";
     char *buffer = calloc(sizeof(format) + obj_files_len + strlen(out) + strlen(link_paths) + sizeof(LDFLAGS), sizeof(*buffer));
     sprintf(buffer, format, out);
 
     for (int i = 0; i < files_count; i++) {
-        strcat(buffer, "'");
+        strcat(buffer, "\"");
         strcat(buffer, obj_files[i]);
-        strcat(buffer, "' ");
+        strcat(buffer, "\" ");
     }
 
     strcat(buffer, link_paths);
@@ -217,19 +215,26 @@ BuildStatus build_prog(char **files, int files_count, char *include_paths, char 
     printf("building %s...\n", out);
     
     char *obj_files[files_count];
-    for (int i = 0; i < files_count; i++) {
-        obj_files[i] = src_to_build_path(files[i*2]);
-    }
+    int obj_files_count = 0;
 
-    for (int i = 0; i < files_count; i++) {
-        if (compile_file(files[i*2], files[i*2 + 1], include_paths, obj_files[i]) != 0) {
-            for (int j = 0; j < files_count; j++)
-                free(obj_files[j]);
-            printf("%s compilation error!\n", out);
-            return BUILD_COMPILATION_ERR;
+    char **file = files;
+    int idx = 0;
+    bool prev_null = true;
+    while (idx < files_count) {
+        if (prev_null) {
+            char *obj_file = src_to_build_path(*file);
+            obj_files[obj_files_count++] = obj_file;
+            if (compile_file(*file, file+1, include_paths, obj_file) != 0) {
+                for (int i = 0; i < obj_files_count; i++)
+                    free(obj_files[i]);
+                printf("%s compilation error!\n", out);
+                return BUILD_COMPILATION_ERR;
+            }
+            idx++;
         }
+        prev_null = (*(file++) == NULL);
     }
-
+    
     int link_res = link_prog(obj_files, files_count, link_paths, out);
 
     for (int j = 0; j < files_count; j++)
@@ -244,6 +249,24 @@ BuildStatus build_prog(char **files, int files_count, char *include_paths, char 
     }
 
     return (link_res == 0)? BUILD_OK : BUILD_LINK_ERR;
+}
+
+int count_src_files(char **files) {
+    int files_count = 0;
+    char **file = files;
+    bool prev_null = true;
+    while (1) {
+        if (*file == NULL) {
+            if (prev_null)
+                break;
+            else
+                files_count++;
+        }
+        prev_null = (*file == NULL);
+        
+        file++;
+    }
+    return files_count;
 }
 
 int main(int argc, char **argv) {
@@ -306,36 +329,37 @@ int main(int argc, char **argv) {
     
     /* FILES FORMAT
     char *files[] = {
-        "src1.c", "dependency1.h dependency2.h ...",
-        "src2.c", "dependency1.h ...",
-        "src3.c", "dependency2.h ...",
+        "src1.c", "dependency1.h" "dependency2.h", ..., NULL
+        "src2.c", "dependency1.h", ..., NULL,
+        "src3.c", "dependency2.h", ..., NULL,
         ...
+        NULL
     };
     // files_count - number of source files
     */
 
     if (build_server) {
         char *server_files[] = {
-            SRC_DIR "server.c",     SRC_DIR "boids.h " SRC_DIR "network.h " SRC_DIR "queue.h " SRC_DIR "kdtree.h",
-            SRC_DIR "boids.c",      SRC_DIR "boids.h",
-            SRC_DIR "network.c",    SRC_DIR "network.h " SRC_DIR "boids.h",
-            SRC_DIR "kdtree.c",     SRC_DIR "kdtree.h " SRC_DIR "boids.h"
+            SRC_DIR "server.c",     SRC_DIR "boids.h", SRC_DIR "network.h", SRC_DIR "queue.h", SRC_DIR "kdtree.h", NULL,
+            SRC_DIR "boids.c",      SRC_DIR "boids.h", NULL,
+            SRC_DIR "network.c",    SRC_DIR "network.h", SRC_DIR "boids.h", NULL,
+            SRC_DIR "kdtree.c",     SRC_DIR "kdtree.h", SRC_DIR "boids.h", NULL,
+            NULL
         };
-        int server_files_count = sizeof(server_files) / sizeof(*server_files) / 2;
 
-        if (build_prog(server_files, server_files_count, IRAYLIB, "", SERVER) != BUILD_OK)
+        if (build_prog(server_files, count_src_files(server_files), IRAYLIB, "", SERVER) != BUILD_OK)
             return 1;
     }
 
     if (build_client) {
         char *client_files[] = {
-            SRC_DIR "client.c",     SRC_DIR "boids.h " SRC_DIR "network.h " SRC_DIR "queue.h ",
-            SRC_DIR "boids.c",      SRC_DIR "boids.h",
-            SRC_DIR "network.c",    SRC_DIR "network.h " SRC_DIR "boids.h",
+            SRC_DIR "client.c",     SRC_DIR "boids.h", SRC_DIR "network.h", SRC_DIR "queue.h", NULL,
+            SRC_DIR "boids.c",      SRC_DIR "boids.h", NULL,
+            SRC_DIR "network.c",    SRC_DIR "network.h", SRC_DIR "boids.h", NULL,
+            NULL
         };
-        int client_files_count = sizeof(client_files) / sizeof(*client_files) / 2;
 
-        if (build_prog(client_files, client_files_count, "", LRAYLIB, CLIENT) != BUILD_OK)
+        if (build_prog(client_files, count_src_files(client_files), "", LRAYLIB, CLIENT) != BUILD_OK)
             return 1;
     }
 
