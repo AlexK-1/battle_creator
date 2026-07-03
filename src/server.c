@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <string.h>
+#include <signal.h>
 
 #define RAYMATH_STATIC_INLINE
 #include <raylib.h>
@@ -101,7 +102,8 @@ Player **players = NULL;
 uint32_t last_player_id = 0; // 0 must be an invalid player id
 Room *rooms[MAX_ROOMS] = { 0 };
 int32_t last_room_idx = -1;
-int chunk_size = CHUNK_SIZE_PIXELS;
+int chunk_size = CHUNK_SIZE_PIXELS, epfd, server_fd;
+long max_fd;
 /* ^ global variables ^ */
 
 int get_player_idx(Player **players, int id) {
@@ -123,9 +125,9 @@ static inline int random_value(int min, int max) {
     return rand() % (max-min) + min;
 }
 
-void close_client(int, int);
+void close_client(int);
 
-void close_room(int epfd, Room *room) {
+void close_room(Room *room) {
     if (room->status == ROOM_GAME && room->thread_run) {
         room->thread_run = false;
         pthread_join(room->thread, NULL);
@@ -137,14 +139,14 @@ void close_room(int epfd, Room *room) {
         Player *op;
         dequeue(room->players[0]->approving_queue, op);
         op->joined = false;
-        close_client(epfd, op->fd);
+        close_client(op->fd);
     }
 
     for (int i = 0; i < room->joined_players; i++) {
         Player *op = room->players[i]; // other_player
         op->joined = false;
         send_packet(op->fd, SP_ROOM_CLOSED, NULL, 0, 0);
-        close_client(epfd, op->fd);
+        close_client(op->fd);
     }
 
     if (room->boids != NULL) free(room->boids);
@@ -152,7 +154,7 @@ void close_room(int epfd, Room *room) {
     rooms[last_room_idx] = NULL;
 }
 
-void close_client(int epfd, int fd) {
+void close_client(int fd) {
     Player *p = players[fd];
 
     // room
@@ -166,7 +168,7 @@ void close_client(int epfd, int fd) {
         if ((room->status == ROOM_AREAS && player_idx == 0) || // room's creator disconnected
             (room->status == ROOM_PLACING) ||
             (room->status == ROOM_GAME && room->joined_players == 1)) {
-            close_room(epfd, room); // close entire room
+            close_room(room); // close entire room
             room_closed = true;
         } else {
             // delete player from array
@@ -226,23 +228,13 @@ void close_client(int epfd, int fd) {
     }
 }
 
-typedef struct {
-    Room *room;
-    int epfd;
-} RoomThreadArgs;
-
 void *room_thread_fn(void *args) {
-    RoomThreadArgs *nargs = args;
-    
-    Room *room = nargs->room;
-    int epfd = nargs->epfd;
-
-    free(args);
+    Room *room = args;
     
     ServerBoid *boids = room->boids = calloc(room->total_boids_number, sizeof(*room->boids));
     if (boids == NULL) {
         room->thread_run = false;
-        close_room(epfd, room);
+        close_room(room);
         return NULL;
     }
     BoidIndex boids_count = 0;
@@ -282,7 +274,7 @@ void *room_thread_fn(void *args) {
     }
 
     if (boids_count > room->total_boids_number) {
-        close_room(epfd, room);
+        close_room(room);
         return NULL;
     }
 
@@ -414,7 +406,7 @@ void *room_thread_fn(void *args) {
     return NULL;
 }
 
-void process_data(Player *p, int epfd) {
+void process_data(Player *p) {
     switch (p->net.type) {
     case CP_NEW_ROOM: {
         CPNew data;
@@ -685,9 +677,7 @@ void process_data(Player *p, int epfd) {
             room->thread_run = true;
             pthread_mutex_init(&room->boids_mtx, NULL);
 
-            RoomThreadArgs *args = malloc(sizeof(*args));
-            *args = (RoomThreadArgs){.room = room, .epfd = epfd};
-            pthread_create(&room->thread, NULL, room_thread_fn, args);
+            pthread_create(&room->thread, NULL, room_thread_fn, room);
         }
         
         break;
@@ -871,7 +861,7 @@ void process_data(Player *p, int epfd) {
     }
 }
 
-int client_recv(Player *p, int epfd) {
+int client_recv(Player *p) {
     while (1) {
         // Receive data
         int n = recv(p->fd, p->net.recv_buf, sizeof(p->net.recv_buf), 0);
@@ -928,7 +918,7 @@ int client_recv(Player *p, int epfd) {
                     ptr += copy;
                 }
                 if (p->net.bytes_remaining == 0) {
-                    process_data(p, epfd);
+                    process_data(p);
                     
                     free(p->net.data_buf);
                     p->net.data_buf = NULL;
@@ -939,6 +929,23 @@ int client_recv(Player *p, int epfd) {
     }
 
     return 0;
+}
+
+void quit(int sig) {
+    printf("\n[!] shutting down server\n");
+
+    for (long i = 0; i < max_fd; i++) {
+        if (players[i] != NULL) {
+            players[i]->joined = false;
+            close_client(i);
+        };
+    }
+    free(players);
+
+    close(epfd);
+    close(server_fd);
+
+    exit(sig);
 }
 
 int main(int argc, char **argv) {
@@ -1015,11 +1022,11 @@ int main(int argc, char **argv) {
 
     printf("chunk: %d pixels\n", chunk_size);
     
-    const long max_fd = sysconf(_SC_OPEN_MAX);
+    max_fd = sysconf(_SC_OPEN_MAX);
     players = calloc(max_fd, sizeof(Player*));
     
     // Create a TCP socket
-    int server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (server_fd < 0) {
         perror("socket");
         return 1;
@@ -1058,14 +1065,14 @@ int main(int argc, char **argv) {
     }
 
     // Create epoll instance
-    int epfd = epoll_create1(0);
+    struct epoll_event event, events[MAX_EVENTS];
+    epfd = epoll_create1(0);
     if (epfd < 0) {
         perror("epoll_create1");
         close(server_fd);
         return 1;
     }
 
-    struct epoll_event event, events[MAX_EVENTS];
     event.events = EPOLLIN; // EPOLLIN | EPOLLOUT
     event.data.fd = server_fd;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &event)) {
@@ -1075,22 +1082,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Make stdin nonblocking
-    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    if (fcntl(STDIN_FILENO, F_GETFD) != -1) {
+        // Make stdin nonblocking
+        int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     
-    // Add stdin to epoll
-    event.events = EPOLLIN;
-    event.data.fd = STDIN_FILENO;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &event)) {
-        perror("epoll_ctl stdin");
-        close(server_fd);
-        close(epfd);
-        return 1;
+        // Add stdin to epoll
+        event.events = EPOLLIN;
+        event.data.fd = STDIN_FILENO;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &event))
+            printf("[!] stdin is invalid\n");
+    } else {
+        printf("[!] stdin is closed\n");
     }
+    
+    printf("[*] epoll server on 0.0.0.0:%d\n", tcp_port);
 
-    printf("epoll server on 0.0.0.0:%d\n", tcp_port);
-
+    signal(SIGINT, quit);
+    
     bool running = true;
     while (running) {
         int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
@@ -1122,7 +1131,8 @@ int main(int argc, char **argv) {
                     }
 
                     Player *player = malloc(sizeof(Player));
-                    *player = (Player){.id = (++last_player_id), .fd = client_fd, .joined = false, .ready = false, .approving_queue = { 0 }, .in_queue = NULL};
+                    *player = (Player){.id = (++last_player_id), .fd = client_fd, .joined = false, .ready = false,
+                                       .approving_queue = { 0 }, .in_queue = NULL};
                     players[client_fd] = player;
 
                     char ip[INET_ADDRSTRLEN];
@@ -1145,7 +1155,6 @@ int main(int argc, char **argv) {
                 if (r > 0) {
                     buf[r] = '\0';
                     if (strcmp(buf, "quit\n") == 0 || strcmp(buf, "q\n") == 0) {
-                        printf("[!] shutting down server\n");
                         running = false;
                         break;
                     }
@@ -1155,24 +1164,15 @@ int main(int argc, char **argv) {
                 }
             } else if (events[i].events & EPOLLERR) {
                 // Disconnect client
-                close_client(epfd, fd);
+                close_client(fd);
             } else {
                 Player *player = players[fd];
-                if (client_recv(player, epfd)) {
-                    close_client(epfd, fd);
+                if (client_recv(player)) {
+                    close_client(fd);
                 }
             }
         }
     }
 
-    for (long i = 0; i < max_fd; i++) {
-        if (players[i] != NULL) {
-            players[i]->joined = false;
-            close_client(epfd, i);
-        };
-    }
-    free(players);
-
-    close(epfd);
-    close(server_fd);
+    quit(0);
 }
