@@ -3,11 +3,9 @@
     
     #define mkdir(file, ...) mkdir(file)
     #define _stat stat
-    #define FILE_NEWER(st1, st2) ((st1).st_mtime > (st2).st_mtime)
 #else
     #include <unistd.h>
     #include <dirent.h>
-    #define FILE_NEWER(st1, st2) ((st1).st_mtim.tv_sec > (st2).st_mtim.tv_sec)
 #endif
 #include <sys/stat.h>
 #include <stdio.h>
@@ -22,23 +20,55 @@
 #endif
 
 #ifndef CC
-    #define CC "cc "
+    #define CC "cc"
 #endif
 
-#define CFLAGS_COMMON "-std=c99 "
+// #define DEBUG
+// #define USE_WAYLAND_DISPLAY
+// #define RAYLIB_PATH "/path/to/raylib"
+
+#ifdef RAYLIB_PATH
+    #define RAYLIB_INCLUDE "-I " RAYLIB_PATH PATH_SEP "src "
+    #define RAYLIB_LINK "-L " RAYLIB_PATH PATH_SEP "src "
+#else
+    #define RAYLIB_INCLUDE ""
+    #define RAYLIB_LINK ""
+#endif
+
+#define CFLAGS_COMMON "-std=c99 -Wall "
 #ifdef DEBUG
-    #define CFLAGS CFLAGS_COMMON "-Wall -Wextra -pedantic -g -fsanitize=address "
+    #define CFLAGS CFLAGS_COMMON "-Wextra -pedantic -g -fsanitize=address "
 #else
     #define CFLAGS CFLAGS_COMMON "-O2 "
 #endif
+#define CFLAGS_SERVER CFLAGS "-Iraylib"
+#define CFLAGS_CLIENT CFLAGS RAYLIB_INCLUDE
 
-#ifdef _WIN32
-    #define LDFLAGS "-lopengl32 -lgdi32 -lwinmm -lkernel32 -luser32 -lshell32 -lws2_32 -static -static-libgcc -s "
-#else
-    #define LDFLAGS "-lm -pthread "
+#if defined(_WIN32)
+    #ifdef DEBUG
+        #define LDFLAGS ""
+    #else
+        #define LDFLAGS "-static -static-libgcc -s "
+    #endif
+    #define LDFLAGS_CLIENT LDFLAGS RAYLIB_LINK "-lraylib -lopengl32 -lgdi32 -lwinmm -lkernel32 -luser32 -lshell32 -lws2_32 "
+    #define LDFLAGS_SERVER LDFLAGS
+#elif defined(__linux__)
+    #define LDFLAGS "-lm -lpthread "
+    #define LDFLAGS_SERVER LDFLAGS
+    #define LDFLAGS_CLIENT_COMMON LDFLAGS RAYLIB_LINK "-lraylib -lGL -ldl -lrt "
+    #ifdef USE_WAYLAND_DISPLAY
+        #define LDFLAGS_CLIENT LDFLAGS_CLIENT_COMMON "-lwayland-client -lwayland-cursor -lwayland-egl -lxkbcommon "
+    #else
+        #define LDFLAGS_CLIENT LDFLAGS_CLIENT_COMMON "-lX11 " /* "-lXrandr -lXinerama -lXi -lXxf86vm -lXcursor " */
+    #endif
+#elif defined(__APPLE__)
+    #define LDFLAGS_SERVER ""
+    #define LDFLAGS_CLIENT RAYLIB_LINK "-lraylib -framework OpenGL -framework Cocoa -framework IOKit -framework CoreAudio -framework CoreVideo "
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    #define LDFLAGS "-lm -lpthread "
+    #define LDFLAGS_SERVER LDFLAGS
+    #define LDFLAGS_CLIENT LDFLAGS RAYLIB_LINK "-lraylib -lGL -lX11 -lXrandr -lXinerama -lXi -lXxf86vm -lXcursor "
 #endif
-#define LRAYLIB "-lraylib "
-#define IRAYLIB "-I ." PATH_SEP "raylib "
 
 #define SRC_DIR "src" PATH_SEP
 #define BUILD_DIR ".build" PATH_SEP
@@ -63,6 +93,8 @@
         exit(EXIT_FAILURE);                                                   \
     } while (0)
 
+
+#define FILE_NEWER(st1, st2) ((st1).st_mtime > (st2).st_mtime)
 
 typedef enum {
     BUILD_OK = 0,
@@ -133,7 +165,7 @@ int create_dir(char *dir_name) {
     }
 }
 
-int compile_file(char *src_file, char **dependency_files, char *include_paths, char *out) {
+int compile_file(char *src_file, char **dependency_files, char *cflags, char *out) {
     struct stat st_src, st_obj;
     if (stat(src_file, &st_src) != 0) {
         printf("source file %s does not exist\n", src_file);
@@ -162,9 +194,9 @@ int compile_file(char *src_file, char **dependency_files, char *include_paths, c
             return 0;
     }
 
-    char format[] = CC CFLAGS "%s -c -o \"%s\" \"%s\"";
-    char *buffer = calloc(sizeof(format) + strlen(include_paths) + strlen(src_file) + strlen(out), sizeof(*buffer));
-    sprintf(buffer, format, include_paths, out, src_file);
+    char format[] = CC " %s -c -o \"%s\" \"%s\"";
+    char *buffer = calloc(sizeof(format) + strlen(cflags) + strlen(src_file) + strlen(out), sizeof(*buffer));
+    sprintf(buffer, format, cflags, out, src_file);
 
     printf("$ %s\n", buffer);
 
@@ -173,13 +205,13 @@ int compile_file(char *src_file, char **dependency_files, char *include_paths, c
     return r;
 }
 
-int link_prog(char **obj_files, int files_count, char *link_paths, char *out) {
+int link_prog(char **obj_files, int files_count, char *ldflags, char *out) {
     int obj_files_len = 0;
     for (int i = 0; i < files_count; i++)
         obj_files_len += /*"*/ 1 + strlen(obj_files[i]) + /*"*/ 1 + /* */ 1;
     
-    char format[] = CC CFLAGS "-o \"%s\" ";
-    char *buffer = calloc(sizeof(format) + obj_files_len + strlen(out) + strlen(link_paths) + sizeof(LDFLAGS), sizeof(*buffer));
+    char format[] = CC " -o \"%s\" ";
+    char *buffer = calloc(sizeof(format) + obj_files_len + strlen(out) + strlen(ldflags), sizeof(*buffer));
     sprintf(buffer, format, out);
 
     for (int i = 0; i < files_count; i++) {
@@ -188,8 +220,7 @@ int link_prog(char **obj_files, int files_count, char *link_paths, char *out) {
         strcat(buffer, "\" ");
     }
 
-    strcat(buffer, link_paths);
-    strcat(buffer, LDFLAGS);
+    strcat(buffer, ldflags);
 
     printf("$ %s\n", buffer);
 
@@ -211,10 +242,10 @@ char *src_to_build_path(char *src_file) {
     return buffer;
 }
 
-BuildStatus build_prog(char **files, int files_count, char *include_paths, char *link_paths, char *out) {
+BuildStatus build_prog(char **files, int files_count, char *cflags, char *ldflags, char *out) {
     printf("building %s...\n", out);
     
-    char *obj_files[files_count];
+    char **obj_files = calloc(files_count, sizeof(*obj_files));
     int obj_files_count = 0;
 
     char **file = files;
@@ -224,9 +255,10 @@ BuildStatus build_prog(char **files, int files_count, char *include_paths, char 
         if (prev_null) {
             char *obj_file = src_to_build_path(*file);
             obj_files[obj_files_count++] = obj_file;
-            if (compile_file(*file, file+1, include_paths, obj_file) != 0) {
+            if (compile_file(*file, file+1, cflags, obj_file) != 0) {
                 for (int i = 0; i < obj_files_count; i++)
                     free(obj_files[i]);
+                free(obj_files);
                 printf("%s compilation error!\n", out);
                 return BUILD_COMPILATION_ERR;
             }
@@ -235,10 +267,11 @@ BuildStatus build_prog(char **files, int files_count, char *include_paths, char 
         prev_null = (*(file++) == NULL);
     }
     
-    int link_res = link_prog(obj_files, files_count, link_paths, out);
+    int link_res = link_prog(obj_files, files_count, ldflags, out);
 
     for (int j = 0; j < files_count; j++)
         free(obj_files[j]);
+    free(obj_files);
 
     if (link_res == 0) {
         printf("%s built successfully!\n", out);
@@ -347,7 +380,7 @@ int main(int argc, char **argv) {
             NULL
         };
 
-        if (build_prog(server_files, count_src_files(server_files), IRAYLIB, "", SERVER) != BUILD_OK)
+        if (build_prog(server_files, count_src_files(server_files), CFLAGS_SERVER, CFLAGS LDFLAGS_SERVER, SERVER) != BUILD_OK)
             return 1;
     }
 
@@ -359,7 +392,7 @@ int main(int argc, char **argv) {
             NULL
         };
 
-        if (build_prog(client_files, count_src_files(client_files), "", LRAYLIB, CLIENT) != BUILD_OK)
+        if (build_prog(client_files, count_src_files(client_files), CFLAGS_CLIENT, CFLAGS LDFLAGS_CLIENT, CLIENT) != BUILD_OK)
             return 1;
     }
 

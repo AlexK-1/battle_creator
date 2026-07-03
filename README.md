@@ -94,7 +94,6 @@ I decided not to use make and wrote my build system in C. So, before building se
 ```sh
 cc build.c -o build
 ```
-For debugging, add the `-DDEBUG` flag.
 
 Then build the program itself
 ```sh
@@ -108,3 +107,15 @@ or
 
 > [!NOTE]
 > The client requires [**Raylib**](https://www.raylib.com) installed
+
+You can define macros in `build.c` for customizing build process:
+  - `CC` - C Compiler (default: `"cc"`)
+  - `DEBUG` - Use debugging flags
+  - `USE_WAYLAND_DISPLAY` - Build with Wayland support instead of X11 on Linux (client only)
+  - `RAYLIB_PATH` - Path to the Raylib repository (client only)
+
+For Example:
+```sh
+cc build.c -o build -DCC=\"tcc\" -DDEBUG -DUSE_WAYLAND_DISPLAY -DRAYLIB_PATH=\"~/raylib\"
+./build all
+```

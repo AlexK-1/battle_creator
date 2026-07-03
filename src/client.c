@@ -335,7 +335,7 @@ void *net_thread_fn(void *args) {
             }
             exited_player = ntohl(exited_player);
 
-            if (*stage == STAGE_AREAS && exited_player != approved_player_id) {
+            if (*stage == STAGE_AREAS && exited_player == approved_player_id) {
                 write_log(log, "[-] player '%s' disconnected\n", approved_player_username);
                 approved_player_id = 0;
 
@@ -957,7 +957,7 @@ int main(int argc, char **argv) {
         CPNew data = {.players_number = players_number, .player_team = player_team, .world_size = {htons(world_size.x), htons(world_size.y)}};
         for (int i = 0; i < TEAMS_COUNT; i++)
             data.boids_number[i] = htons(boids_number[i]);
-        strncpy(data.creator, username, USERNAME_LEN-1);
+        strncpy(data.creator, username, USERNAME_LEN);
         data.creator[USERNAME_LEN-1] = '\0';
 
         send_packet(fd, CP_NEW_ROOM, &data, sizeof(data), 0);
@@ -977,7 +977,7 @@ int main(int argc, char **argv) {
         }
     } else {
         CPJoin data = {.room_id = htonl(room_id)};
-        strncpy(data.username, username, USERNAME_LEN-1);
+        strncpy(data.username, username, USERNAME_LEN);
         data.username[USERNAME_LEN-1] = '\0';
 
         send_packet(fd, CP_JOIN_ROOM, &data, sizeof(data), 0);

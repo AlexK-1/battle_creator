@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+
+#define RAYMATH_STATIC_INLINE
 #include <raymath.h>
 
 #include "boids.h"

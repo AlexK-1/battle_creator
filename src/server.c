@@ -20,7 +20,9 @@
 #include <pthread.h>
 #include <string.h>
 
+#define RAYMATH_STATIC_INLINE
 #include <raylib.h>
+#include <raymath.h>
 
 #include "boids.h"
 #include "network.h"
@@ -504,7 +506,13 @@ void process_data(Player *p, int epfd) {
         memcpy(&data, p->net.data_buf, sizeof(data));
         data.room_id = ntohl(data.room_id);
 
-        uint16_t room_idx = data.room_id & 0xffff0000;
+        uint16_t room_idx = (data.room_id & 0xffff0000) >> 16;
+        if (room_idx > MAX_ROOMS-1) {
+            SPJoined send_data = {.status = JOIN_FAILED};
+            send_packet(p->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+            break;
+        }
+        
         Room *room = rooms[room_idx];
         if ((room != NULL) && (room->id == data.room_id) && (room->joined_players < room->players_number) && (room->status == ROOM_AREAS)) {
             strcpy(p->name, data.username);

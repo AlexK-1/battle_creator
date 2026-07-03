@@ -1,3 +1,4 @@
+#define RAYMATH_STATIC_INLINE
 #include <raymath.h>
 #include <stdint.h>
 #include <stdbool.h>
