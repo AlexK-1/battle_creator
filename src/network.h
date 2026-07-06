@@ -37,7 +37,7 @@ typedef struct {
 
 typedef struct {
     Rec rec;
-    uint8_t team;
+    int8_t team;
 } Area;
 
 typedef enum {
@@ -46,7 +46,9 @@ typedef enum {
     SP_JOIN_PLAYER, // Player joined to the room (sent after the request to create/join to the room)
     SP_NEW_JOIN, // New player joined to the room
     SP_PLAYER_EXIT, // Player left the room
+    SP_SEND_AREAS, // Areas of the admin
     SP_START_PLACING, // Admin of the room starts placing of the boids
+    SP_PLAYER_READY, // A message, that the player is ready to start the game
     SP_START_GAME, // When all players have placed their boids
     SP_BOIDS_SYNC, // Boids sync server->clients
     SP_ROOM_CLOSED // Room is closed
@@ -57,9 +59,10 @@ typedef enum {
     CP_NEW_ROOM, // Create new room
     CP_JOIN_ROOM, // Join to the room
     CP_APPROVE_PLAYER, // Approve/reject new player
+    CP_SEND_AREAS, // Sending areas of the admin to other players
     CP_START_PLACING, // Admin of the room starts placing of the boids
     CP_SEND_BOIDS, // Sending player's boids before the game starts
-    CP_ORDER
+    CP_ORDER // Sending player's order to his boids
 } CPType; // Client packet type
 
 typedef struct {
@@ -94,7 +97,7 @@ typedef struct {
 } SPJoined;
 
 typedef struct {
-    uint8_t players_number, player_team;
+    uint8_t players_number, player_team, hide_areas;
     Point world_size;
     BoidIndex boids_number[TEAMS_COUNT];
     char creator[USERNAME_LEN];

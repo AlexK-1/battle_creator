@@ -146,13 +146,13 @@ typedef enum {
 
 typedef struct {
     int fd, players_number, *joined_players, chunk_size;
-    bool new_room, *select_mode;
+    bool new_room, *select_mode, *players_ready;
     Point *world_size;
     BoidIndex *boids_number, *boids_count, total_boids_number;
     ClientPlayer *players;
     Log *log;
     Grid *grid;
-    int16_t *areas_count;
+    uint16_t *areas_count;
     Area *areas;
     ClientBoid *boids;
     GameMode *mode;
@@ -163,6 +163,7 @@ pthread_mutex_t areas_mtx;
 pthread_mutex_t boids_mtx;
 pthread_mutex_t running_mtx;
 pthread_mutex_t input_mtx;
+pthread_mutex_t players_mtx;
 
 void *net_thread_fn(void *args) {
     NetThreadArgs *nargs = args;
@@ -179,10 +180,11 @@ void *net_thread_fn(void *args) {
     ClientPlayer *players = nargs->players;
     Log *log = nargs->log;
     Area *areas = nargs->areas;
-    int16_t *areas_count = nargs->areas_count;
+    uint16_t *areas_count = nargs->areas_count;
     bool *select_mode = nargs->select_mode;
     Grid *grid = nargs->grid;
     ClientBoid *boids = nargs->boids;
+    bool *players_ready = nargs->players_ready;
     GameMode *mode = nargs->mode;
     GameStage *stage = nargs->stage;
 
@@ -233,12 +235,14 @@ void *net_thread_fn(void *args) {
                     }
 
                     bool team_used = false;
+                    pthread_mutex_lock(&players_mtx);
                     for (int i = 0; i < *joined_players; i++) {
                         if (players[i].team == team) {
                             team_used = true;
                             break;
                         }
                     }
+                    pthread_mutex_unlock(&players_mtx);
                     if (team_used) {
                         write_log(log, "[!] enter an unused team\n");
                         get_input = true;
@@ -314,12 +318,15 @@ void *net_thread_fn(void *args) {
             }
             new_player.id = ntohl(new_player.id);
 
+            pthread_mutex_lock(&players_mtx);
             players[(*joined_players)++] = new_player;
+            pthread_mutex_unlock(&players_mtx);
             write_log(log, "[+] new player '%s' - %s\n", new_player.name, get_team_name(new_player.team));
 
             if (new_room && players_number == *joined_players) {
                 write_log(log, "[*] press ENTER to start placing boids\n");
             }
+            approved_player_id = 0;
             
             break;
             }
@@ -348,14 +355,17 @@ void *net_thread_fn(void *args) {
                 write_log(log, "[-] player '%s' disconnected\n", players[player_idx].name);
             
                 // delete player from array
+                pthread_mutex_lock(&players_mtx);
                 memmove(players + player_idx, players + player_idx + 1,
                         sizeof(players[0]) * (*joined_players - player_idx - 1));
                 (*joined_players)--;
+                pthread_mutex_unlock(&players_mtx);
             }
             
             break;
             }
-        case SP_START_PLACING: {
+        case SP_START_PLACING:
+        case SP_SEND_AREAS: {
             uint32_t packet_size;
             recv_all(fd, &packet_size, sizeof(uint32_t), 0);
             packet_size = ntohl(packet_size);
@@ -373,9 +383,9 @@ void *net_thread_fn(void *args) {
             if (!new_room) {
                 pthread_mutex_lock(&areas_mtx);
                 *areas_count = new_areas_count;
-                Area *a = (Area*)(buf + sizeof(*areas_count));
+                Area *a = (Area*)(buf + sizeof(new_areas_count));
                 for (int i = 0; i < *areas_count; i++) {
-                    areas[i] = *a;
+                    areas[i].team = a->team;
                     areas[i].rec.x1 = ntohs(a->rec.x1);
                     areas[i].rec.x2 = ntohs(a->rec.x2);
                     areas[i].rec.y1 = ntohs(a->rec.y1);
@@ -384,13 +394,36 @@ void *net_thread_fn(void *args) {
                 }
                 pthread_mutex_unlock(&areas_mtx);
             }
-            *mode = MODE_SPAWN;
-            *stage = STAGE_PLACING;
 
-            free(buf);
+            if (packet_type == SP_START_PLACING) {
+                *mode = MODE_SPAWN;
+                *stage = STAGE_PLACING;
 
-            write_log(log, "[*] now you can spawn boids on your areas");
-            write_log(log, "[*] press ENTER when you will ready to start the game\n");
+                free(buf);
+
+                write_log(log, "[*] now you can spawn boids on your areas");
+                write_log(log, "[*] press ENTER when you will ready to start the game\n");
+            }
+            
+            break;
+            }
+        case SP_PLAYER_READY: {
+            uint32_t packet_size;
+            recv_all(fd, &packet_size, sizeof(uint32_t), 0);
+            packet_size = ntohl(packet_size);
+            char *buf = malloc(packet_size);
+
+            recv_all(fd, buf, packet_size, 0);
+
+            if (packet_size != sizeof(uint32_t))
+                break;
+
+            pthread_mutex_lock(&players_mtx);
+            uint32_t id = ntohl(*(uint32_t*)buf);
+            int idx = get_player_idx(players, id);
+            players_ready[players[idx].team] = true;
+            write_log(log, "[*] player '%s' is ready\n", players[idx].name);
+            pthread_mutex_unlock(&players_mtx);
             
             break;
             }
@@ -511,7 +544,6 @@ void *net_thread_fn(void *args) {
 
 /* <============================================ BOIDS AND MAIN ============================================> */
 
-#define MAX_AREAS_COUNT 1024
 #define DEFAULT_PLAYERS_COUNT 2
 #define DEFAULT_WORLD_SIZE_X 10050
 #define DEFAULT_WORLD_SIZE_Y 10050
@@ -596,9 +628,83 @@ void draw_selection(ClientBoid *boid, Texture2D texture, float scale, Color colo
                    atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, color);
 }
 
+// Original function by @G-5ars
+void cleanup_areas(Area *areas, uint16_t *areas_count) {
+    // x pass
+    for (int i = 0; i < *areas_count; i++) {
+        Area *area = &areas[i];
+        if (area->team == -1)
+            continue;
+        for (int j = i+1; j < *areas_count; j++) {
+            Area *other = &areas[j];
+            if (i == j ||
+                area->team != other->team ||
+                other->team == -1)
+                continue;
+
+            if (area->rec.x1 == other->rec.x1 && area->rec.x2 == other->rec.x2 && (area->rec.y1 == other->rec.y2 || area->rec.y2 == other->rec.y1)) {
+                area->rec.y1 = MIN(area->rec.y1, other->rec.y1);
+                area->rec.y2 = MAX(area->rec.y2, other->rec.y2);
+                other->team = -1; // Mark areas as deleted
+            }
+        }
+    }
+
+    // y pass
+    for (int i = 0; i < *areas_count; i++) {
+        Area *area = &areas[i];
+        if (area->team == -1)
+            continue;
+        for (int j = i+1; j < *areas_count; j++) {
+            Area *other = &areas[j];
+            if (i == j ||
+                area->team != other->team ||
+                other->team == -1)
+                continue;
+
+            if (area->rec.y1 == other->rec.y1 && area->rec.y2 == other->rec.y2 && (area->rec.x1 == other->rec.x2 || area->rec.x2 == other->rec.x1)) {
+                area->rec.x1 = MIN(area->rec.x1, other->rec.x1);
+                area->rec.x2 = MAX(area->rec.x2, other->rec.x2);
+                other->team = -1; // Mark area as deleted
+            }
+        }
+    }
+
+    // Remove deleted areas from array
+    int offset = 0;
+    for (int i = 0; i < *areas_count; i++) {
+        areas[i - offset] = areas[i];
+        Area *area = &areas[i];
+        if (area->team == -1)
+            offset++;
+    }
+    *areas_count -= offset;
+}
+
+int send_areas(int fd, uint8_t package_type, Area *areas, uint16_t areas_count) {
+    uint32_t buf_size = areas_count * sizeof(*areas) + sizeof(areas_count);
+    char *buf = malloc(buf_size);
+
+    *(uint16_t*)buf = htons(areas_count);
+    Area *a = (Area*)(buf + sizeof(areas_count));
+    for (int i = 0; i < areas_count; i++) {
+        *a = areas[i];
+        a->rec.x1 = htons(a->rec.x1);
+        a->rec.x2 = htons(a->rec.x2);
+        a->rec.y1 = htons(a->rec.y1);
+        a->rec.y2 = htons(a->rec.y2);
+        a++;
+    }
+
+    int r = send_packet(fd, package_type, buf, buf_size, 0);
+
+    free(buf);
+    return r;
+}
+
 int main(int argc, char **argv) {
     // room/player settings, argparse
-    bool new_room, show_global_help = false, show_command_help = false;
+    bool new_room, hide_areas = false, show_global_help = false, show_command_help = false;
     uint32_t room_id = 0;
     int players_number = DEFAULT_PLAYERS_COUNT;
     BoidTeam player_team = TEAM_RED;
@@ -626,100 +732,120 @@ int main(int argc, char **argv) {
         char *arg = *(++argv);
 
         if (arg[0] == '-') {
-            if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
-                show_command_help = true;
-                break;
-            } else if (strcmp(arg, "--server") == 0 || strcmp(arg, "-s") == 0) {
-                if (argc == 1) ERRF("no value for option '%s'\n", arg);
+            int old_argc = argc;
+            bool ext = false; // exit
 
-                strcpy(server, *(++argv));
-                argc--;
-            } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
-                if (argc == 1) ERRF("no value for option '%s'\n", arg);
+            do {
+                if (strcmp(arg, "--help") == 0 || strncmp(arg, "-h", 2) == 0) {
+                    show_command_help = true;
+                    ext = true;
+                    break;
+                } else if (strcmp(arg, "--server") == 0 || strcmp(arg, "-s") == 0) {
+                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
-                char *value_str = *(++argv);
-                argc--;
+                    strcpy(server, *(++argv));
+                    argc--;
+                } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
+                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
-                char *endp;
-                tcp_port = strtoul(value_str, &endp, 10);
-                if (*endp != '\0') {
-                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
-                }
-            } else if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
-                if (argc == 1) ERRF("no value for option '%s'\n", arg);
-
-                char *value_str = *(++argv);
-                argc--;
-
-                char *endp;
-                chunk_size = strtoul(value_str, &endp, 10);
-                if (*endp != '\0') {
-                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
-                }
-
-                if (chunk_size < BOID_SIZE) {
-                    ERRF("size of chunk must be greater than or equal to %d\n", BOID_SIZE);
-                } else if (chunk_size > CHUNK_SIZE_PIXELS) {
-                    ERRF("size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
-                }
-                chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
-            } else if (strcmp(arg, "--name") == 0 || strcmp(arg, "-n") == 0) {
-                if (argc == 1) ERRF("no value for option '%s'\n", arg);
-
-                strcpy(username, *(++argv));
-                argc--;
-            } else if (new_room) {
-                if (strcmp(arg, "--players") == 0 || strcmp(arg, "-p") == 0 || (arg[1] == 'p' && isdigit(arg[2]))) {
-                    if (argc == 1 && !isdigit(arg[2])) ERRF("no value for option '%s'\n", arg);
-
-                    int s = strlen(arg);
-
-                    char *value_str;
-                    if (arg[1] == 'p' && s >= 3) {
-                        value_str = arg+2;
-                    } else {
-                        value_str = *(++argv);
-                        argc--;
-                    }
+                    char *value_str = *(++argv);
+                    argc--;
 
                     char *endp;
-                    players_number = strtoul(value_str, &endp, 10);
+                    tcp_port = strtoul(value_str, &endp, 10);
                     if (*endp != '\0') {
                         ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                     }
-                    if (players_number == 0 || players_number > 4) {
-                        ERR("number of players must be from 1 to 4\n");
-                    }
-                } else if (strcmp(arg, "--team") == 0 || strcmp(arg, "-t") == 0) {
+                } else if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
                     if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
                     char *value_str = *(++argv);
                     argc--;
 
-                    if (*value_str == 'r') player_team = TEAM_RED;
-                    else if (*value_str == 'b') player_team = TEAM_BLUE;
-                    else if (*value_str == 'g') player_team = TEAM_GREEN;
-                    else if (*value_str == 'y') player_team = TEAM_YELLOW;
-                    else {
+                    char *endp;
+                    chunk_size = strtoul(value_str, &endp, 10);
+                    if (*endp != '\0') {
                         ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                     }
-                } else if (strcmp(arg, "--world") == 0 || strcmp(arg, "-w") == 0) {
+
+                    if (chunk_size < BOID_SIZE) {
+                        ERRF("size of chunk must be greater than or equal to %d\n", BOID_SIZE);
+                    } else if (chunk_size > CHUNK_SIZE_PIXELS) {
+                        ERRF("size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
+                    }
+                    chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
+                } else if (strcmp(arg, "--name") == 0 || strcmp(arg, "-n") == 0) {
                     if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
-                    char *value_str = *(++argv);
+                    strcpy(username, *(++argv));
                     argc--;
-                    if (sscanf(value_str, "%hux%hu", &world_size.x, &world_size.y) < 2) {
-                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                } else if (new_room) {
+                    if (strcmp(arg, "--players") == 0 || strcmp(arg, "-p") == 0 || (arg[1] == 'p' && isdigit(arg[2]))) {
+                        if (argc == 1 && !isdigit(arg[2])) ERRF("no value for option '%s'\n", arg);
+
+                        int s = strlen(arg);
+
+                        char *value_str;
+                        if (arg[1] == 'p' && s >= 3) {
+                            value_str = arg+2;
+                            arg += 1;
+                        } else {
+                            value_str = *(++argv);
+                            argc--;
+                        }
+
+                        char *endp;
+                        players_number = strtoul(value_str, &endp, 10);
+                        if (*endp != '\0') {
+                            ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                        }
+                        if (players_number == 0 || players_number > 4) {
+                            ERR("number of players must be from 1 to 4\n");
+                        }
+                    } else if (strcmp(arg, "--team") == 0 || strcmp(arg, "-t") == 0) {
+                        if (argc == 1) ERRF("no value for option '%s'\n", arg);
+
+                        char *value_str = *(++argv);
+                        argc--;
+
+                        if (*value_str == 'r') player_team = TEAM_RED;
+                        else if (*value_str == 'b') player_team = TEAM_BLUE;
+                        else if (*value_str == 'g') player_team = TEAM_GREEN;
+                        else if (*value_str == 'y') player_team = TEAM_YELLOW;
+                        else {
+                            ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                        }
+                    } else if (strcmp(arg, "--world") == 0 || strcmp(arg, "-w") == 0) {
+                        if (argc == 1) ERRF("no value for option '%s'\n", arg);
+
+                        char *value_str = *(++argv);
+                        argc--;
+                        if (sscanf(value_str, "%hux%hu", &world_size.x, &world_size.y) < 2) {
+                            ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                        }
+                        world_size.x = ceilf((float)world_size.x / BOID_SIZE) * BOID_SIZE;
+                        world_size.y = ceilf((float)world_size.y / BOID_SIZE) * BOID_SIZE;
+                    } else if (strcmp(arg, "--hide-areas") == 0 || strncmp(arg, "-a", 2) == 0) {
+                        hide_areas = true;
+                    } else {
+                        ERRF("unexpected argument '%s'\n", arg);
                     }
-                    world_size.x = ceilf((float)world_size.x / BOID_SIZE) * BOID_SIZE;
-                    world_size.y = ceilf((float)world_size.y / BOID_SIZE) * BOID_SIZE;
+    
                 } else {
                     ERRF("unexpected argument '%s'\n", arg);
                 }
                 
-            } else {
-                ERRF("unexpected argument '%s'\n", arg);
-            }
+                if (argc == old_argc && arg[1] != '-' && arg[2] != '\0') {
+                    // Move the arg pointer to flags like -abcd, which will be interpreted as -a -b -c -d
+                    arg++;
+                    *arg = '-';
+                } else {
+                    break;
+                }
+            } while (1);
+
+            if (ext)
+                break;
         } else if (new_room) {
             char *c;
             int teams[TEAMS_COUNT] = { 0 }, teams_count = 0;
@@ -820,6 +946,8 @@ int main(int argc, char **argv) {
                 "    Size of the game world in pixels in the <width>x<height> format,\n"
                 "    rounded up to the nearest number divisible by %d\n"
                 "    (default: %dx%d)\n"
+                "  -a, --hide-areas\n"
+                "    Do not show areas to otrher players while admin player draws them\n"
                 "\n"
                 "Examples:\n"
                 "  %s new --name bebob --world 1050x1050 -p2 r:30 b:40\n"
@@ -858,13 +986,7 @@ int main(int argc, char **argv) {
         exit(0);
     }
     
-    char *player_team_name = NULL;
     if (new_room) {
-        player_team_name = get_team_name(player_team);
-        if (boids_number[player_team] == 0) {
-            ERRF("number of boids in the player's team (%s) is not set\n", player_team_name);
-        }
-
         int teams_number = 0;
         for (int i = 0; i < TEAMS_COUNT; i++) {
             if (boids_number[i] > 0) {
@@ -876,6 +998,8 @@ int main(int argc, char **argv) {
         if (teams_number != players_number) {
             ERR("you have not set the number of boids for all players\n");
         }
+        if (total_boids_number > (world_size.x/BOID_SIZE)*(world_size.y/BOID_SIZE))
+            ERRF("you won't be able to place %d boids in a %dx%d world\n", total_boids_number, world_size.x, world_size.y);
         if (total_boids_number > MAX_BOIDS_COUNT) {
             ERRF("number of boids (%u) is greater than max boids count (%u)\n", total_boids_number, MAX_BOIDS_COUNT);
         }
@@ -954,7 +1078,8 @@ int main(int argc, char **argv) {
     // Join/new room request
     SPJoined recv_data;
     if (new_room) {
-        CPNew data = {.players_number = players_number, .player_team = player_team, .world_size = {htons(world_size.x), htons(world_size.y)}};
+        CPNew data = {.players_number = players_number, .player_team = player_team,
+                      .world_size = {htons(world_size.x), htons(world_size.y)}, .hide_areas = hide_areas};
         for (int i = 0; i < TEAMS_COUNT; i++)
             data.boids_number[i] = htons(boids_number[i]);
         strncpy(data.creator, username, USERNAME_LEN);
@@ -1002,7 +1127,6 @@ int main(int argc, char **argv) {
         }
 
         player_team = recv_data.player_team;
-        player_team_name = get_team_name(player_team);
     }
 
     room_id = ntohl(recv_data.room_id);
@@ -1018,6 +1142,7 @@ int main(int argc, char **argv) {
     }
 
     bool team_used[TEAMS_COUNT] = { 0 };
+    bool players_ready[TEAMS_COUNT] = { 0 };
 
     total_boids_number = 0;
     for (int i = 0; i < TEAMS_COUNT; i++) {
@@ -1110,7 +1235,7 @@ int main(int argc, char **argv) {
     Point area_start_selecting = { 0 }, area_end_selecting = { 0 };
     Area areas[MAX_AREAS_COUNT] = { 0 };
     int areas_size[TEAMS_COUNT] = { 0 };
-    int16_t areas_count = 0;
+    uint16_t areas_count = 0;
 
     // Boids
     ClientBoid *boids = calloc(total_boids_number, sizeof(*boids));
@@ -1128,11 +1253,13 @@ int main(int argc, char **argv) {
     // Start a thread to receive messages from the server
     pthread_mutex_init(&log_mtx, NULL);
     pthread_mutex_init(&input_mtx, NULL);
+    pthread_mutex_init(&areas_mtx, NULL);
     pthread_mutex_init(&boids_mtx, NULL);
-    NetThreadArgs thread_args = {.fd = fd, .players_number = players_number, .joined_players = &joined_players, .chunk_size = chunk_size, .new_room = new_room,
-                                 .select_mode = &select_mode, .world_size = &world_size, .boids_number = boids_number, .boids_count = &boids_count,
-                                 .total_boids_number = total_boids_number, .players = players, .log = &log, .grid = &grid, .areas_count = &areas_count,
-                                 .areas = areas, .boids = boids, .mode = &mode, .stage = &stage};
+    pthread_mutex_init(&players_mtx, NULL);
+    NetThreadArgs thread_args = {.fd = fd, .players_number = players_number, .joined_players = &joined_players, .chunk_size = chunk_size,
+                                 .new_room = new_room, .select_mode = &select_mode, .players_ready = players_ready, .world_size = &world_size,
+                                 .boids_number = boids_number, .boids_count = &boids_count, .total_boids_number = total_boids_number, .players = players,
+                                 .log = &log, .grid = &grid, .areas_count = &areas_count, .areas = areas, .boids = boids, .mode = &mode, .stage = &stage};
     pthread_t net_thread;
     pthread_create(&net_thread, NULL, net_thread_fn, &thread_args);
     
@@ -1301,23 +1428,10 @@ int main(int argc, char **argv) {
                             i--;
 
                             // Divide the old area into non-overlapping new ones
-                            // TODO: optimize it
-                            if (intersection.y1 == r.y1 || intersection.y2 == r.y2) {
-                                if (intersection.x1 != r.x1) areas[areas_count++] = (Area){.rec = {r.x1, r.y1, intersection.x1, r.y2}, .team = rt};
-                                if (intersection.y2 != r.y2 && intersection.y1 == r.y1) areas[areas_count++] = (Area){.rec = {intersection.x1, intersection.y2, intersection.x2, r.y2}, .team = rt};
-                                else if (intersection.y1 != r.y1 && intersection.y2 == r.y2) areas[areas_count++] = (Area){.rec = {intersection.x1, r.y1, intersection.x2, intersection.y1}, .team = rt};
-                                if (intersection.x2 != r.x2) areas[areas_count++] = (Area){.rec = {intersection.x2, r.y1, r.x2, r.y2}, .team = rt};
-                            } else if (intersection.x1 == r.x1 || intersection.x2 == r.x2) {
-                                areas[areas_count++] = (Area){.rec = {r.x1, r.y1, r.x2, intersection.y1}, .team = rt};
-                                if (intersection.x1 == r.x1 && intersection.x2 != r.x2) areas[areas_count++] = (Area){.rec = {intersection.x2, intersection.y1, r.x2, intersection.y2}, .team = rt};
-                                else if (intersection.x1 != r.x1 && intersection.x2 == r.x2) areas[areas_count++] = (Area){.rec = {r.x1, intersection.y1, intersection.x1, intersection.y2}, .team = rt};
-                                areas[areas_count++] = (Area){.rec = {r.x1, intersection.y2, r.x2, r.y2}, .team = rt};
-                            } else {
-                                areas[areas_count++] = (Area){.rec = {r.x1, r.y1, r.x2, intersection.y1}, .team = rt};
-                                areas[areas_count++] = (Area){.rec = {r.x1, intersection.y1, intersection.x1, intersection.y2}, .team = rt};
-                                areas[areas_count++] = (Area){.rec = {intersection.x2, intersection.y1, r.x2, intersection.y2}, .team = rt};
-                                areas[areas_count++] = (Area){.rec = {r.x1, intersection.y2, r.x2, r.y2}, .team = rt};
-                            }
+                            if (intersection.y1 != r.y1) areas[areas_count++] = (Area){.rec = {r.x1, r.y1, r.x2, intersection.y1}, .team = rt};
+                            if (intersection.x1 != r.x1) areas[areas_count++] = (Area) {.rec = {r.x1, intersection.y1, intersection.x1, intersection.y2}, .team = rt};
+                            if (intersection.x2 != r.x2) areas[areas_count++] = (Area){.rec = {intersection.x2, intersection.y1, r.x2, intersection.y2}, .team = rt};
+                            if (intersection.y2 != r.y2) areas[areas_count++] = (Area){.rec = {r.x1, intersection.y2, r.x2, r.y2}, .team = rt};
 
                             // Subtract the intersecting part from total areas size
                             areas_size[rt] -= (intersection.x2 - intersection.x1) * (intersection.y2 - intersection.y1);
@@ -1328,11 +1442,18 @@ int main(int argc, char **argv) {
                         areas[areas_count++] = (Area){.rec = area, .team = selecting_team};
                         areas_size[selecting_team] += (area.x2 - area.x1) * (area.y2 - area.y1);
                     }
+
+                    cleanup_areas(areas, &areas_count);
+
+                    if (!hide_areas)
+                        send_areas(fd, CP_SEND_AREAS, areas, areas_count);
+
                     pthread_mutex_unlock(&areas_mtx);
                 }
             }
 
             // Start placing
+            pthread_mutex_lock(&players_mtx);
             if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && !typing_string_input && new_room && players_number == joined_players) {
                 bool ok = true;
                 for (int team = 0; team < TEAMS_COUNT; team++) {
@@ -1344,29 +1465,15 @@ int main(int argc, char **argv) {
 
                 // Send data to the server only if size of areas of all teams is greater than or equal to the number of boids
                 if (ok) {
-                    uint32_t buf_size = areas_count * sizeof(*areas) + sizeof(areas_count);
-                    char *buf = malloc(buf_size);
-
                     pthread_mutex_lock(&areas_mtx);
-                    *(uint16_t*)buf = htons(areas_count);
-                    Area *a = (Area*)(buf + sizeof(areas_count));
-                    for (int i = 0; i < areas_count; i++) {
-                        *a = areas[i];
-                        a->rec.x1 = htons(a->rec.x1);
-                        a->rec.x2 = htons(a->rec.x2);
-                        a->rec.y1 = htons(a->rec.y1);
-                        a->rec.y2 = htons(a->rec.y2);
-                        a++;
-                    }
+                    send_areas(fd, CP_START_PLACING, areas, areas_count);
                     pthread_mutex_unlock(&areas_mtx);
-                
-                    send_packet(fd, CP_START_PLACING, buf, buf_size, 0);
-
-                    free(buf);
+                    
                 } else {
                     write_log(&log, "[!] you cannot start placing if size of areas of all teams is less than the number of boids\n");
                 }
             }
+            pthread_mutex_unlock(&players_mtx);
         }
 
         // Spawn boids
@@ -1407,13 +1514,13 @@ int main(int argc, char **argv) {
                             bool can_place = false;
 
                             // Check if new boids is in his team's area
-                            if (area != NULL && area->team == player_team &&
+                            if (area != NULL && area->team == (int)player_team &&
                                 cell_x >= area->rec.x1 && cell_x < area->rec.x2 && cell_y >= area->rec.y1 && cell_y < area->rec.y2) {
                                 can_place = true;
                             } else {
                                 for (int i = 0; i < areas_count; i++) {
                                     Area *area = &areas[i];
-                                    if (area->team == player_team &&
+                                    if (area->team == (int)player_team &&
                                         cell_x >= area->rec.x1 && cell_x < area->rec.x2 && cell_y >= area->rec.y1 && cell_y < area->rec.y2) {
                                         can_place = true;
                                         break;
@@ -1852,16 +1959,16 @@ int main(int argc, char **argv) {
             DrawRectangleLines(0, 0, world_size.x, world_size.y, BLACK);
 
             // Draw areas
-            if (mode == MODE_AREAS || stage == STAGE_PLACING) {
+            if (stage == STAGE_AREAS || stage == STAGE_PLACING) {
                 pthread_mutex_lock(&areas_mtx);
                 for (int i = 0; i < areas_count; i++) {
                     Area area = areas[i];
                     Color color = RAYWHITE;
                     switch (area.team) {
-                        case TEAM_RED: color = (Color){RED.r, RED.g, RED.b, (stage == STAGE_AREAS)? 255: 20}; break;
-                        case TEAM_BLUE: color = (Color){BLUE.r, BLUE.g, BLUE.b, (stage == STAGE_AREAS)? 255: 20}; break;
-                        case TEAM_GREEN: color = (Color){GREEN.r, GREEN.g, GREEN.b, (stage == STAGE_AREAS)? 255: 20}; break;
-                        case TEAM_YELLOW: color = (Color){ORANGE.r, ORANGE.g, ORANGE.b, (stage == STAGE_AREAS)? 255: 20}; break;
+                        case TEAM_RED: color = (Color){RED.r, RED.g, RED.b, (mode == MODE_AREAS)? 50: 20}; break;
+                        case TEAM_BLUE: color = (Color){BLUE.r, BLUE.g, BLUE.b, (mode == MODE_AREAS)? 50: 20}; break;
+                        case TEAM_GREEN: color = (Color){GREEN.r, GREEN.g, GREEN.b, (mode == MODE_AREAS)? 50: 20}; break;
+                        case TEAM_YELLOW: color = (Color){ORANGE.r, ORANGE.g, ORANGE.b, (mode == MODE_AREAS)? 50: 20}; break;
                     }
                     DrawRectangle(area.rec.x1 * BOID_SIZE, area.rec.y1 * BOID_SIZE,
                                   (area.rec.x2 - area.rec.x1) * BOID_SIZE, (area.rec.y2 - area.rec.y1) * BOID_SIZE, color);
@@ -2011,6 +2118,7 @@ int main(int argc, char **argv) {
 
             // Draw boids number
             int l = 0; // line
+            pthread_mutex_lock(&players_mtx);
             for (int team = 0; team < TEAMS_COUNT; team++) {
                 if (!team_used[team]) continue;
                 
@@ -2038,9 +2146,10 @@ int main(int argc, char **argv) {
                                             areas_size[team], (boids_number[team] < areas_size[team])? ")" : "!)");
                 } else if (stage == STAGE_PLACING) {
                     if (team == (signed)player_team) {
-                        str = (char*)TextFormat("%s: %d (%d left)", players[player_idx].name, boids_count, boids_number[team]-boids_count);
+                        str = (char*)TextFormat("%s: %d (%d left) %s", players[player_idx].name, boids_count, boids_number[team]-boids_count,
+                                                players_ready[team]? "ready" : "");
                     } else {
-                        str = (char*)TextFormat("%s: -", players[player_idx].name);
+                        str = (char*)TextFormat("%s: - %s", players[player_idx].name, players_ready[team]? "(ready)" : "");
                     }
                 } else if (stage == STAGE_GAME) {
                     str = (char*)TextFormat("%s: %d", players[player_idx].name, boids_number[team]);
@@ -2049,6 +2158,7 @@ int main(int argc, char **argv) {
                 if (str != NULL)
                     DrawText(str, 10, 40 + (l++)*20, 20, team_color);
             }
+            pthread_mutex_unlock(&players_mtx);
 
             DrawFPS(10, 10);
         EndDrawing();

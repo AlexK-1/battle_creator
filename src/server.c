@@ -87,9 +87,11 @@ typedef struct Room {
     uint32_t id;
     Point world;
     pthread_t thread;
-    bool thread_run, sync_boids;
+    bool thread_run, sync_boids, hide_areas;
     ServerBoid *boids;
-    pthread_mutex_t boids_mtx;
+    pthread_mutex_t boids_mtx, players_mtx;
+    Area areas[MAX_AREAS_COUNT];
+    uint16_t areas_count;
     enum {
         ROOM_AREAS,
         ROOM_PLACING,
@@ -143,15 +145,18 @@ void close_room(Room *room) {
     }
 
     for (int i = 0; i < room->joined_players; i++) {
-        Player *op = room->players[i]; // other_player
-        op->joined = false;
-        send_packet(op->fd, SP_ROOM_CLOSED, NULL, 0, 0);
-        close_client(op->fd);
+        Player *p = room->players[i];
+        if (p->joined) {
+            p->joined = false;
+            send_packet(p->fd, SP_ROOM_CLOSED, NULL, 0, MSG_NOSIGNAL);
+            close_client(p->fd);
+        }
     }
 
     if (room->boids != NULL) free(room->boids);
     free(room);
     rooms[last_room_idx] = NULL;
+    last_room_idx--;
 }
 
 void close_client(int fd) {
@@ -164,6 +169,16 @@ void close_client(int fd) {
 
         int player_idx = get_player_idx(room->players, p->fd);
 
+        // send a message to all players in the room that the player has disconnected
+        uint32_t nid = htonl(p->id);
+        pthread_mutex_lock(&room->players_mtx);
+        for (int i = 0; i < room->joined_players; i++) {
+            Player *op = room->players[i];
+            if (op->id != room->players[player_idx]->id)
+                send_packet(op->fd, SP_PLAYER_EXIT, &nid, sizeof(op->id), MSG_NOSIGNAL);
+        }
+        pthread_mutex_unlock(&room->players_mtx);
+
         last_room_idx = ((room->id & 0xffff0000) >> 16);
         if ((room->status == ROOM_AREAS && player_idx == 0) || // room's creator disconnected
             (room->status == ROOM_PLACING) ||
@@ -172,19 +187,13 @@ void close_client(int fd) {
             room_closed = true;
         } else {
             // delete player from array
+            pthread_mutex_lock(&room->players_mtx);
             memmove(room->players + player_idx, room->players + player_idx + 1,
                     sizeof(room->players[0]) * (room->joined_players - player_idx - 1));
             room->joined_players--;
-
-            // send a message to all players in the room that the player has disconnected
-            uint32_t nfd = htonl(p->id);
-            for (int i = 0; i < room->joined_players; i++) {
-                Player *op = room->players[i];
-                send_packet(op->fd, SP_PLAYER_EXIT, &nfd, sizeof(op->id), 0);
-            }
+            pthread_mutex_unlock(&room->players_mtx);
         }
 
-        last_room_idx--;
     }
 
     if (!room_closed) {
@@ -212,13 +221,14 @@ void close_client(int fd) {
                     memmove(q, q + 1, sizeof(*q) * (p->in_queue->rear));
                 }
             }
-            p->in_queue->size--;
-            p->in_queue->rear--;
 
-            if (find_idx == 0) {
+            if (find_idx == p->in_queue->front) {
                 uint32_t nid = htonl(p->id);
                 send_packet(p->approving_player->fd, SP_PLAYER_EXIT, &nid, sizeof(nid), 0);
             }
+            
+            p->in_queue->size--;
+            p->in_queue->rear--;
         }
 
         printf("[-] fd=%d id=%d hung up\n", fd, p->id);
@@ -239,6 +249,8 @@ void *room_thread_fn(void *args) {
     }
     BoidIndex boids_count = 0;
     
+    // Place boids
+    pthread_mutex_lock(&room->players_mtx);
     for (int player_idx = 0; player_idx < room->joined_players; player_idx++) {
         Player *player = room->players[player_idx];
         
@@ -253,11 +265,23 @@ void *room_thread_fn(void *args) {
                 for (int i = 0; i < b.count; i++) {
                     if (boids_count >= room->total_boids_number)
                         break;
-                    
-                    ServerBoid new_boid = {.b = {.pos = {cell_x*BOID_SIZE + (int)(BOID_SIZE/2.0), cell_y*BOID_SIZE + (int)(BOID_SIZE/2.0)}, .velocity = { 0 },
-                                                 .speed = random_value(80, 130)/100.0, .health = BOID_MAX_HEALTH, .xp = random_value(0, 5),
-                                                 .team = player->team, .action = ACT_STOP}};
-                    room->boids[boids_count++] = new_boid;
+
+                    bool in_area = false;
+                    for (int i = 0; i < room->areas_count; i++) {
+                        Area *a = &room->areas[i];
+                        if (a->rec.x1 <= cell_x && a->rec.x2 > cell_x &&
+                            a->rec.y1 <= cell_y && a->rec.y2 > cell_y) {
+                            in_area = (a->team == b.team);
+                            break;
+                        }
+                    }
+
+                    if (in_area) {
+                        ServerBoid new_boid = {.b = {.pos = {cell_x*BOID_SIZE + (int)(BOID_SIZE/2.0), cell_y*BOID_SIZE + (int)(BOID_SIZE/2.0)},
+                                                     .velocity = { 0 }, .speed = random_value(80, 130)/100.0, .health = BOID_MAX_HEALTH,
+                                                     .xp = random_value(0, 5), .team = player->team, .action = ACT_STOP}};
+                        room->boids[boids_count++] = new_boid;
+                    }
                 
                     cell++;
                     cell_x++;
@@ -272,6 +296,7 @@ void *room_thread_fn(void *args) {
         if (boids_count > room->total_boids_number)
             break;
     }
+    pthread_mutex_unlock(&room->players_mtx);
 
     if (boids_count > room->total_boids_number) {
         close_room(room);
@@ -293,9 +318,11 @@ void *room_thread_fn(void *args) {
         boids_data[i] = boid;
     }
 
+    pthread_mutex_lock(&room->players_mtx);
     for (int i = 0; i < room->joined_players; i++) {
         send_packet(room->players[i]->fd, SP_START_GAME, data, packet_size, 0);
     }
+    pthread_mutex_unlock(&room->players_mtx);
 
     free(data);
 
@@ -370,9 +397,11 @@ void *room_thread_fn(void *args) {
                 boids_data[i] = send_boid;
             }
 
+            pthread_mutex_lock(&room->players_mtx);
             for (int i = 0; i < room->joined_players; i++) {
                 send_packet(room->players[i]->fd, SP_BOIDS_SYNC, data, packet_size, 0);
             }
+            pthread_mutex_unlock(&room->players_mtx);
 
             free(data);
 
@@ -401,13 +430,15 @@ void *room_thread_fn(void *args) {
     free(grid.chunks);
 
     pthread_mutex_destroy(&room->boids_mtx);
+    pthread_mutex_destroy(&room->players_mtx);
 
     room->thread_run = false;
     return NULL;
 }
 
 void process_data(Player *p) {
-    switch (p->net.type) {
+    int package_type = p->net.type;
+    switch (package_type) {
     case CP_NEW_ROOM: {
         CPNew data;
         if (p->net.data_len != sizeof(data))
@@ -416,7 +447,7 @@ void process_data(Player *p) {
 
         bool free_rooms =  false;
         for (int j = 1; j < MAX_ROOMS; j++) {
-            if (rooms[last_room_idx + j] == NULL) {
+            if (rooms[(last_room_idx + j) % MAX_ROOMS] == NULL) {
                 last_room_idx = (last_room_idx + j) % MAX_ROOMS;
                 free_rooms = true;
                 break;
@@ -445,6 +476,7 @@ void process_data(Player *p) {
         room->world = (Point){ntohs(data.world_size.x), ntohs(data.world_size.y)};
         room->boids = NULL;
         room->thread_run = room->sync_boids = false;
+        room->hide_areas = data.hide_areas;
         for (int j = 0; j < TEAMS_COUNT; j++)
             room->teams[j] = ntohs(data.boids_number[j]);
         room->status = ROOM_AREAS;
@@ -555,7 +587,7 @@ void process_data(Player *p) {
         if (data.team == -1) {
             approved_player->joined = false;
             SPJoined send_data = {.status = JOIN_REJECTED};
-            send_packet(p->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+            send_packet(approved_player->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
         } else {
             approved_player->joined = true;
             approved_player->ready = false;
@@ -582,6 +614,26 @@ void process_data(Player *p) {
 
             send_packet(approved_player->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
 
+            if (!room->hide_areas) {
+                uint32_t buf_size = room->areas_count * sizeof(*room->areas) + sizeof(room->areas_count);
+                char *buf = malloc(buf_size);
+
+                *(uint16_t*)buf = htons(room->areas_count);
+                Area *a = (Area*)(buf + sizeof(room->areas_count));
+                for (int i = 0; i < room->areas_count; i++) {
+                    *a = room->areas[i];
+                    a->rec.x1 = htons(a->rec.x1);
+                    a->rec.x2 = htons(a->rec.x2);
+                    a->rec.y1 = htons(a->rec.y1);
+                    a->rec.y2 = htons(a->rec.y2);
+                    a++;
+                }
+
+                send_packet(approved_player->fd, SP_SEND_AREAS, buf, buf_size, 0);
+
+                free(buf);
+            }
+            
             // send a message to all players in the room that the player has joined
             ClientPlayer player_data = {.id = htonl(approved_player->id), .team = approved_player->team};
             strcpy(player_data.name, approved_player->name);
@@ -614,11 +666,13 @@ void process_data(Player *p) {
 
         break;
         }
-    case CP_START_PLACING: {
+    case CP_START_PLACING:
+    case CP_SEND_AREAS: {
         Room *room = p->room;
         
         if (p->net.data_len < sizeof(int16_t) || room->players[0]->fd != p->fd ||
-            room->joined_players != room->players_number || room->status != ROOM_AREAS)
+            (room->joined_players != room->players_number && package_type == CP_START_PLACING) ||
+            room->status != ROOM_AREAS)
             break;
 
         int16_t areas_count = ntohs(*(int16_t*)p->net.data_buf);
@@ -628,15 +682,28 @@ void process_data(Player *p) {
         // send a message to all players that admin starts placing boids
         for (int i = 1; i < room->joined_players; i++) {
             Player *op = room->players[i];
-            send_packet(op->fd, SP_START_PLACING, p->net.data_buf, p->net.data_len, 0);
+            send_packet(op->fd, (package_type == CP_START_PLACING)? SP_START_PLACING : SP_SEND_AREAS, p->net.data_buf, p->net.data_len, 0);
         }
 
-        // send a message to admin of the room
-        areas_count = 0;
-        send_packet(p->fd, SP_START_PLACING, &areas_count, sizeof(areas_count), 0);
+        room->areas_count = areas_count;
+        Area *a = (Area*)(p->net.data_buf + sizeof(areas_count));
+        for (int i = 0; i < areas_count; i++) {
+            room->areas[i].rec = (Rec){.x1 = ntohs(a->rec.x1),
+                                       .y1 = ntohs(a->rec.y1),
+                                       .x2 = ntohs(a->rec.x2),
+                                       .y2 = ntohs(a->rec.y2)};
+            room->areas[i].team = a->team;
+            a++;
+        }
+
+        if (package_type == CP_START_PLACING) {
+            // send a message to admin of the room
+            areas_count = 0;
+            send_packet(p->fd, SP_START_PLACING, &areas_count, sizeof(areas_count), 0);
         
-        room->status = ROOM_PLACING;
-        printf("[*] room %06x started placing\n", room->id);
+            room->status = ROOM_PLACING;
+            printf("[*] room %06x started placing\n", room->id);
+        }
 
         break;
         }
@@ -661,6 +728,13 @@ void process_data(Player *p) {
         p->start_boids_len = count;
         p->ready = true;
 
+        // Send a message, that the player is ready
+        uint32_t nid = htonl(p->id);
+        for (int i = 0; i < room->joined_players; i++) {
+            Player *op = room->players[i];
+            send_packet(op->fd, SP_PLAYER_READY, &nid, sizeof(nid), 0);
+        }
+
         bool all_ready = true;
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i];
@@ -676,6 +750,7 @@ void process_data(Player *p) {
 
             room->thread_run = true;
             pthread_mutex_init(&room->boids_mtx, NULL);
+            pthread_mutex_init(&room->players_mtx, NULL);
 
             pthread_create(&room->thread, NULL, room_thread_fn, room);
         }
@@ -707,6 +782,8 @@ void process_data(Player *p) {
             for (BoidIndex i = 0; i < boids_count; i++) {
                 BoidIndex idx = ntohs(boids[i]);
                 ServerBoid *boid = &room->boids[idx];
+                if (boid->b.team != p->team)
+                    continue;
 
                 boid->direction_order = false;
                 boid->point_order = false;                
@@ -725,6 +802,8 @@ void process_data(Player *p) {
             for (BoidIndex i = 0; i < boids_count; i++) {
                 BoidIndex idx = ntohs(boids[i]);
                 ServerBoid *boid = &room->boids[idx];
+                if (boid->b.team != p->team)
+                    continue;
                 
                 if ((boid->b.action == ACT_STOP) && (action != ACT_STOP)) // Randomize boid's speed, if it stops
                     boid->b.velocity = (Vector2){random_value(-10, 10)/10.0, random_value(-10, 10)/10.0};
@@ -747,6 +826,8 @@ void process_data(Player *p) {
             for (BoidIndex i = 0; i < boids_count; i++) {
                 BoidIndex idx = ntohs(boids[i]);
                 ServerBoid *boid = &room->boids[idx];
+                if (boid->b.team != p->team)
+                    continue;
                 
                 boid->order_vector = direction;
                 boid->direction_order = true;
@@ -768,6 +849,8 @@ void process_data(Player *p) {
             for (BoidIndex i = 0; i < boids_count; i++) {
                 BoidIndex idx = ntohs(boids[i]);
                 ServerBoid *boid = &room->boids[idx];
+                if (boid->b.team != p->team)
+                    continue;
                 
                 boid->order_vector = point;
                 boid->direction_order = false;
@@ -793,6 +876,8 @@ void process_data(Player *p) {
             for (BoidIndex i = 0; i < boids_count; i++) {
                 BoidIndex idx = ntohs(boids[i]);
                 ServerBoid *boid = &room->boids[idx];
+                if (boid->b.team != p->team)
+                    continue;
 
                 boid->is_used = false;
                 b[bc++] = boid;
@@ -959,43 +1044,59 @@ int main(int argc, char **argv) {
 
     while (--argc) {
         char *arg = *(++argv);
+        bool ext = false; // exit
 
         if (arg[0] == '-') {
-            if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
-                show_help = true;
-                break;
-            } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
-                if (argc == 1) ERRF("no value for option '%s'\n", arg);
+            int old_argc = argc;
+            do {
+                if (strcmp(arg, "--help") == 0 || strncmp(arg, "-h", 2) == 0) {
+                    show_help = true;
+                    ext = true;
+                    break;
+                } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
+                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
                 
-                char *value_str = *(++argv);
-                argc--;
+                    char *value_str = *(++argv);
+                    argc--;
 
-                char *endp;
-                tcp_port = strtoul(value_str, &endp, 10);
-                if (*endp != '\0') {
-                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                    char *endp;
+                    tcp_port = strtoul(value_str, &endp, 10);
+                    if (*endp != '\0') {
+                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                    }
+                } else if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
+                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
+
+                    char *value_str = *(++argv);
+                    argc--;
+
+                    char *endp;
+                    chunk_size = strtoul(value_str, &endp, 10);
+                    if (*endp != '\0') {
+                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                    }
+
+                    if (chunk_size < BOID_SIZE) {
+                        ERRF("size of chunk must be greater than or equal to %d\n", BOID_SIZE);
+                    } else if (chunk_size > CHUNK_SIZE_PIXELS) {
+                        ERRF("size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
+                    }
+                    chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
+                } else {
+                    ERRF("unexpected argument '%s'\n", arg);
                 }
-            } else if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
-                if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
-                char *value_str = *(++argv);
-                argc--;
-
-                char *endp;
-                chunk_size = strtoul(value_str, &endp, 10);
-                if (*endp != '\0') {
-                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                if (argc == old_argc && arg[1] != '-' && arg[2] != '\0') {
+                    // Move the arg pointer to flags like -abcd, which will be interpreted as -a -b -c -d
+                    arg++;
+                    *arg = '-';
+                } else {
+                    break;
                 }
+            } while (1);
 
-                if (chunk_size < BOID_SIZE) {
-                    ERRF("size of chunk must be greater than or equal to %d\n", BOID_SIZE);
-                } else if (chunk_size > CHUNK_SIZE_PIXELS) {
-                    ERRF("size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
-                }
-                chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
-            } else {
-                ERRF("unexpected argument '%s'\n", arg);
-            }
+            if (ext)
+                break;
         } else {
             ERRF("unexpected argument '%s'\n", arg);
         }
