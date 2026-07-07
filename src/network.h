@@ -89,7 +89,7 @@ typedef enum {
 
 typedef struct {
     uint32_t room_id, player_id;
-    uint8_t players_number, joined_players, player_team;
+    uint8_t players_number, joined_players, player_team, server_target_tps;
     Point world_size;
     ClientPlayer players[TEAMS_COUNT];
     BoidIndex teams[TEAMS_COUNT];

@@ -149,6 +149,7 @@ typedef struct {
     bool new_room, *select_mode, *players_ready;
     Point *world_size;
     BoidIndex *boids_number, *boids_count, total_boids_number;
+    uint8_t *server_tps;
     ClientPlayer *players;
     Log *log;
     Grid *grid;
@@ -182,6 +183,7 @@ void *net_thread_fn(void *args) {
     Area *areas = nargs->areas;
     uint16_t *areas_count = nargs->areas_count;
     bool *select_mode = nargs->select_mode;
+    uint8_t *server_tps = nargs->server_tps;
     Grid *grid = nargs->grid;
     ClientBoid *boids = nargs->boids;
     bool *players_ready = nargs->players_ready;
@@ -476,18 +478,19 @@ void *net_thread_fn(void *args) {
             char *buf = malloc(packet_size);
 
             /* PACKET FORMAT
-            [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
+            [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
             */
             recv_all(fd, buf, packet_size, 0);
 
-            BoidIndex recv_boids_count = ntohs(*(BoidIndex*)buf);
-            if (packet_size != (sizeof(recv_boids_count)*2 + recv_boids_count*sizeof(NetBoid))) {
+            *server_tps = *(uint8_t*)buf;
+            BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(buf+1));
+            if (packet_size != (1+sizeof(recv_boids_count)*2 + recv_boids_count*sizeof(NetBoid))) {
                 free(buf);
                 break;
             }
-            BoidIndex boids_first_index = ntohs(*(BoidIndex*)(buf+sizeof(BoidIndex)));
+            BoidIndex boids_first_index = ntohs(*(BoidIndex*)(buf+1+sizeof(BoidIndex)));
 
-            NetBoid *recv_boids = (NetBoid*)(buf + sizeof(recv_boids_count)*2);
+            NetBoid *recv_boids = (NetBoid*)(buf + 1 + sizeof(recv_boids_count)*2);
 
             pthread_mutex_lock(&boids_mtx);
             for (int i = 0; i < recv_boids_count; i++) {
@@ -1134,6 +1137,7 @@ int main(int argc, char **argv) {
     int joined_players = recv_data.joined_players;
     world_size.x = ntohs(recv_data.world_size.x);
     world_size.y = ntohs(recv_data.world_size.y);
+    int server_target_tps = recv_data.server_target_tps;
     
     ClientPlayer players[TEAMS_COUNT] = { 0 };
     for (int i = 0; i < joined_players; i++) {
@@ -1175,9 +1179,10 @@ int main(int argc, char **argv) {
     Log log;
     init_cstack(log, MAX_LOG_LEN);
     
-    write_log(&log, "[*] %s\n    id: %06x\n    teams: %d\n    world: %dx%d\n    chunk: %d\n    creator: %s\n    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
+    write_log(&log, "[*] %s\n    id: %06x\n    teams: %d\n    world: %dx%d\n    chunk: %d\n    server tps: %d\n    creator: %s\n"
+                    "    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
            new_room? "created a room" : "joined to the room",
-           room_id, players_number, world_size.x, world_size.y, chunk_size, players[0].name, total_boids_number,
+           room_id, players_number, world_size.x, world_size.y, chunk_size, server_target_tps, players[0].name, total_boids_number,
            boids_number[TEAM_RED],
            boids_number[TEAM_BLUE],
            boids_number[TEAM_GREEN],
@@ -1250,6 +1255,15 @@ int main(int argc, char **argv) {
     GenTextureMipmaps(&texture);
     SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
 
+    // Server TPS
+    enum {
+        TPS_NUM,
+        TPS_PERCENT,
+        TPS_HIDE
+    } tps_display_type = TPS_NUM;
+    const int tps_display_types_count = 3;
+    uint8_t server_tps = 0;
+    
     // Start a thread to receive messages from the server
     pthread_mutex_init(&log_mtx, NULL);
     pthread_mutex_init(&input_mtx, NULL);
@@ -1258,8 +1272,9 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&players_mtx, NULL);
     NetThreadArgs thread_args = {.fd = fd, .players_number = players_number, .joined_players = &joined_players, .chunk_size = chunk_size,
                                  .new_room = new_room, .select_mode = &select_mode, .players_ready = players_ready, .world_size = &world_size,
-                                 .boids_number = boids_number, .boids_count = &boids_count, .total_boids_number = total_boids_number, .players = players,
-                                 .log = &log, .grid = &grid, .areas_count = &areas_count, .areas = areas, .boids = boids, .mode = &mode, .stage = &stage};
+                                 .boids_number = boids_number, .boids_count = &boids_count, .total_boids_number = total_boids_number,
+                                 .server_tps = &server_tps, .players = players, .log = &log, .grid = &grid, .areas_count = &areas_count,
+                                 .areas = areas, .boids = boids, .mode = &mode, .stage = &stage};
     pthread_t net_thread;
     pthread_create(&net_thread, NULL, net_thread_fn, &thread_args);
     
@@ -1275,6 +1290,7 @@ int main(int argc, char **argv) {
         if (!show_log || !typing_string_input) {
             if (IsKeyPressed(KEY_L)) show_log = !show_log;
             if (IsKeyPressed(KEY_K)) show_grid = !show_grid;
+            if (IsKeyPressed(KEY_M)) tps_display_type++, tps_display_type %= tps_display_types_count;
 
             if (mode == MODE_SELECT)
                 selecting_shift_pressed |= IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
@@ -2093,9 +2109,14 @@ int main(int argc, char **argv) {
             case MODE_LINE:
                 DrawText("Mode: Line", screen_width - 115, 10, 20, BLACK); break;
             }
-            // if (pause)
-            //     DrawText("Paused", screen_width - 85, 40, 20, BLACK);
-            
+
+            if (stage == STAGE_GAME) {
+                switch (tps_display_type) {
+                    case TPS_NUM: DrawText(TextFormat("Server TPS: %2d/%2d", server_tps, server_target_tps), screen_width - 212, 40, 20, BLACK); break;
+                    case TPS_PERCENT: DrawText(TextFormat("Server TPS: %3.0f%%", (float)server_tps/server_target_tps * 100), screen_width - 195, 40, 20, BLACK); break;
+                    case TPS_HIDE: break;
+                }
+            }
 
             // Draw log
             if (show_log) {

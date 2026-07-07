@@ -34,7 +34,7 @@
 #define MAX_EVENTS 1024
 #define MAX_APPROVING_QUEUE_LEN 10
 #define MAX_PACKET_SIZE (1024*64)
-#define TPS 15
+#define DEFAULT_TPS 15
 
 #define ERR(str)                                                              \
     do {                                                                      \
@@ -106,6 +106,7 @@ Room *rooms[MAX_ROOMS] = { 0 };
 int32_t last_room_idx = -1;
 int chunk_size = CHUNK_SIZE_PIXELS, epfd, server_fd;
 long max_fd;
+int tps = DEFAULT_TPS;
 /* ^ global variables ^ */
 
 int get_player_idx(Player **players, int id) {
@@ -330,7 +331,8 @@ void *room_thread_fn(void *args) {
     Grid grid = { 0 };
     init_grid(&grid, (BaseBoid*)boids, boids_count, room->world.x, room->world.y, chunk_size);
 
-    double target_delay = 1.0/(double)TPS;
+    double target_delay = 1.0 / (double)tps;
+    double delay = 0.0;
     int timer = 0;
 
     while (room->thread_run && boids_count > 0) {
@@ -365,30 +367,24 @@ void *room_thread_fn(void *args) {
                 boid_bound((BaseBoid*)boid, room->world.x, room->world.y);
             }
 
-            boid->b.pos = Vector2Add(boid->b.pos, Vector2Scale(boid->b.velocity, boid->b.speed * (60.0f/TPS)));
+            boid->b.pos = Vector2Add(boid->b.pos, Vector2Scale(boid->b.velocity, boid->b.speed * (60.0f/tps)));
         }
 
         pthread_mutex_lock(&room->boids_mtx);
-        /*if (room->sync_boids) {
-            // timer = tps*2;
-            // room->sync_boids = false;
-            
-            printf("ordr %ld\n", time(NULL) - prevt);
-            prevt = time(NULL);
-        }*/
         if (timer == 0 || room->sync_boids) {
             // Send boids data to clients (boids sync)
 
             /* PACKET FORMAT
-            [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
+            [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
             */
-            uint32_t packet_size = sizeof(BoidIndex)*2 + boids_count*sizeof(NetBoid);
+            uint32_t packet_size = 1 + sizeof(BoidIndex)*2 + boids_count*sizeof(NetBoid);
             char *data = malloc(packet_size);
 
-            *(BoidIndex*)(data) = htons(boids_count);
-            *(BoidIndex*)(data+sizeof(BoidIndex)) = htons(0);
+            *(uint8_t*)(data) = (tps - timer) / (float)delay;
+            *(BoidIndex*)(data+1) = htons(boids_count);
+            *(BoidIndex*)(data+1+sizeof(BoidIndex)) = htons(0);
 
-            NetBoid *boids_data = (NetBoid*)(data + sizeof(BoidIndex)*2);
+            NetBoid *boids_data = (NetBoid*)(data + 1 + sizeof(BoidIndex)*2);
 
             for (int i = 0; i < boids_count; i++) {
                 BaseBoid *b = &boids[i].b;
@@ -406,7 +402,8 @@ void *room_thread_fn(void *args) {
             free(data);
 
             room->sync_boids = false;
-            timer = TPS; // 1 second
+            timer = tps; // 1 second
+            delay = 0;
         }
         timer--;
         
@@ -419,11 +416,14 @@ void *room_thread_fn(void *args) {
         double tick_seconds = ((double)(current_time - prev_time)) / CLOCKS_PER_SEC;
 
         if (tick_seconds < target_delay) {
+            delay += target_delay;
             double wait_seconds = target_delay - tick_seconds;
             time_t sec = wait_seconds;
             double nsec = (wait_seconds - sec)*1000000000L;
             struct timespec delay = {.tv_sec = sec, .tv_nsec = nsec};
             while (nanosleep(&delay, &delay) == -1) continue;
+        } else {
+            delay += tick_seconds;
         }
     }
 
@@ -507,7 +507,8 @@ void process_data(Player *p) {
                room->teams[TEAM_YELLOW]);
 
         SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(p->id), .players_number = room->players_number,
-                              .joined_players = room->joined_players, .player_team = p->team, .world_size = data.world_size, .status = JOIN_OK};
+                              .joined_players = room->joined_players, .player_team = p->team, .server_target_tps = tps,
+                              .world_size = data.world_size, .status = JOIN_OK};
 
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i]; // other_player
@@ -599,7 +600,7 @@ void process_data(Player *p) {
             room->players[room->joined_players++] = approved_player;
 
             SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(approved_player->id), .players_number = room->players_number,
-                                  .joined_players = room->joined_players, .player_team = approved_player->team,
+                                  .joined_players = room->joined_players, .player_team = approved_player->team, .server_target_tps = tps,
                                   .world_size = {htons(room->world.x), htons(room->world.y)}, .status = JOIN_OK};
 
             for (int i = 0; i < room->joined_players; i++) {
@@ -809,7 +810,7 @@ void process_data(Player *p) {
                     boid->b.velocity = (Vector2){random_value(-10, 10)/10.0, random_value(-10, 10)/10.0};
 
                 boid->b.action = action;
-                boid->order_timer = random_value(20, 30)*TPS; // 20-30 seconds
+                boid->order_timer = random_value(20, 30)*tps; // 20-30 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -832,7 +833,7 @@ void process_data(Player *p) {
                 boid->order_vector = direction;
                 boid->direction_order = true;
                 boid->point_order = false;
-                boid->order_timer = random_value(30, 45)*TPS; // 30-45 seconds
+                boid->order_timer = random_value(30, 45)*tps; // 30-45 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -855,7 +856,7 @@ void process_data(Player *p) {
                 boid->order_vector = point;
                 boid->direction_order = false;
                 boid->point_order = true;
-                boid->order_timer = random_value(30, 45)*TPS; // 30-45 seconds
+                boid->order_timer = random_value(30, 45)*tps; // 30-45 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -920,7 +921,7 @@ void process_data(Player *p) {
                     if (nearest_boid == NULL) break;
                     
                     nearest_boid->order_vector = point;
-                    nearest_boid->order_timer = Vector2Distance(nearest_boid->b.pos, point) / BOID_MIN_SPEED / (60.0/TPS);
+                    nearest_boid->order_timer = Vector2Distance(nearest_boid->b.pos, point) / BOID_MIN_SPEED / (60.0/tps);
                     nearest_boid->is_used = true;
                     nearest_boid->point_order = true;
                     nearest_boid->direction_order = false;
@@ -1034,10 +1035,6 @@ void quit(int sig) {
 }
 
 int main(int argc, char **argv) {
-    /* FORMAT
-      ./server [-T|--tcp-port] <port> [-c|--chunk] <chunk_size>
-    */
-    
     unsigned short tcp_port = TCP_PORT;
     bool show_help = false;
     char *prog = argv[0];
@@ -1082,6 +1079,21 @@ int main(int argc, char **argv) {
                         ERRF("size of chunk must be less than or equal to %d\n", CHUNK_SIZE_PIXELS);
                     }
                     chunk_size = (chunk_size / BOID_SIZE) * BOID_SIZE;
+                } else if (strcmp(arg, "--tps") == 0 || strcmp(arg, "-t") == 0) {
+                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
+
+                    char *value_str = *(++argv);
+                    argc--;
+
+                    char *endp;
+                    tps = strtoul(value_str, &endp, 10);
+                    if (*endp != '\0') {
+                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                    }
+
+                    if (chunk_size < BOID_SIZE) {
+                        ERR("tps must be greater than or equal to 1\n");
+                    }
                 } else {
                     ERRF("unexpected argument '%s'\n", arg);
                 }
@@ -1115,13 +1127,16 @@ int main(int argc, char **argv) {
             "    TCP port of the game server (default: %d)\n"
             "  -c, --chunk <NUM>\n"
             "    Size of chunk in pixels, rounded down to the nearest multiple of %d\n"
-            "    (default: %d)\n",
-            prog, TCP_PORT, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS);
+            "    (default: %d)\n"
+            "  -t, --tps <NUM>\n"
+            "    Simulation's target tps (default: %d)\n",
+            prog, TCP_PORT, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, DEFAULT_TPS);
 
         exit(0);
     }
 
     printf("chunk: %d pixels\n", chunk_size);
+    printf("target tps: %d\n", tps);
     
     max_fd = sysconf(_SC_OPEN_MAX);
     players = calloc(max_fd, sizeof(Player*));

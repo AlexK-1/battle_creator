@@ -55,6 +55,7 @@ Global game control:
   - `Mouse wheel` or `+`/'-' - zoom in/out
   - `K` - show/hide grid
   - `L` - show/hide log
+  - `M` - change server TPS display mode
 
 Stage/mode-specific control:
 1. Connecting/areas stage
