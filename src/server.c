@@ -27,6 +27,7 @@
 
 #include "boids.h"
 #include "network.h"
+#include "logging.h"
 #include "queue.h"
 #include "kdtree.h"
 
@@ -136,7 +137,7 @@ void close_room(Room *room) {
         pthread_join(room->thread, NULL);
     }
     
-    printf("[*] room %06x closed\n", room->id);
+    write_log(L_INFO, "room %06x closed\n", room->id);
 
     while (room->players[0]->approving_queue.size > 0) {
         Player *op;
@@ -232,7 +233,7 @@ void close_client(int fd) {
             p->in_queue->rear--;
         }
 
-        printf("[-] fd=%d id=%d hung up\n", fd, p->id);
+        write_log(L_DISCONNECT, "fd=%d id=%d hung up\n", fd, p->id);
         
         free(p);
         players[fd] = NULL;
@@ -440,6 +441,10 @@ void process_data(Player *p) {
     int package_type = p->net.type;
     switch (package_type) {
     case CP_NEW_ROOM: {
+        /* PACKET FORMAT
+        [CPNew room_data]
+        */
+
         CPNew data;
         if (p->net.data_len != sizeof(data))
             break;
@@ -455,7 +460,7 @@ void process_data(Player *p) {
         }
         
         if (!free_rooms) {
-            printf("[!] no free rooms\n");
+            write_log(L_WARNING, "no free rooms\n");
 
             SPJoined send_data = {.status = JOIN_FAILED};
             send_packet(p->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
@@ -499,7 +504,7 @@ void process_data(Player *p) {
 
         room->id = (last_room_idx << 16) | (total_boids_number << 2) | data.players_number;
         rooms[last_room_idx] = room;
-        printf("[*] new room\n    id: %06x\n    teams: %d\n    world: %dx%d\n    creator: %s (id=%d)\n    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
+        write_log(L_INFO, "new room\n    id: %06x\n    teams: %d\n    world: %dx%d\n    creator: %s (id=%d)\n    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
                room->id, data.players_number, room->world.x, room->world.y, data.creator, p->id, total_boids_number,
                room->teams[TEAM_RED],
                room->teams[TEAM_BLUE],
@@ -525,6 +530,10 @@ void process_data(Player *p) {
         break;
         }
     case CP_JOIN_ROOM: {
+        /* PACKET FORMAT
+        [CPJoin room]
+        */
+
         CPJoin data;
         if (p->net.data_len != sizeof(data))
             break;
@@ -567,6 +576,10 @@ void process_data(Player *p) {
         break;
         }
     case CP_APPROVE_PLAYER: {
+        /* PACKET FORMAT
+        [CPApprove player]
+        */
+
         CPApprove data;
         if (p->net.data_len != sizeof(data))
             break;
@@ -669,6 +682,10 @@ void process_data(Player *p) {
         }
     case CP_START_PLACING:
     case CP_SEND_AREAS: {
+        /* PACKET FORMAT
+        [uint16 areas_count] [Area[areas_count] areas]
+        */
+
         Room *room = p->room;
         
         if (p->net.data_len < sizeof(int16_t) || room->players[0]->fd != p->fd ||
@@ -676,8 +693,8 @@ void process_data(Player *p) {
             room->status != ROOM_AREAS)
             break;
 
-        int16_t areas_count = ntohs(*(int16_t*)p->net.data_buf);
-        if (areas_count <= 0 || p->net.data_len != (areas_count * sizeof(Area) + sizeof(areas_count)))
+        uint16_t areas_count = ntohs(*(int16_t*)p->net.data_buf);
+        if (p->net.data_len != (areas_count * sizeof(Area) + sizeof(areas_count)))
             break;
         
         // send a message to all players that admin starts placing boids
@@ -703,12 +720,16 @@ void process_data(Player *p) {
             send_packet(p->fd, SP_START_PLACING, &areas_count, sizeof(areas_count), 0);
         
             room->status = ROOM_PLACING;
-            printf("[*] room %06x started placing\n", room->id);
+            write_log(L_INFO, "room %06x started placing\n", room->id);
         }
 
         break;
         }
     case CP_SEND_BOIDS: {
+        /* PACKET FORMAT
+        [uint16 count] [ClientStartNetBoids[count] boids]
+        */
+
         Room *room = p->room;
         
         if (p->net.data_len < sizeof(uint16_t) ||
@@ -747,7 +768,7 @@ void process_data(Player *p) {
 
         if (all_ready) {
             room->status = ROOM_GAME;
-            printf("[*] room %06x started the game\n", room->id);
+            write_log(L_INFO, "room %06x started the game\n", room->id);
 
             room->thread_run = true;
             pthread_mutex_init(&room->boids_mtx, NULL);
@@ -1018,7 +1039,7 @@ int client_recv(Player *p) {
 }
 
 void quit(int sig) {
-    printf("\n[!] shutting down server\n");
+    write_log(L_WARNING, "shutting down server\n");
 
     for (long i = 0; i < max_fd; i++) {
         if (players[i] != NULL) {
@@ -1135,6 +1156,8 @@ int main(int argc, char **argv) {
         exit(0);
     }
 
+    set_log_config(NULL, /*print_time=*/ true, /*stdout*/ L_INFO, /*file*/ L_DEBUG);
+
     printf("chunk: %d pixels\n", chunk_size);
     printf("target tps: %d\n", tps);
     
@@ -1207,12 +1230,12 @@ int main(int argc, char **argv) {
         event.events = EPOLLIN;
         event.data.fd = STDIN_FILENO;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &event))
-            printf("[!] stdin is invalid\n");
+            write_log(L_WARNING, "stdin is invalid\n");
     } else {
-        printf("[!] stdin is closed\n");
+        write_log(L_WARNING, "stdin is closed\n");
     }
     
-    printf("[*] epoll server on 0.0.0.0:%d\n", tcp_port);
+    write_log(L_INFO, "epoll server on 0.0.0.0:%d\n", tcp_port);
 
     signal(SIGINT, quit);
     
@@ -1254,7 +1277,7 @@ int main(int argc, char **argv) {
                     char ip[INET_ADDRSTRLEN];
                     if (!inet_ntop(servaddr.sin_family, &client_addr.sin_addr, ip, sizeof(ip)))
                         strcpy("?", ip);
-                    printf("[+] %s:%d (fd=%d id=%d)\n", ip, ntohs(client_addr.sin_port), client_fd, last_player_id);
+                    write_log(L_JOIN, "%s:%d (fd=%d id=%d)\n", ip, ntohs(client_addr.sin_port), client_fd, last_player_id);
 
                     event.events = EPOLLIN | EPOLLRDHUP;
                     event.data.fd = client_fd;
@@ -1271,6 +1294,7 @@ int main(int argc, char **argv) {
                 if (r > 0) {
                     buf[r] = '\0';
                     if (strcmp(buf, "quit\n") == 0 || strcmp(buf, "q\n") == 0) {
+                        write_log(L_INPUT, buf);
                         running = false;
                         break;
                     }

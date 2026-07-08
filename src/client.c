@@ -16,7 +16,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <math.h>
-#include <stdarg.h>
 #include <errno.h>
 
 #include <raylib.h>
@@ -24,7 +23,12 @@
 
 #include "boids.h"
 #include "network.h"
+#include "logging.h"
 #include "queue.h"
+
+#undef ORANGE
+#define ORANGE (Color){ 240, 146, 0, 255 }
+#define DARKRED (Color){ 200, 11, 25, 255 }
 
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 450
@@ -53,6 +57,7 @@
 typedef struct {
     char string[LOG_BUF_SIZE];
     int lines;
+    LogType type;
 } LogEntry;
 
 typedef struct {
@@ -62,16 +67,18 @@ typedef struct {
 
 pthread_mutex_t log_mtx;
 
-// Write a message to log
-void write_log(Log *log, const char *format, ...) {
+// Write a message to log (console, game window, maybe file)
+void log_message(Log *log, LogType type, const char *format, ...) {
     LogEntry buf = { 0 };
+    buf.type = type;
     
     va_list args;
     va_start(args, format);
     vsnprintf(buf.string, LOG_BUF_SIZE, format, args);
     va_end(args);
 
-    printf("%s", buf.string);
+    // Write to console/file
+    write_log(type, buf.string);
 
     if (log->items != NULL) {
         // Count lines in message
@@ -193,7 +200,7 @@ void *net_thread_fn(void *args) {
     uint32_t approved_player_id = 0;
     char approved_player_username[USERNAME_LEN];
     
-    bool ex = false;
+    bool ex = false; // exit from loop
     while (1) {
         pthread_mutex_lock(&running_mtx);
         if (!running) {
@@ -219,19 +226,15 @@ void *net_thread_fn(void *args) {
                     team = TEAM_YELLOW;
                 else if (team_char == 'n')
                     team = -1;
-                else if (team_char == EOF) {
-                    putchar('\n');
-                    ex = true;
-                    break;
-                } else {
-                    write_log(log, "[!] enter valid team\n");
+                else {
+                    log_message(log, L_WARNING, "enter valid team\n");
                     get_input = true;
                     ok = false;
                 }
 
                 if (team >= 0) {
                     if (boids_number[team] == 0) {
-                        write_log(log, "[!] enter valid team\n");
+                        log_message(log, L_WARNING, "enter valid team\n");
                         get_input = true;
                         ok = false;
                     }
@@ -246,7 +249,7 @@ void *net_thread_fn(void *args) {
                     }
                     pthread_mutex_unlock(&players_mtx);
                     if (team_used) {
-                        write_log(log, "[!] enter an unused team\n");
+                        log_message(log, L_WARNING, "enter an unused team\n");
                         get_input = true;
                         ok = false;
                     }
@@ -265,7 +268,7 @@ void *net_thread_fn(void *args) {
         uint8_t packet_type;
         int r = recv(fd, &packet_type, 1, 0);
         if (r == 0) {
-            write_log(log, "[!] connection closed\n");
+            log_message(log, L_WARNING, "connection closed\n");
             break;
         }
         if (r < 0) {
@@ -279,73 +282,95 @@ void *net_thread_fn(void *args) {
             if (err_wouldblock) {
                 WaitTime(0.01);
                 continue;
-            } else
+            } else {
+                log_message(log, L_ERROR, "error receiving packet size\n");
+                perror("recv");
                 break;
+            }
         }
 
+        uint32_t packet_size;
+        recv_all(fd, &packet_size, sizeof(uint32_t), 0);
+        packet_size = ntohl(packet_size);
+        char *recv_buf = malloc(packet_size);
+
+        if (recv_all(fd, recv_buf, packet_size, 0)) {
+            log_message(log, L_ERROR, "error receiving SP#%d packet\n", packet_type);
+            perror("recv_all");
+        }
+        
         switch (packet_type) {
         case SP_APPROVE_PLAYER: { // Approve/reject new player
-            SPApprove other_player;
-            uint32_t packet_len;
-            if (recv_packet(fd, &other_player, &packet_len, 0)) {
-                ex = true;
-                break;
-            }
-            if (packet_len != sizeof(other_player)) {
+            /* PACKET FORMAT
+            [SPApprove player]
+            */
+
+            const uint32_t expected_size = sizeof(SPApprove);
+            if (packet_size != expected_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                          packet_type, expected_size, packet_size);
                 ex = true;
                 break;
             }
 
-            approved_player_id = ntohl(other_player.id);
-            strcpy(approved_player_username, other_player.username);
+            SPApprove *other_player = (SPApprove*)recv_buf;
+
+            approved_player_id = ntohl(other_player->id);
+            strcpy(approved_player_username, other_player->username);
 
             pthread_mutex_lock(&input_mtx);
             get_input = true;
             pthread_mutex_unlock(&input_mtx);
 
-            write_log(log, "[?] team of new player '%s' (r/b/g/y or n for reject):\n", other_player.username);
+            log_message(log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", other_player->username);
 
             break;   
             }
         case SP_NEW_JOIN: {
-            ClientPlayer new_player;
-            uint32_t packet_len;
-            if (recv_packet(fd, &new_player, &packet_len, 0)) {
+            /* PACKET FORMAT
+            [ClientPlayer new_player]
+            */
+            
+            const uint32_t expected_size = sizeof(ClientPlayer);
+            if (packet_size != expected_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                          packet_type, expected_size, packet_size);
                 ex = true;
                 break;
             }
-            if (packet_len != sizeof(new_player)) {
-                ex = true;
-                break;
-            }
-            new_player.id = ntohl(new_player.id);
+
+            ClientPlayer *new_player = (ClientPlayer*)recv_buf;
+            new_player->id = ntohl(new_player->id);
 
             pthread_mutex_lock(&players_mtx);
-            players[(*joined_players)++] = new_player;
+            players[(*joined_players)++] = *new_player;
             pthread_mutex_unlock(&players_mtx);
-            write_log(log, "[+] new player '%s' - %s\n", new_player.name, get_team_name(new_player.team));
+            log_message(log, L_JOIN, "new player '%s' - %s\n", new_player->name, get_team_name(new_player->team));
 
             if (new_room && players_number == *joined_players) {
-                write_log(log, "[*] press ENTER to start placing boids\n");
+                log_message(log, L_INFO, "press ENTER to start placing boids\n");
             }
             approved_player_id = 0;
             
             break;
             }
         case SP_PLAYER_EXIT: {
-            uint32_t exited_player, packet_len;
-            if (recv_packet(fd, &exited_player, &packet_len, 0)) {
+            /* PACKET FORMAT
+            [uin32_t player_id]
+            */
+            
+            const uint32_t expected_size = sizeof(uint32_t);
+            if (packet_size != expected_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                          packet_type, expected_size, packet_size);
                 ex = true;
                 break;
             }
-            if (packet_len != sizeof(exited_player)) {
-                ex = true;
-                break;
-            }
-            exited_player = ntohl(exited_player);
+
+            uint32_t exited_player = ntohl(*(uint32_t*)recv_buf);
 
             if (*stage == STAGE_AREAS && exited_player == approved_player_id) {
-                write_log(log, "[-] player '%s' disconnected\n", approved_player_username);
+                log_message(log, L_DISCONNECT, "player '%s' disconnected\n", approved_player_username);
                 approved_player_id = 0;
 
                 pthread_mutex_lock(&input_mtx);
@@ -354,7 +379,7 @@ void *net_thread_fn(void *args) {
                 pthread_mutex_unlock(&input_mtx);
             } else {
                 int player_idx = get_player_idx(players, exited_player);
-                write_log(log, "[-] player '%s' disconnected\n", players[player_idx].name);
+                log_message(log, L_DISCONNECT, "player '%s' disconnected\n", players[player_idx].name);
             
                 // delete player from array
                 pthread_mutex_lock(&players_mtx);
@@ -368,24 +393,31 @@ void *net_thread_fn(void *args) {
             }
         case SP_START_PLACING:
         case SP_SEND_AREAS: {
-            uint32_t packet_size;
-            recv_all(fd, &packet_size, sizeof(uint32_t), 0);
-            packet_size = ntohl(packet_size);
-            char *buf = malloc(packet_size);
-
-            recv_all(fd, buf, packet_size, 0);
+            /* PACKET FORMAT
+            [uint16 areas_count] [Area[areas_count] areas]
+            */
             
-            int16_t new_areas_count = ntohs(*(int16_t*)buf);
-            if (new_areas_count < 0 || packet_size != (sizeof(new_areas_count) + new_areas_count*sizeof(Area))) {
+            const uint32_t least_size = /*areas_count*/ sizeof(int16_t);
+            if (packet_size < least_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
+                          packet_type, least_size, packet_size);
                 ex = true;
-                free(buf);
                 break;
             }
-
+            
+            uint16_t new_areas_count = ntohs(*(int16_t*)recv_buf);
+            const uint32_t expected_size = sizeof(new_areas_count) + new_areas_count*sizeof(Area);
+            if (packet_size != expected_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                          packet_type, expected_size, packet_size);
+                ex = true;
+                break;
+            }
+            
             if (!new_room) {
                 pthread_mutex_lock(&areas_mtx);
                 *areas_count = new_areas_count;
-                Area *a = (Area*)(buf + sizeof(new_areas_count));
+                Area *a = (Area*)(recv_buf + sizeof(new_areas_count));
                 for (int i = 0; i < *areas_count; i++) {
                     areas[i].team = a->team;
                     areas[i].rec.x1 = ntohs(a->rec.x1);
@@ -401,50 +433,64 @@ void *net_thread_fn(void *args) {
                 *mode = MODE_SPAWN;
                 *stage = STAGE_PLACING;
 
-                free(buf);
-
-                write_log(log, "[*] now you can spawn boids on your areas");
-                write_log(log, "[*] press ENTER when you will ready to start the game\n");
+                log_message(log, L_INFO, "now you can spawn boids on your areas");
+                log_message(log, L_INFO, "press ENTER when you will ready to start the game\n");
             }
             
             break;
             }
         case SP_PLAYER_READY: {
-            uint32_t packet_size;
-            recv_all(fd, &packet_size, sizeof(uint32_t), 0);
-            packet_size = ntohl(packet_size);
-            char *buf = malloc(packet_size);
+            /* PACKET FORMAT
+            [uint32 player_id]
+            */
 
-            recv_all(fd, buf, packet_size, 0);
-
-            if (packet_size != sizeof(uint32_t))
+            const uint32_t expected_size = sizeof(uint32_t);
+            if (packet_size != expected_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                          packet_type, expected_size, packet_size);
+                ex = true;
                 break;
+            }
 
             pthread_mutex_lock(&players_mtx);
-            uint32_t id = ntohl(*(uint32_t*)buf);
+            uint32_t id = ntohl(*(uint32_t*)recv_buf);
             int idx = get_player_idx(players, id);
             players_ready[players[idx].team] = true;
-            write_log(log, "[*] player '%s' is ready\n", players[idx].name);
+            log_message(log, L_INFO, "player '%s' is ready\n", players[idx].name);
             pthread_mutex_unlock(&players_mtx);
             
             break;
             }
         case SP_START_GAME: {
-            uint32_t packet_size;
-            recv_all(fd, &packet_size, sizeof(uint32_t), 0);
-            packet_size = ntohl(packet_size);
-            char *buf = malloc(packet_size);
+            /* PACKET FORMAT
+            [uint16 boids_count] [ServerStartNetBoid[boids_count] boids]
+            */
 
-            recv_all(fd, buf, packet_size, 0);
-
-            uint16_t recv_boids_count = ntohs(*(uint16_t*)buf);
-            if (recv_boids_count != total_boids_number || packet_size != (sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid))) {
+            const uint32_t least_size = /*boids_count*/ sizeof(uint16_t);
+            if (packet_size < least_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
+                          packet_type, least_size, packet_size);
                 ex = true;
-                free(buf);
+                break;
+            }
+            
+            uint16_t recv_boids_count = ntohs(*(uint16_t*)recv_buf);
+            const uint32_t expected_size = sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid);
+            if (packet_size != expected_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                          packet_type, expected_size, packet_size);
+                ex = true;
                 break;
             }
 
-            ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(buf + sizeof(recv_boids_count));
+            if (recv_boids_count != total_boids_number) {
+                log_message(log, L_ERROR, "invalid number of boids in SP#%d packet (expected %d boids, %d boids received)\n",
+                          packet_type, total_boids_number, recv_boids_count);
+                ex = true;
+                break;
+            }
+
+            ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(recv_buf + sizeof(recv_boids_count));
 
             pthread_mutex_lock(&boids_mtx);
             for (int i = 0; i < recv_boids_count; i++) {
@@ -465,32 +511,36 @@ void *net_thread_fn(void *args) {
             *stage = STAGE_GAME;
             *select_mode = true;
 
-            free(buf);
-
-            write_log(log, "[*] the game has started\n");
+            log_message(log, L_INFO, "the game has started\n");
             
             break;
             }
         case SP_BOIDS_SYNC: {
-            uint32_t packet_size;
-            recv_all(fd, &packet_size, sizeof(uint32_t), 0);
-            packet_size = ntohl(packet_size);
-            char *buf = malloc(packet_size);
-
             /* PACKET FORMAT
             [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
             */
-            recv_all(fd, buf, packet_size, 0);
 
-            *server_tps = *(uint8_t*)buf;
-            BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(buf+1));
-            if (packet_size != (1+sizeof(recv_boids_count)*2 + recv_boids_count*sizeof(NetBoid))) {
-                free(buf);
+            const uint32_t least_size = /*current_server_tps*/ 1 + /*boids_count*/ sizeof(uint16_t) + /*first_boid_index*/ sizeof(uint16_t);
+            if (packet_size < least_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
+                          packet_type, least_size, packet_size);
+                ex = true;
                 break;
             }
-            BoidIndex boids_first_index = ntohs(*(BoidIndex*)(buf+1+sizeof(BoidIndex)));
+            
+            BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(recv_buf+1));
+            const uint32_t expected_size = 1 + sizeof(uint16_t) + sizeof(uint16_t) + recv_boids_count*sizeof(NetBoid);
+            if (packet_size != expected_size) {
+                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                          packet_type, expected_size, packet_size);
+                ex = true;
+                break;
+            }
 
-            NetBoid *recv_boids = (NetBoid*)(buf + 1 + sizeof(recv_boids_count)*2);
+            *server_tps = *(uint8_t*)recv_buf;
+            BoidIndex boids_first_index = ntohs(*(BoidIndex*)(recv_buf+1+sizeof(BoidIndex)));
+
+            NetBoid *recv_boids = (NetBoid*)(recv_buf + 1 + sizeof(recv_boids_count)*2);
 
             pthread_mutex_lock(&boids_mtx);
             for (int i = 0; i < recv_boids_count; i++) {
@@ -521,17 +571,17 @@ void *net_thread_fn(void *args) {
 
             pthread_mutex_unlock(&boids_mtx);
 
-            free(buf);
-
             break;
             }
         case SP_ROOM_CLOSED: {
-            write_log(log, "[*] room closed\n");
+            log_message(log, L_INFO, "room closed\n");
             ex = true;
             
             break;
             }
         }
+
+        free(recv_buf);
 
         if (ex)
             break;
@@ -1078,6 +1128,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    set_log_config(NULL, /*print_time=*/ false, /*stdout*/ L_INFO, /*file*/ L_DEBUG);
+
     // Join/new room request
     SPJoined recv_data;
     if (new_room) {
@@ -1093,14 +1145,14 @@ int main(int argc, char **argv) {
         uint8_t packet_type;
         recv(fd, &packet_type, 1, 0);
         if (packet_type != SP_JOIN_PLAYER) {
-            fputs("[*] unable to create a room\n", stderr);
+            write_log(L_INFO, "unable to create a room\n");
             return 1;
         }
         
         uint32_t data_len;
         recv_packet(fd, &recv_data, &data_len, 0);
         if (data_len != sizeof(SPJoined) || recv_data.status != JOIN_OK) {
-            fputs("[*] unable to create a room\n", stderr);
+            write_log(L_INFO, "unable to create a room\n");
             return 1;
         }
     } else {
@@ -1113,19 +1165,19 @@ int main(int argc, char **argv) {
         uint8_t packet_type;
         recv(fd, &packet_type, 1, 0);
         if (packet_type != SP_JOIN_PLAYER) {
-            fputs("[*] unable to join to the room\n", stderr);
+            write_log(L_INFO, "unable to join to the room\n");
             return 1;
         }
         
         uint32_t data_len;
         recv_packet(fd, &recv_data, &data_len, 0);
         if (data_len != sizeof(SPJoined) || recv_data.status == JOIN_FAILED) {
-            fputs("[*] unable to join to the room\n", stderr);
+            write_log(L_INFO, "unable to join to the room\n");
             return 1;
         }
 
         if (recv_data.status == JOIN_REJECTED) {
-            printf("[*] admin has rejected your joining\n");
+            write_log(L_INFO, "admin has rejected your joining\n");
             return 1;
         }
 
@@ -1179,8 +1231,8 @@ int main(int argc, char **argv) {
     Log log;
     init_cstack(log, MAX_LOG_LEN);
     
-    write_log(&log, "[*] %s\n    id: %06x\n    teams: %d\n    world: %dx%d\n    chunk: %d\n    server tps: %d\n    creator: %s\n"
-                    "    boids:  %-4d\n    red:    %-4d\n    blue:   %-4d\n    green:  %-4d\n    yellow: %-4d\n",
+    log_message(&log, L_INFO, "%s\n     id: %06x\n     teams: %d\n     world: %dx%d\n     chunk: %d\n     server tps: %d\n     creator: %s\n"    
+                    "     boids:  %-4d\n     red:    %-4d\n     blue:   %-4d\n     green:  %-4d\n     yellow: %-4d\n",
            new_room? "created a room" : "joined to the room",
            room_id, players_number, world_size.x, world_size.y, chunk_size, server_target_tps, players[0].name, total_boids_number,
            boids_number[TEAM_RED],
@@ -1189,14 +1241,15 @@ int main(int argc, char **argv) {
            boids_number[TEAM_YELLOW]);
 
     if (!new_room) {
-        write_log(&log, "[*] players:\n");
+        char players_info[LOG_BUF_SIZE] = "players:\n";
         for (int i = 0; i < joined_players; i++) {
             ClientPlayer *op = &players[i];
 
             char *team = get_team_name(op->team);
 
-            write_log(&log, "    %s - %s\n", op->name, team);
+            snprintf(players_info+strlen(players_info), sizeof(players_info), "  %s - %s\n", op->name, team);
         }
+        log_message(&log, L_INFO, players_info);
     }
 
     // Init Raylib
@@ -1219,7 +1272,6 @@ int main(int argc, char **argv) {
     bool show_line = false;
     Vector2 line_points[ORDER_LINE_MAX_POINT];
     int line_points_count = 0;
-    float line_len = 0;
     
     // Selection
     int selecting_team = TEAM_RED;
@@ -1370,7 +1422,7 @@ int main(int argc, char **argv) {
                 // Input ends with ENTER
                 if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
                     typing_string_input = false;
-                    write_log(&log, input_string);
+                    log_message(&log, L_INPUT, input_string);
 
                     get_input = false;
                     input_received = true;
@@ -1486,7 +1538,7 @@ int main(int argc, char **argv) {
                     pthread_mutex_unlock(&areas_mtx);
                     
                 } else {
-                    write_log(&log, "[!] you cannot start placing if size of areas of all teams is less than the number of boids\n");
+                    log_message(&log, L_WARNING, "you cannot start placing if size of areas of all teams is less than the number of boids\n");
                 }
             }
             pthread_mutex_unlock(&players_mtx);
@@ -1711,12 +1763,12 @@ int main(int argc, char **argv) {
                     memcpy(buf+sizeof(count), data, count * sizeof(*data));
 
                     send_packet(fd, CP_SEND_BOIDS, buf, bufsize, 0);
-                    write_log(&log, "[*] wait until other players are ready to start the game\n");
+                    log_message(&log, L_INFO, "wait until other players are ready to start the game\n");
 
                     free(data);
                     free(buf);
                 } else {
-                    write_log(&log, "[!] place all your boids before you start the game\n");
+                    log_message(&log, L_WARNING, "place all your boids before you start the game\n");
                 }
             }
         }
@@ -1826,12 +1878,10 @@ int main(int argc, char **argv) {
                 Vector2 point_pos = {x, y};
 
                 if (show_line && (line_points_count < ORDER_LINE_MAX_POINT)) {
-                    line_len += Vector2Distance(point_pos, line_points[line_points_count-1]);
                     line_points[line_points_count++] = point_pos;
                 } else if (!show_line) { // First point
                     show_line = true;
                     line_points[0] = point_pos;
-                    line_len = 0;
                     line_points_count = 1;
                 }
             }
@@ -2118,13 +2168,29 @@ int main(int argc, char **argv) {
                 }
             }
 
+            Color log_colors[] = {
+                [L_DEBUG] = GRAY,
+                [L_JOIN] = LIME,
+                [L_DISCONNECT] = ORANGE,
+                [L_QUESTION] = DARKBLUE,
+                [L_INPUT] = DARKPURPLE,
+                [L_INFO] = BLACK,
+                [L_WARNING] = RED,
+                [L_ERROR] = DARKRED
+            };
+            
             // Draw log
             if (show_log) {
                 int line = typing_string_input, idx = log.front;
                 pthread_mutex_lock(&log_mtx);
                 for (int i = 0; i < log.size; i++) {
                     line += log.items[idx].lines;
-                    DrawText(log.items[idx].string, 10, screen_height - line*22 - 5, 20, BLACK);
+                    LogEntry *entry = &log.items[idx];
+                    
+                    // DrawText(log_prefixes[entry->type], 10, screen_height - line*22 - 5, 20, log_colors[entry->type]);
+                    // DrawText(entry->string, 40, screen_height - line*22 - 5, 20, BLACK);
+                    DrawText(TextFormat("%s%s", log_prefixes[entry->type], entry->string), 10, screen_height - line*22 - 5, 20, log_colors[entry->type]);
+
                     idx = (idx > 0)? (idx - 1) : log.max_len-1;
                 }
                 pthread_mutex_unlock(&log_mtx);
@@ -2133,7 +2199,7 @@ int main(int argc, char **argv) {
             // Draw keyboard input
             pthread_mutex_lock(&input_mtx);
             if (typing_string_input) {
-                DrawText(input_string, 10, screen_height - 22 - 5, 20, BLACK);
+                DrawText(TextFormat("%s%s", log_prefixes[L_INPUT], input_string), 10, screen_height - 22 - 5, 20, log_colors[L_INPUT]);
             }
             pthread_mutex_unlock(&input_mtx);
 
@@ -2198,7 +2264,7 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&running_mtx);
     pthread_join(net_thread, NULL);
 
-    write_log(&log, "[*] exit\n");
+    log_message(&log, L_INFO, "exit\n");
     
     // Destroy all mutexes and conditions
     pthread_mutex_destroy(&input_mtx);
