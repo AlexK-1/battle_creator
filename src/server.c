@@ -31,6 +31,9 @@
 #include "queue.h"
 #include "kdtree.h"
 
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+
 #define MAX_ROOMS 256
 #define MAX_EVENTS 1024
 #define MAX_APPROVING_QUEUE_LEN 10
@@ -56,11 +59,12 @@ connect -> server
 */
 
 typedef struct Player {
-    int fd;
+    int tcp_fd;
+    struct sockaddr_in tcp_addr, udp_addr;
     uint32_t id;
     char name[USERNAME_LEN];
     uint8_t team;
-    bool joined, ready;
+    bool joined, ready, udp_enabled;
     ClientStartNetBoids start_boids[MAX_BOIDS_COUNT*2];
     int start_boids_len;
     struct Player *approving_player;
@@ -105,14 +109,15 @@ Player **players = NULL;
 uint32_t last_player_id = 0; // 0 must be an invalid player id
 Room *rooms[MAX_ROOMS] = { 0 };
 int32_t last_room_idx = -1;
-int chunk_size = CHUNK_SIZE_PIXELS, epfd, server_fd;
+int chunk_size = CHUNK_SIZE_PIXELS, epfd, tcp_fd, udp_fd;
+bool udp_opened = false;
 long max_fd;
 int tps = DEFAULT_TPS;
 /* ^ global variables ^ */
 
 int get_player_idx(Player **players, int id) {
     for (int i = 0; i < TEAMS_COUNT; i++) {
-        if (players[i]->fd == id)
+        if (players[i]->tcp_fd == id)
             return i;
     }
     return -1;
@@ -143,15 +148,15 @@ void close_room(Room *room) {
         Player *op;
         dequeue(room->players[0]->approving_queue, op);
         op->joined = false;
-        close_client(op->fd);
+        close_client(op->tcp_fd);
     }
 
     for (int i = 0; i < room->joined_players; i++) {
         Player *p = room->players[i];
         if (p->joined) {
             p->joined = false;
-            send_packet(p->fd, SP_ROOM_CLOSED, NULL, 0, MSG_NOSIGNAL);
-            close_client(p->fd);
+            send_packet(p->tcp_fd, SP_ROOM_CLOSED, NULL, 0, MSG_NOSIGNAL);
+            close_client(p->tcp_fd);
         }
     }
 
@@ -169,7 +174,7 @@ void close_client(int fd) {
     if (p->joined && p->room != NULL) {
         Room *room = p->room;
 
-        int player_idx = get_player_idx(room->players, p->fd);
+        int player_idx = get_player_idx(room->players, p->tcp_fd);
 
         // send a message to all players in the room that the player has disconnected
         uint32_t nid = htonl(p->id);
@@ -177,7 +182,7 @@ void close_client(int fd) {
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i];
             if (op->id != room->players[player_idx]->id)
-                send_packet(op->fd, SP_PLAYER_EXIT, &nid, sizeof(op->id), MSG_NOSIGNAL);
+                send_packet(op->tcp_fd, SP_PLAYER_EXIT, &nid, sizeof(op->id), MSG_NOSIGNAL);
         }
         pthread_mutex_unlock(&room->players_mtx);
 
@@ -208,7 +213,7 @@ void close_client(int fd) {
             int find_idx = -1;
             for (int i = 0; i < p->in_queue->size; i++) {
                 int idx = (p->in_queue->front + i) % p->in_queue->max_len;
-                if (p->in_queue->items[idx]->fd == p->fd) {
+                if (p->in_queue->items[idx]->tcp_fd == p->tcp_fd) {
                     find_idx = idx;
                     break;
                 }
@@ -226,7 +231,7 @@ void close_client(int fd) {
 
             if (find_idx == p->in_queue->front) {
                 uint32_t nid = htonl(p->id);
-                send_packet(p->approving_player->fd, SP_PLAYER_EXIT, &nid, sizeof(nid), 0);
+                send_packet(p->approving_player->tcp_fd, SP_PLAYER_EXIT, &nid, sizeof(nid), 0);
             }
             
             p->in_queue->size--;
@@ -322,7 +327,7 @@ void *room_thread_fn(void *args) {
 
     pthread_mutex_lock(&room->players_mtx);
     for (int i = 0; i < room->joined_players; i++) {
-        send_packet(room->players[i]->fd, SP_START_GAME, data, packet_size, 0);
+        send_packet(room->players[i]->tcp_fd, SP_START_GAME, data, packet_size, 0);
     }
     pthread_mutex_unlock(&room->players_mtx);
 
@@ -395,9 +400,46 @@ void *room_thread_fn(void *args) {
             }
 
             pthread_mutex_lock(&room->players_mtx);
+            
+            bool send_udp = false;
             for (int i = 0; i < room->joined_players; i++) {
-                send_packet(room->players[i]->fd, SP_BOIDS_SYNC, data, packet_size, 0);
+                Player *p = room->players[i];
+
+                if (udp_opened && p->udp_enabled) {
+                    send_udp = true;
+                } else {
+                    // Send by TCP
+                    send_packet(p->tcp_fd, SP_BOIDS_SYNC, data, packet_size, 0);
+                }
             }
+
+            // At least one client has UDP enabled
+            if (send_udp) {
+                const int boids_in_packet = 1400 / sizeof(NetBoid);
+                BoidIndex boids_sent = 0;
+                char *packet = data;
+
+                // Divide all data to small packets and send by UDP
+                while (boids_sent < boids_count) {
+                    BoidIndex send_boids_count = MIN(boids_in_packet, boids_count - boids_sent);
+                    
+                    *(uint8_t*)(packet) = (tps - timer) / (float)delay;
+                    *(BoidIndex*)(packet+1) = htons(send_boids_count);
+                    *(BoidIndex*)(packet+1+sizeof(BoidIndex)) = htons(boids_sent);
+
+                    uint32_t packet_size = 1 + sizeof(BoidIndex)*2 + send_boids_count*sizeof(NetBoid);
+
+                    for (int i = 0; i < room->joined_players; i++) {
+                        Player *p = room->players[i];
+                        if (p->udp_enabled)
+                            sendto_packet(udp_fd, SP_BOIDS_SYNC, packet, packet_size, 0, (struct sockaddr*)&p->udp_addr, sizeof(p->udp_addr));
+                    }
+
+                    packet += send_boids_count*sizeof(NetBoid);
+                    boids_sent += send_boids_count;
+                }
+            }
+            
             pthread_mutex_unlock(&room->players_mtx);
 
             free(data);
@@ -463,7 +505,7 @@ void process_data(Player *p) {
             write_log(L_WARNING, "no free rooms\n");
 
             SPJoined send_data = {.status = JOIN_FAILED};
-            send_packet(p->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+            send_packet(p->tcp_fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
             
             break;
         }
@@ -525,7 +567,7 @@ void process_data(Player *p) {
             send_data.teams[i] = htons(room->teams[i]);
         }
 
-        send_packet(p->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+        send_packet(p->tcp_fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
         
         break;
         }
@@ -543,7 +585,7 @@ void process_data(Player *p) {
         uint16_t room_idx = (data.room_id & 0xffff0000) >> 16;
         if (room_idx > MAX_ROOMS-1) {
             SPJoined send_data = {.status = JOIN_FAILED};
-            send_packet(p->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+            send_packet(p->tcp_fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
             break;
         }
         
@@ -554,7 +596,7 @@ void process_data(Player *p) {
             Player *room_owner = room->players[0];
             if (is_queue_full(room_owner->approving_queue)) {
                 SPJoined send_data = {.status = JOIN_FAILED};
-                send_packet(p->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+                send_packet(p->tcp_fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
                 break;
             }
             
@@ -566,11 +608,11 @@ void process_data(Player *p) {
                 SPApprove send_data = {.id = htonl(p->id), .username = { 0 }};
                 strcpy(send_data.username, data.username);
 
-                send_packet(room_owner->fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
+                send_packet(room_owner->tcp_fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
             }
         } else {
             SPJoined send_data = {.status = JOIN_FAILED};
-            send_packet(p->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+            send_packet(p->tcp_fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
         }
         
         break;
@@ -601,7 +643,7 @@ void process_data(Player *p) {
         if (data.team == -1) {
             approved_player->joined = false;
             SPJoined send_data = {.status = JOIN_REJECTED};
-            send_packet(approved_player->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+            send_packet(approved_player->tcp_fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
         } else {
             approved_player->joined = true;
             approved_player->ready = false;
@@ -626,7 +668,7 @@ void process_data(Player *p) {
                 send_data.teams[i] = htons(room->teams[i]);
             }
 
-            send_packet(approved_player->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+            send_packet(approved_player->tcp_fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
 
             if (!room->hide_areas) {
                 uint32_t buf_size = room->areas_count * sizeof(*room->areas) + sizeof(room->areas_count);
@@ -643,7 +685,7 @@ void process_data(Player *p) {
                     a++;
                 }
 
-                send_packet(approved_player->fd, SP_SEND_AREAS, buf, buf_size, 0);
+                send_packet(approved_player->tcp_fd, SP_SEND_AREAS, buf, buf_size, 0);
 
                 free(buf);
             }
@@ -654,7 +696,7 @@ void process_data(Player *p) {
             for (int i = 0; i < room->joined_players; i++) {
                 Player *op = room->players[i];
                 if (op != approved_player)
-                    send_packet(op->fd, SP_NEW_JOIN, &player_data, sizeof(player_data), 0);
+                    send_packet(op->tcp_fd, SP_NEW_JOIN, &player_data, sizeof(player_data), 0);
             }
 
             if (room->joined_players == room->players_number) {
@@ -663,7 +705,7 @@ void process_data(Player *p) {
                     dequeue(p->approving_queue, op);
 
                     SPJoined send_data = {.status = JOIN_FAILED};
-                    send_packet(op->fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
+                    send_packet(op->tcp_fd, SP_JOIN_PLAYER, &send_data, sizeof(send_data), 0);
                     break;
                 }
             }
@@ -675,7 +717,7 @@ void process_data(Player *p) {
             SPApprove send_data = {.id = htonl(approved_player->id), .username = { 0 }};
             strcpy(send_data.username, approved_player->name);
 
-            send_packet(p->fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
+            send_packet(p->tcp_fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
         }
 
         break;
@@ -688,7 +730,7 @@ void process_data(Player *p) {
 
         Room *room = p->room;
         
-        if (p->net.data_len < sizeof(int16_t) || room->players[0]->fd != p->fd ||
+        if (p->net.data_len < sizeof(int16_t) || room->players[0]->tcp_fd != p->tcp_fd ||
             (room->joined_players != room->players_number && package_type == CP_START_PLACING) ||
             room->status != ROOM_AREAS)
             break;
@@ -700,7 +742,7 @@ void process_data(Player *p) {
         // send a message to all players that admin starts placing boids
         for (int i = 1; i < room->joined_players; i++) {
             Player *op = room->players[i];
-            send_packet(op->fd, (package_type == CP_START_PLACING)? SP_START_PLACING : SP_SEND_AREAS, p->net.data_buf, p->net.data_len, 0);
+            send_packet(op->tcp_fd, (package_type == CP_START_PLACING)? SP_START_PLACING : SP_SEND_AREAS, p->net.data_buf, p->net.data_len, 0);
         }
 
         room->areas_count = areas_count;
@@ -717,7 +759,7 @@ void process_data(Player *p) {
         if (package_type == CP_START_PLACING) {
             // send a message to admin of the room
             areas_count = 0;
-            send_packet(p->fd, SP_START_PLACING, &areas_count, sizeof(areas_count), 0);
+            send_packet(p->tcp_fd, SP_START_PLACING, &areas_count, sizeof(areas_count), 0);
         
             room->status = ROOM_PLACING;
             write_log(L_INFO, "room %06x started placing\n", room->id);
@@ -754,7 +796,7 @@ void process_data(Player *p) {
         uint32_t nid = htonl(p->id);
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i];
-            send_packet(op->fd, SP_PLAYER_READY, &nid, sizeof(nid), 0);
+            send_packet(op->tcp_fd, SP_PLAYER_READY, &nid, sizeof(nid), 0);
         }
 
         bool all_ready = true;
@@ -971,7 +1013,7 @@ void process_data(Player *p) {
 int client_recv(Player *p) {
     while (1) {
         // Receive data
-        int n = recv(p->fd, p->net.recv_buf, sizeof(p->net.recv_buf), 0);
+        int n = recv(p->tcp_fd, p->net.recv_buf, sizeof(p->net.recv_buf), 0);
         if (n == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
@@ -1050,13 +1092,15 @@ void quit(int sig) {
     free(players);
 
     close(epfd);
-    close(server_fd);
+    close(tcp_fd);
+    if (udp_opened)
+        close(udp_fd);
 
     exit(sig);
 }
 
 int main(int argc, char **argv) {
-    unsigned short tcp_port = TCP_PORT;
+    unsigned short tcp_port = TCP_PORT, udp_port = UDP_PORT;
     bool show_help = false;
     char *prog = argv[0];
 
@@ -1079,6 +1123,17 @@ int main(int argc, char **argv) {
 
                     char *endp;
                     tcp_port = strtoul(value_str, &endp, 10);
+                    if (*endp != '\0') {
+                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                    }
+                } else if (strcmp(arg, "--udp-port") == 0 || strcmp(arg, "-U") == 0) {
+                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
+                
+                    char *value_str = *(++argv);
+                    argc--;
+
+                    char *endp;
+                    udp_port = strtoul(value_str, &endp, 10);
                     if (*endp != '\0') {
                         ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                     }
@@ -1146,17 +1201,23 @@ int main(int argc, char **argv) {
             "    Show this message and exit\n"
             "  -T, --tcp-port\n"
             "    TCP port of the game server (default: %d)\n"
+            "  -U, --udp-port\n"
+            "    UDP port of the game server (default: %d)\n"
             "  -c, --chunk <NUM>\n"
             "    Size of chunk in pixels, rounded down to the nearest multiple of %d\n"
             "    (default: %d)\n"
             "  -t, --tps <NUM>\n"
             "    Simulation's target tps (default: %d)\n",
-            prog, TCP_PORT, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, DEFAULT_TPS);
+            prog, TCP_PORT, UDP_PORT, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, DEFAULT_TPS);
 
         exit(0);
     }
 
-    set_log_config(NULL, /*print_time=*/ true, /*stdout*/ L_INFO, /*file*/ L_DEBUG);
+    #ifdef DEBUG
+        set_log_config(NULL, /*print_time=*/ true, /*stdout*/ L_DEBUG, /*file*/ L_DEBUG);
+    #else
+        set_log_config(NULL, /*print_time=*/ true, /*stdout*/ L_INFO, /*file*/ L_DEBUG);
+    #endif
 
     printf("chunk: %d pixels\n", chunk_size);
     printf("target tps: %d\n", tps);
@@ -1165,42 +1226,84 @@ int main(int argc, char **argv) {
     players = calloc(max_fd, sizeof(Player*));
     
     // Create a TCP socket
-    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (server_fd < 0) {
+    bool tcp_opened = false;
+    tcp_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (tcp_fd < 0) {
         perror("socket");
-        return 1;
+        goto tcp_fail;
     }
 
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+    if (setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
         perror("setsockopt SO_REUSEADDR");
-        close(server_fd);
-        return 1;
+        goto tcp_fail;
     }
 
     opt = 1;
-    if (setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt))) {
+    if (setsockopt(tcp_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt))) {
         perror("setsockopt TCP_NODELAY");
-        close(server_fd);
-        return 1;
+        goto tcp_fail;
     }
     
-    struct sockaddr_in servaddr = { 0 };
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(tcp_port);
-    servaddr.sin_family = AF_INET;
+    struct sockaddr_in tcp_servaddr = { 0 };
+    tcp_servaddr.sin_addr.s_addr = INADDR_ANY;
+    tcp_servaddr.sin_port = htons(tcp_port);
+    tcp_servaddr.sin_family = AF_INET;
 
     // Forcefully attaching socket to the port
-    if (bind(server_fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+    if (bind(tcp_fd, (struct sockaddr*)&tcp_servaddr, sizeof(tcp_servaddr)) < 0) {
         perror("bind");
-        close(server_fd);
-        return 1;
+        goto tcp_fail;
     }
 
-    if (listen(server_fd, 1) < 0) {
+    if (listen(tcp_fd, SOMAXCONN) < 0) {
         perror("listen");
-        close(server_fd);
-        return 1;
+        goto tcp_fail;
+    }
+
+    write_log(L_INFO, "opened a TCP socket on port %d\n", tcp_port);
+    tcp_opened = true;
+
+    tcp_fail: {
+        if (!tcp_opened) {
+            write_log(L_WARNING, "failed to open a TCP socket on port %d\n", tcp_port);
+            close(tcp_fd);
+            return 1;
+        }
+    }
+
+    // Create a UDP socket
+    udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (udp_fd < 0) {
+        perror("socket");
+        goto udp_fail;
+    }
+
+    opt = 1;
+    if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        perror("setsockopt SO_REUSEADDR");
+        close(udp_fd);
+        goto udp_fail;
+    }
+
+    struct sockaddr_in udp_servaddr = { 0 };
+    udp_servaddr.sin_addr.s_addr = INADDR_ANY;
+    udp_servaddr.sin_port = htons(udp_port);
+    udp_servaddr.sin_family = AF_INET;
+
+    // Forcefully attaching socket to the port
+    if (bind(udp_fd, (struct sockaddr*)&udp_servaddr, sizeof(udp_servaddr)) < 0) {
+        perror("bind");
+        close(udp_fd);
+        goto udp_fail;
+    }
+
+    write_log(L_INFO, "opened a UDP socket on port %d\n", udp_port);
+    udp_opened = true;
+
+    udp_fail: {
+        if (!udp_opened)
+            write_log(L_WARNING, "failed to open a UDP socket on port %d\n", udp_port);
     }
 
     // Create epoll instance
@@ -1208,17 +1311,27 @@ int main(int argc, char **argv) {
     epfd = epoll_create1(0);
     if (epfd < 0) {
         perror("epoll_create1");
-        close(server_fd);
+        close(tcp_fd);
         return 1;
     }
 
-    event.events = EPOLLIN; // EPOLLIN | EPOLLOUT
-    event.data.fd = server_fd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &event)) {
+    event.events = EPOLLIN;
+    event.data.fd = tcp_fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, tcp_fd, &event)) {
         perror("epoll_ctl");
-        close(server_fd);
+        close(tcp_fd);
         close(epfd);
         return 1;
+    }
+
+    if (udp_opened) {
+        event.events = EPOLLIN;
+        event.data.fd = udp_fd;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, udp_fd, &event)) {
+            write_log(L_ERROR, "failed to add a UDP socket to epoll");
+            perror("epoll_ctl");
+            close(udp_fd);
+        }
     }
 
     if (fcntl(STDIN_FILENO, F_GETFD) != -1) {
@@ -1235,8 +1348,6 @@ int main(int argc, char **argv) {
         write_log(L_WARNING, "stdin is closed\n");
     }
     
-    write_log(L_INFO, "epoll server on 0.0.0.0:%d\n", tcp_port);
-
     signal(SIGINT, quit);
     
     bool running = true;
@@ -1250,12 +1361,12 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
-            if (fd == server_fd) {
+            if (fd == tcp_fd) {
                 // Accept all pending connections
                 while (1) {
                     struct sockaddr_in client_addr;
                     socklen_t client_len = sizeof(client_addr);
-                    int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+                    int client_fd = accept(tcp_fd, (struct sockaddr*)&client_addr, &client_len);
                     if (client_fd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         perror("accept");
@@ -1270,12 +1381,12 @@ int main(int argc, char **argv) {
                     }
 
                     Player *player = malloc(sizeof(Player));
-                    *player = (Player){.id = (++last_player_id), .fd = client_fd, .joined = false, .ready = false,
-                                       .approving_queue = { 0 }, .in_queue = NULL};
+                    *player = (Player){.id = (++last_player_id), .tcp_fd = client_fd, .tcp_addr = client_addr,
+                                       .joined = false, .ready = false, .approving_queue = { 0 }, .in_queue = NULL};
                     players[client_fd] = player;
 
                     char ip[INET_ADDRSTRLEN];
-                    if (!inet_ntop(servaddr.sin_family, &client_addr.sin_addr, ip, sizeof(ip)))
+                    if (!inet_ntop(tcp_servaddr.sin_family, &client_addr.sin_addr, ip, sizeof(ip)))
                         strcpy("?", ip);
                     write_log(L_JOIN, "%s:%d (fd=%d id=%d)\n", ip, ntohs(client_addr.sin_port), client_fd, last_player_id);
 
@@ -1285,6 +1396,46 @@ int main(int argc, char **argv) {
                         perror("epoll_ctl");
                         free(players[client_fd]);
                         close(client_fd);
+                    }
+                }
+            } else if (fd == udp_fd) {
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+
+                char buffer[1024];
+                ssize_t n = recvfrom(udp_fd, &buffer, sizeof(buffer), 0, (struct sockaddr*)&client_addr, &client_len);
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                    perror("accept");
+                    break;
+                }
+
+                uint8_t packet_type = *(uint8_t*)buffer;
+                uint32_t packet_size = ntohl(*(uint32_t*)(buffer + 1));
+                if ((uint32_t)n != (1 + sizeof(packet_size) + packet_size))
+                    continue;
+                char *data = buffer + 1 + sizeof(packet_size);
+
+                if (packet_type == CP_UDP_HELLO) {
+                    /* PACKET FORMAT
+                    [uint32 player_id]
+                    */
+
+                    if (packet_size != sizeof(uint32_t))
+                        continue;
+                    uint32_t player_id = ntohl(*(uint32_t*)data);
+
+                    Player *p = NULL;
+                    for (long i = 0; i < max_fd; i++) {
+                        if (players[i] != NULL && players[i]->id == player_id) {
+                            p = players[i];
+                            break;
+                        }
+                    }
+
+                    if (p != NULL) {
+                        p->udp_addr = client_addr;
+                        p->udp_enabled = true;
                     }
                 }
             } else if (events[i].data.fd == STDIN_FILENO) {

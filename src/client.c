@@ -134,6 +134,10 @@ ClientPlayer *find_player(ClientPlayer *players, uint32_t id) {
 char input_string[INPUT_STRING_LEN];
 bool get_input = false, input_received = false, typing_string_input = false, running = true;
 
+int tcp_fd, udp_fd;
+struct sockaddr_in udp_servaddr = { 0 };
+bool udp_opened = false;
+
 typedef enum {
     MODE_WAIT,
     MODE_AREAS,
@@ -152,7 +156,7 @@ typedef enum {
 } GameStage;
 
 typedef struct {
-    int fd, players_number, *joined_players, chunk_size;
+    int players_number, *joined_players, chunk_size;
     bool new_room, *select_mode, *players_ready;
     Point *world_size;
     BoidIndex *boids_number, *boids_count, total_boids_number;
@@ -176,7 +180,6 @@ pthread_mutex_t players_mtx;
 void *net_thread_fn(void *args) {
     NetThreadArgs *nargs = args;
     
-    int fd = nargs->fd;
     bool new_room = nargs->new_room;
     int players_number = nargs->players_number;
     int *joined_players = nargs->joined_players;
@@ -199,6 +202,12 @@ void *net_thread_fn(void *args) {
 
     uint32_t approved_player_id = 0;
     char approved_player_username[USERNAME_LEN];
+    
+    enum {
+        SYNC_PROTO_NONE = 0,
+        SYNC_PROTO_TCP,
+        SYNC_PROTO_UDP,
+    } sync_proto = SYNC_PROTO_NONE;
     
     bool ex = false; // exit from loop
     while (1) {
@@ -257,7 +266,7 @@ void *net_thread_fn(void *args) {
 
                 if (ok) {
                     CPApprove send_data = {.id = htonl(approved_player_id), .team = team};
-                    send_packet(fd, CP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
+                    send_packet(tcp_fd, CP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
                 }
             }
             
@@ -266,12 +275,14 @@ void *net_thread_fn(void *args) {
         pthread_mutex_unlock(&input_mtx);
         
         uint8_t packet_type;
-        int r = recv(fd, &packet_type, 1, 0);
+        bool recv_udp = false, recv_tcp = false;
+
+        // Try to receive a packet by TCP
+        int r = recv(tcp_fd, &packet_type, 1, 0);
         if (r == 0) {
-            log_message(log, L_WARNING, "connection closed\n");
+            log_message(log, L_DEBUG, "TCP connection closed\n");
             break;
-        }
-        if (r < 0) {
+        } else if (r < 0) {
             bool err_wouldblock;
             #ifdef _WIN32
                 int err = WSAGetLastError();
@@ -280,308 +291,371 @@ void *net_thread_fn(void *args) {
                 err_wouldblock = (errno == EWOULDBLOCK);
             #endif
             if (err_wouldblock) {
-                WaitTime(0.01);
-                continue;
+                recv_udp = true; // No data
             } else {
-                log_message(log, L_ERROR, "error receiving packet size\n");
+                log_message(log, L_ERROR, "failed to receive a packet size by TCP\n");
                 perror("recv");
                 break;
             }
+        } else {
+            recv_tcp = true;
         }
 
         uint32_t packet_size;
-        recv_all(fd, &packet_size, sizeof(uint32_t), 0);
-        packet_size = ntohl(packet_size);
-        char *recv_buf = malloc(packet_size);
+        char recv_buf_stack[32 * 1024], *recv_buf;
 
-        if (recv_all(fd, recv_buf, packet_size, 0)) {
-            log_message(log, L_ERROR, "error receiving SP#%d packet\n", packet_type);
-            perror("recv_all");
+        // Receive data by TCP
+        if (recv_tcp) {
+            recv_all(tcp_fd, &packet_size, sizeof(uint32_t), 0);
+            packet_size = ntohl(packet_size);
+            recv_buf = malloc(packet_size);
+
+            if (recv_all(tcp_fd, recv_buf, packet_size, 0)) {
+                log_message(log, L_ERROR, "error receiving SP#%d packet\n", packet_type);
+                perror("recv_all");
+                free(recv_buf);
+                break;
+            }
         }
-        
-        switch (packet_type) {
-        case SP_APPROVE_PLAYER: { // Approve/reject new player
-            /* PACKET FORMAT
-            [SPApprove player]
-            */
 
-            const uint32_t expected_size = sizeof(SPApprove);
-            if (packet_size != expected_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                          packet_type, expected_size, packet_size);
-                ex = true;
+        // Try to receive a packet by UDP
+        if (recv_udp) {
+            socklen_t addrlen = sizeof(udp_servaddr);
+            ssize_t n = recvfrom(udp_fd, recv_buf_stack, sizeof(recv_buf_stack), 0, (struct sockaddr*)&udp_servaddr, &addrlen);
+            if (n == 0) {
+                log_message(log, L_DEBUG, "UDP connection closed\n");
                 break;
+            } else if (n < 0) {
+                bool err_wouldblock;
+                #ifdef _WIN32
+                    int err = WSAGetLastError();
+                    err_wouldblock = (err == WSAEWOULDBLOCK);
+                #else
+                    err_wouldblock = (errno == EWOULDBLOCK);
+                #endif
+                if (err_wouldblock) {
+                    recv_udp = false; // No data
+                } else {
+                    log_message(log, L_ERROR, "failed to receive data by UDP\n");
+                    perror("recv");
+                    break;
+                }
+            } else {
+                if ((uint32_t)n >= (1 + sizeof(packet_size))) {
+                    // Prepare data to processing
+                    recv_buf = recv_buf_stack;
+                    packet_type = *(uint8_t*)recv_buf;
+                    packet_size = ntohl(*(uint32_t*)(recv_buf + 1));
+                    recv_buf += 1 + sizeof(packet_size); // Skip header
+
+                    recv_udp = (uint32_t)n == (1 + sizeof(packet_size) + packet_size);
+                } else {
+                    recv_udp = false; // Invalid packet
+                }
             }
+        }
 
-            SPApprove *other_player = (SPApprove*)recv_buf;
-
-            approved_player_id = ntohl(other_player->id);
-            strcpy(approved_player_username, other_player->username);
-
-            pthread_mutex_lock(&input_mtx);
-            get_input = true;
-            pthread_mutex_unlock(&input_mtx);
-
-            log_message(log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", other_player->username);
-
-            break;   
-            }
-        case SP_NEW_JOIN: {
-            /* PACKET FORMAT
-            [ClientPlayer new_player]
-            */
+        if (!recv_tcp && !recv_udp) {
+            // No data at all (neither TCP nor UDP)
+            WaitTime(0.03);
+        } else {
+            // Process received data
             
-            const uint32_t expected_size = sizeof(ClientPlayer);
-            if (packet_size != expected_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                          packet_type, expected_size, packet_size);
-                ex = true;
-                break;
-            }
+            switch (packet_type) {
+            case SP_APPROVE_PLAYER: { // Approve/reject new player
+                /* PACKET FORMAT
+                [SPApprove player]
+                */
 
-            ClientPlayer *new_player = (ClientPlayer*)recv_buf;
-            new_player->id = ntohl(new_player->id);
+                const uint32_t expected_size = sizeof(SPApprove);
+                if (packet_size != expected_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                              packet_type, expected_size, packet_size);
+                    ex = true;
+                    break;
+                }
 
-            pthread_mutex_lock(&players_mtx);
-            players[(*joined_players)++] = *new_player;
-            pthread_mutex_unlock(&players_mtx);
-            log_message(log, L_JOIN, "new player '%s' - %s\n", new_player->name, get_team_name(new_player->team));
+                SPApprove *other_player = (SPApprove*)recv_buf;
 
-            if (new_room && players_number == *joined_players) {
-                log_message(log, L_INFO, "press ENTER to start placing boids\n");
-            }
-            approved_player_id = 0;
-            
-            break;
-            }
-        case SP_PLAYER_EXIT: {
-            /* PACKET FORMAT
-            [uin32_t player_id]
-            */
-            
-            const uint32_t expected_size = sizeof(uint32_t);
-            if (packet_size != expected_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                          packet_type, expected_size, packet_size);
-                ex = true;
-                break;
-            }
-
-            uint32_t exited_player = ntohl(*(uint32_t*)recv_buf);
-
-            if (*stage == STAGE_AREAS && exited_player == approved_player_id) {
-                log_message(log, L_DISCONNECT, "player '%s' disconnected\n", approved_player_username);
-                approved_player_id = 0;
+                approved_player_id = ntohl(other_player->id);
+                strcpy(approved_player_username, other_player->username);
 
                 pthread_mutex_lock(&input_mtx);
-                get_input = false;
-                typing_string_input = false;
+                get_input = true;
                 pthread_mutex_unlock(&input_mtx);
-            } else {
-                int player_idx = get_player_idx(players, exited_player);
-                log_message(log, L_DISCONNECT, "player '%s' disconnected\n", players[player_idx].name);
+
+                log_message(log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", other_player->username);
+
+                break;   
+                }
+            case SP_NEW_JOIN: {
+                /* PACKET FORMAT
+                [ClientPlayer new_player]
+                */
             
-                // delete player from array
+                const uint32_t expected_size = sizeof(ClientPlayer);
+                if (packet_size != expected_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                              packet_type, expected_size, packet_size);
+                    ex = true;
+                    break;
+                }
+
+                ClientPlayer *new_player = (ClientPlayer*)recv_buf;
+                new_player->id = ntohl(new_player->id);
+
                 pthread_mutex_lock(&players_mtx);
-                memmove(players + player_idx, players + player_idx + 1,
-                        sizeof(players[0]) * (*joined_players - player_idx - 1));
-                (*joined_players)--;
+                players[(*joined_players)++] = *new_player;
                 pthread_mutex_unlock(&players_mtx);
-            }
-            
-            break;
-            }
-        case SP_START_PLACING:
-        case SP_SEND_AREAS: {
-            /* PACKET FORMAT
-            [uint16 areas_count] [Area[areas_count] areas]
-            */
-            
-            const uint32_t least_size = /*areas_count*/ sizeof(int16_t);
-            if (packet_size < least_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
-                          packet_type, least_size, packet_size);
-                ex = true;
-                break;
-            }
-            
-            uint16_t new_areas_count = ntohs(*(int16_t*)recv_buf);
-            const uint32_t expected_size = sizeof(new_areas_count) + new_areas_count*sizeof(Area);
-            if (packet_size != expected_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                          packet_type, expected_size, packet_size);
-                ex = true;
-                break;
-            }
-            
-            if (!new_room) {
-                pthread_mutex_lock(&areas_mtx);
-                *areas_count = new_areas_count;
-                Area *a = (Area*)(recv_buf + sizeof(new_areas_count));
-                for (int i = 0; i < *areas_count; i++) {
-                    areas[i].team = a->team;
-                    areas[i].rec.x1 = ntohs(a->rec.x1);
-                    areas[i].rec.x2 = ntohs(a->rec.x2);
-                    areas[i].rec.y1 = ntohs(a->rec.y1);
-                    areas[i].rec.y2 = ntohs(a->rec.y2);
-                    a++;
+                log_message(log, L_JOIN, "new player '%s' - %s\n", new_player->name, get_team_name(new_player->team));
+
+                if (new_room && players_number == *joined_players) {
+                    log_message(log, L_INFO, "press ENTER to start placing boids\n");
                 }
-                pthread_mutex_unlock(&areas_mtx);
-            }
-
-            if (packet_type == SP_START_PLACING) {
-                *mode = MODE_SPAWN;
-                *stage = STAGE_PLACING;
-
-                log_message(log, L_INFO, "now you can spawn boids on your areas");
-                log_message(log, L_INFO, "press ENTER when you will ready to start the game\n");
-            }
+                approved_player_id = 0;
             
-            break;
-            }
-        case SP_PLAYER_READY: {
-            /* PACKET FORMAT
-            [uint32 player_id]
-            */
-
-            const uint32_t expected_size = sizeof(uint32_t);
-            if (packet_size != expected_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                          packet_type, expected_size, packet_size);
-                ex = true;
                 break;
-            }
-
-            pthread_mutex_lock(&players_mtx);
-            uint32_t id = ntohl(*(uint32_t*)recv_buf);
-            int idx = get_player_idx(players, id);
-            players_ready[players[idx].team] = true;
-            log_message(log, L_INFO, "player '%s' is ready\n", players[idx].name);
-            pthread_mutex_unlock(&players_mtx);
+                }
+            case SP_PLAYER_EXIT: {
+                /* PACKET FORMAT
+                [uin32_t player_id]
+                */
             
-            break;
-            }
-        case SP_START_GAME: {
-            /* PACKET FORMAT
-            [uint16 boids_count] [ServerStartNetBoid[boids_count] boids]
-            */
+                const uint32_t expected_size = sizeof(uint32_t);
+                if (packet_size != expected_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                              packet_type, expected_size, packet_size);
+                    ex = true;
+                    break;
+                }
 
-            const uint32_t least_size = /*boids_count*/ sizeof(uint16_t);
-            if (packet_size < least_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
-                          packet_type, least_size, packet_size);
-                ex = true;
-                break;
-            }
+                uint32_t exited_player = ntohl(*(uint32_t*)recv_buf);
+
+                if (*stage == STAGE_AREAS && exited_player == approved_player_id) {
+                    log_message(log, L_DISCONNECT, "player '%s' disconnected\n", approved_player_username);
+                    approved_player_id = 0;
+
+                    pthread_mutex_lock(&input_mtx);
+                    get_input = false;
+                    typing_string_input = false;
+                    pthread_mutex_unlock(&input_mtx);
+                } else {
+                    int player_idx = get_player_idx(players, exited_player);
+                    log_message(log, L_DISCONNECT, "player '%s' disconnected\n", players[player_idx].name);
             
-            uint16_t recv_boids_count = ntohs(*(uint16_t*)recv_buf);
-            const uint32_t expected_size = sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid);
-            if (packet_size != expected_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                          packet_type, expected_size, packet_size);
-                ex = true;
-                break;
-            }
-
-            if (recv_boids_count != total_boids_number) {
-                log_message(log, L_ERROR, "invalid number of boids in SP#%d packet (expected %d boids, %d boids received)\n",
-                          packet_type, total_boids_number, recv_boids_count);
-                ex = true;
-                break;
-            }
-
-            ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(recv_buf + sizeof(recv_boids_count));
-
-            pthread_mutex_lock(&boids_mtx);
-            for (int i = 0; i < recv_boids_count; i++) {
-                ServerStartNetBoid recv_boid = recv_boids[i];
-                ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed/100.0f, .health = BOID_MAX_HEALTH, .xp = recv_boid.xp,
-                                             .team = recv_boid.team, .action = ACT_STOP},
-                                       .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
-                boids[i] = new_boid;
-            }
-            *boids_count = recv_boids_count;
-
-            // Reinit grid
-            init_grid(grid, boids, *boids_count, world->x, world->y, chunk_size);
-
-            pthread_mutex_unlock(&boids_mtx);
-
-            *mode = MODE_SELECT;
-            *stage = STAGE_GAME;
-            *select_mode = true;
-
-            log_message(log, L_INFO, "the game has started\n");
+                    // delete player from array
+                    pthread_mutex_lock(&players_mtx);
+                    memmove(players + player_idx, players + player_idx + 1,
+                            sizeof(players[0]) * (*joined_players - player_idx - 1));
+                    (*joined_players)--;
+                    pthread_mutex_unlock(&players_mtx);
+                }
             
-            break;
-            }
-        case SP_BOIDS_SYNC: {
-            /* PACKET FORMAT
-            [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
-            */
-
-            const uint32_t least_size = /*current_server_tps*/ 1 + /*boids_count*/ sizeof(uint16_t) + /*first_boid_index*/ sizeof(uint16_t);
-            if (packet_size < least_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
-                          packet_type, least_size, packet_size);
-                ex = true;
                 break;
-            }
+                }
+            case SP_START_PLACING:
+            case SP_SEND_AREAS: {
+                /* PACKET FORMAT
+                [uint16 areas_count] [Area[areas_count] areas]
+                */
             
-            BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(recv_buf+1));
-            const uint32_t expected_size = 1 + sizeof(uint16_t) + sizeof(uint16_t) + recv_boids_count*sizeof(NetBoid);
-            if (packet_size != expected_size) {
-                log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                          packet_type, expected_size, packet_size);
-                ex = true;
+                const uint32_t least_size = /*areas_count*/ sizeof(int16_t);
+                if (packet_size < least_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
+                              packet_type, least_size, packet_size);
+                    ex = true;
+                    break;
+                }
+            
+                uint16_t new_areas_count = ntohs(*(int16_t*)recv_buf);
+                const uint32_t expected_size = sizeof(new_areas_count) + new_areas_count*sizeof(Area);
+                if (packet_size != expected_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                              packet_type, expected_size, packet_size);
+                    ex = true;
+                    break;
+                }
+            
+                if (!new_room) {
+                    pthread_mutex_lock(&areas_mtx);
+                    *areas_count = new_areas_count;
+                    Area *a = (Area*)(recv_buf + sizeof(new_areas_count));
+                    for (int i = 0; i < *areas_count; i++) {
+                        areas[i].team = a->team;
+                        areas[i].rec.x1 = ntohs(a->rec.x1);
+                        areas[i].rec.x2 = ntohs(a->rec.x2);
+                        areas[i].rec.y1 = ntohs(a->rec.y1);
+                        areas[i].rec.y2 = ntohs(a->rec.y2);
+                        a++;
+                    }
+                    pthread_mutex_unlock(&areas_mtx);
+                }
+
+                if (packet_type == SP_START_PLACING) {
+                    *mode = MODE_SPAWN;
+                    *stage = STAGE_PLACING;
+
+                    log_message(log, L_INFO, "now you can spawn boids on your areas");
+                    log_message(log, L_INFO, "press ENTER when you will ready to start the game\n");
+                }
+            
                 break;
-            }
+                }
+            case SP_PLAYER_READY: {
+                /* PACKET FORMAT
+                [uint32 player_id]
+                */
 
-            *server_tps = *(uint8_t*)recv_buf;
-            BoidIndex boids_first_index = ntohs(*(BoidIndex*)(recv_buf+1+sizeof(BoidIndex)));
+                const uint32_t expected_size = sizeof(uint32_t);
+                if (packet_size != expected_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                              packet_type, expected_size, packet_size);
+                    ex = true;
+                    break;
+                }
 
-            NetBoid *recv_boids = (NetBoid*)(recv_buf + 1 + sizeof(recv_boids_count)*2);
+                pthread_mutex_lock(&players_mtx);
+                uint32_t id = ntohl(*(uint32_t*)recv_buf);
+                int idx = get_player_idx(players, id);
+                players_ready[players[idx].team] = true;
+                log_message(log, L_INFO, "player '%s' is ready\n", players[idx].name);
+                pthread_mutex_unlock(&players_mtx);
+            
+                break;
+                }
+            case SP_START_GAME: {
+                /* PACKET FORMAT
+                [uint16 boids_count] [ServerStartNetBoid[boids_count] boids]
+                */
 
-            pthread_mutex_lock(&boids_mtx);
-            for (int i = 0; i < recv_boids_count; i++) {
-                NetBoid *recv_boid = &recv_boids[i];
-                ClientBoid *boid = &boids[boids_first_index + i];
-                boid->b.health = recv_boid->health;
-                boid->b.xp = recv_boid->xp;
-                if (recv_boid->action == ACT_FALL || recv_boid->action == ACT_SURRENDER) {
-                    boid->is_selected = false;
-                    if ((recv_boid->action == ACT_FALL && boid->b.action != ACT_FALL) ||
-                        (recv_boid->action == ACT_SURRENDER && boid->b.action != ACT_SURRENDER))
-                        boid->sprite_timer = 0;
+                const uint32_t least_size = /*boids_count*/ sizeof(uint16_t);
+                if (packet_size < least_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
+                              packet_type, least_size, packet_size);
+                    ex = true;
+                    break;
+                }
+            
+                uint16_t recv_boids_count = ntohs(*(uint16_t*)recv_buf);
+                const uint32_t expected_size = sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid);
+                if (packet_size != expected_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                              packet_type, expected_size, packet_size);
+                    ex = true;
+                    break;
+                }
+
+                if (recv_boids_count != total_boids_number) {
+                    log_message(log, L_ERROR, "invalid number of boids in SP#%d packet (expected %d boids, %d boids received)\n",
+                              packet_type, total_boids_number, recv_boids_count);
+                    ex = true;
+                    break;
+                }
+
+                ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(recv_buf + sizeof(recv_boids_count));
+
+                pthread_mutex_lock(&boids_mtx);
+                for (int i = 0; i < recv_boids_count; i++) {
+                    ServerStartNetBoid recv_boid = recv_boids[i];
+                    ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed/100.0f, .health = BOID_MAX_HEALTH, .xp = recv_boid.xp,
+                                                 .team = recv_boid.team, .action = ACT_STOP},
+                                           .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
+                    boids[i] = new_boid;
+                }
+                *boids_count = recv_boids_count;
+
+                // Reinit grid
+                init_grid(grid, boids, *boids_count, world->x, world->y, chunk_size);
+
+                pthread_mutex_unlock(&boids_mtx);
+
+                *mode = MODE_SELECT;
+                *stage = STAGE_GAME;
+                *select_mode = true;
+
+                log_message(log, L_INFO, "the game has started\n");
+            
+                break;
+                }
+            case SP_BOIDS_SYNC: {
+                /* PACKET FORMAT
+                [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
+                */
+
+                const uint32_t least_size = /*current_server_tps*/ 1 + /*boids_count*/ sizeof(BoidIndex) + /*first_boid_index*/ sizeof(BoidIndex);
+                if (packet_size < least_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
+                              packet_type, least_size, packet_size);
+                    ex = true;
+                    break;
+                }
+            
+                BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(recv_buf+1));
+                const uint32_t expected_size = 1 + sizeof(BoidIndex) + sizeof(BoidIndex) + recv_boids_count*sizeof(NetBoid);
+                if (packet_size != expected_size) {
+                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
+                              packet_type, expected_size, packet_size);
+                    ex = true;
+                    break;
+                }
+
+                if (sync_proto == SYNC_PROTO_NONE) {
+                    if (recv_tcp) {
+                        sync_proto = SYNC_PROTO_TCP;
+                        log_message(log, L_DEBUG, "Using TCP as a protocol for boids sync\n");
+                    } else if (recv_udp) {
+                        sync_proto = SYNC_PROTO_UDP;
+                        log_message(log, L_DEBUG, "Using UDP as a protocol for boids sync\n");
+                    }
+                }
+
+                *server_tps = *(uint8_t*)recv_buf;
+                BoidIndex boids_first_index = ntohs(*(BoidIndex*)(recv_buf+1+sizeof(BoidIndex)));
+
+                NetBoid *recv_boids = (NetBoid*)(recv_buf + 1 + sizeof(recv_boids_count)*2);
+
+                pthread_mutex_lock(&boids_mtx);
+                for (int i = 0; i < recv_boids_count; i++) {
+                    NetBoid *recv_boid = &recv_boids[i];
+                    ClientBoid *boid = &boids[boids_first_index + i];
+                    boid->b.health = recv_boid->health;
+                    boid->b.xp = recv_boid->xp;
+                    if (recv_boid->action == ACT_FALL || recv_boid->action == ACT_SURRENDER) {
+                        boid->is_selected = false;
+                        if ((recv_boid->action == ACT_FALL && boid->b.action != ACT_FALL) ||
+                            (recv_boid->action == ACT_SURRENDER && boid->b.action != ACT_SURRENDER))
+                            boid->sprite_timer = 0;
+                        boid->b.action = recv_boid->action;
+                        continue;
+                    }
                     boid->b.action = recv_boid->action;
-                    continue;
+                    boid->target_pos = (Vector2){ntohs(recv_boid->x), ntohs(recv_boid->y)};
+                    boid->b.velocity.x = recv_boid->vel/255.0*BOID_MAX_SPEED * cos(recv_boid->angle/127.0*PI);
+                    boid->b.velocity.y = recv_boid->vel/255.0*BOID_MAX_SPEED * sin(recv_boid->angle/127.0*PI);
+                    // if (recv_boid->vel > 0 && !boid->b.is_fighting)
+                    //     boid->direction = boid->b.velocity;
+                    boid->go_target = true;
                 }
-                boid->b.action = recv_boid->action;
-                boid->target_pos = (Vector2){ntohs(recv_boid->x), ntohs(recv_boid->y)};
-                boid->b.velocity.x = recv_boid->vel/255.0*BOID_MAX_SPEED * cos(recv_boid->angle/127.0*PI);
-                boid->b.velocity.y = recv_boid->vel/255.0*BOID_MAX_SPEED * sin(recv_boid->angle/127.0*PI);
-                // if (recv_boid->vel > 0 && !boid->b.is_fighting)
-                //     boid->direction = boid->b.velocity;
-                boid->go_target = true;
-            }
 
-            // Update grid
-            clear_grid(grid);
-            fill_grid(grid, boids, *boids_count);
+                // Update grid
+                clear_grid(grid);
+                fill_grid(grid, boids, *boids_count);
 
-            pthread_mutex_unlock(&boids_mtx);
+                pthread_mutex_unlock(&boids_mtx);
 
-            break;
-            }
-        case SP_ROOM_CLOSED: {
-            log_message(log, L_INFO, "room closed\n");
-            ex = true;
+                break;
+                }
+            case SP_ROOM_CLOSED: {
+                log_message(log, L_INFO, "room closed\n");
+                ex = true;
             
-            break;
+                break;
+                }
             }
         }
 
-        free(recv_buf);
+        if (recv_tcp)
+            free(recv_buf);
 
         if (ex)
             break;
@@ -764,7 +838,7 @@ int main(int argc, char **argv) {
     BoidIndex boids_number[TEAMS_COUNT] = { 0 }, total_boids_number = 0;
     char *prog = argv[0], username[USERNAME_LEN] = DEFAULT_USERNAME , server[INET_ADDRSTRLEN] = DEFAULT_SERVER;
     Point world_size = {DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y};
-    unsigned short tcp_port = TCP_PORT;
+    unsigned short tcp_port = TCP_PORT, udp_port = UDP_PORT;
     int chunk_size = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS;
     
     if (argc < 2) {
@@ -806,6 +880,17 @@ int main(int argc, char **argv) {
 
                     char *endp;
                     tcp_port = strtoul(value_str, &endp, 10);
+                    if (*endp != '\0') {
+                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                    }
+                } else if (strcmp(arg, "--udp-port") == 0 || strcmp(arg, "-U") == 0) {
+                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
+
+                    char *value_str = *(++argv);
+                    argc--;
+
+                    char *endp;
+                    udp_port = strtoul(value_str, &endp, 10);
                     if (*endp != '\0') {
                         ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                     }
@@ -986,6 +1071,8 @@ int main(int argc, char **argv) {
                 "    Server's IP address (default: %s)\n"
                 "  -T, --tcp-server <NUM>\n"
                 "    TCP port of the game server (default: %d)\n"
+                "  -U, --udp-server <NUM>\n"
+                "    UDP port of the game server (default: %d)\n"
                 "  -n, --name <STR>\n"
                 "    Username (default: %s)\n"
                 "  -c, --chunk <NUM>\n"
@@ -1005,7 +1092,7 @@ int main(int argc, char **argv) {
                 "Examples:\n"
                 "  %s new --name bebob --world 1050x1050 -p2 r:30 b:40\n"
                 "  %s new -s 192.168.0.1 --chunk 525 -p4 r:b:1500 g:y:1000\n",
-                prog, DEFAULT_SERVER, TCP_PORT, DEFAULT_USERNAME, BOID_SIZE, DEFAULT_CLIENT_CHUNK_SIZE_PIXELS, DEFAULT_PLAYERS_COUNT, BOID_SIZE,
+                prog, DEFAULT_SERVER, TCP_PORT, UDP_PORT, DEFAULT_USERNAME, BOID_SIZE, DEFAULT_CLIENT_CHUNK_SIZE_PIXELS, DEFAULT_PLAYERS_COUNT, BOID_SIZE,
                 DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y, prog, prog);
         } else { // join
             printf(
@@ -1024,6 +1111,8 @@ int main(int argc, char **argv) {
                 "    Server's IP address (default: %s)\n"
                 "  -T, --tcp-server <NUM>\n"
                 "    TCP port of the game server (default: %d)\n"
+                "  -U, --udp-server <NUM>\n"
+                "    UDP port of the game server (default: %d)\n"
                 "  -n, --name <STR>\n"
                 "    Username (default: %s)\n"
                 "  -c, --chunk <NUM>\n"
@@ -1033,7 +1122,7 @@ int main(int argc, char **argv) {
                 "Examples:\n"
                 "  %s join --name glug -c 525 015dc2\n"
                 "  %s join -s 192.168.0.1 -T 1234 1012c4\n",
-                prog, DEFAULT_SERVER, TCP_PORT, DEFAULT_USERNAME, BOID_SIZE, DEFAULT_CLIENT_CHUNK_SIZE_PIXELS, prog, prog);
+                prog, DEFAULT_SERVER, TCP_PORT, UDP_PORT, DEFAULT_USERNAME, BOID_SIZE, DEFAULT_CLIENT_CHUNK_SIZE_PIXELS, prog, prog);
         }
 
         exit(0);
@@ -1060,18 +1149,11 @@ int main(int argc, char **argv) {
 
     printf("server %s:%d\n", server, tcp_port);
 
-    // printf("name: %s\n", username);
-    // if (new_room) {
-    //     printf("team: %s\n", player_team_name);
-        
-    //     printf("new room\n red\t: %-4d\n blue\t: %-4d\n green\t: %-4d\n yellow\t: %-4d\n",
-    //            boids_number[TEAM_RED],
-    //            boids_number[TEAM_BLUE],
-    //            boids_number[TEAM_GREEN],
-    //            boids_number[TEAM_YELLOW]);
-    // } else {
-    //     printf("room: %06x\n", room_id);
-    // }
+    #ifdef DEBUG
+        set_log_config(NULL, /*print_time=*/ false, /*stdout*/ L_DEBUG, /*file*/ L_DEBUG);
+    #else
+        set_log_config(NULL, /*print_time=*/ false, /*stdout*/ L_INFO, /*file*/ L_DEBUG);
+    #endif
 
     #ifdef _WIN32
         WSADATA ws_data;
@@ -1083,9 +1165,10 @@ int main(int argc, char **argv) {
     #endif
     
     // Create a TCP socket
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
+    bool tcp_opened = false;
+    tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_fd < 0) {
+        perror("socket SOCK_STREAM");
         return 1;
     }
 
@@ -1094,41 +1177,67 @@ int main(int argc, char **argv) {
     #else
         char opt = 1;
     #endif
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt))) {
+    if (setsockopt(tcp_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt))) {
         perror("setsockopt TCP_NODELAY");
-        close(fd);
-        #ifdef _WIN32
-            WSACleanup();
-        #endif
-        return 1;
+        goto tcp_fail;
     }
 
-    struct sockaddr_in servaddr;
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(tcp_port);
-    socklen_t addrlen = sizeof(servaddr);
+    struct sockaddr_in tcp_servaddr = { 0 };
+    tcp_servaddr.sin_family = AF_INET;
+    tcp_servaddr.sin_port = htons(tcp_port);
+    socklen_t tcp_addrlen = sizeof(tcp_servaddr);
 
     // Convert IPv4 and IPv6 addresses from text to binary form
-    if (inet_pton(AF_INET, server, &servaddr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, server, &tcp_servaddr.sin_addr) <= 0) {
         perror("Invalid address / Address not supported");
-        close(fd);
-        #ifdef _WIN32
-            WSACleanup();
-        #endif
-        return 1;
+        goto tcp_fail;
     }
 
-    int status = connect(fd, (struct sockaddr*)&servaddr, addrlen);
-    if (status < 0) {
+    if (connect(tcp_fd, (struct sockaddr*)&tcp_servaddr, tcp_addrlen) < 0) {
         perror("connect");
-        close(fd);
-        #ifdef _WIN32
-            WSACleanup();
-        #endif
-        return 1;
+        goto tcp_fail;
     }
 
-    set_log_config(NULL, /*print_time=*/ false, /*stdout*/ L_INFO, /*file*/ L_DEBUG);
+    write_log(L_DEBUG, "opened a TCP socket to %s:%d\n", server, tcp_port);
+    tcp_opened = true;
+
+    tcp_fail: {
+        if (!tcp_opened) {
+            write_log(L_ERROR, "failed to open a TCP socket to %s:%d\n", server, tcp_port);
+            close(tcp_fd);
+            #ifdef _WIN32
+                WSACleanup();
+            #endif
+            return 1;
+        }
+    }
+
+    // Create a UDP socket
+    udp_opened = false;
+    udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd < 0) {
+        perror("socket SOCK_DGRAM");
+        goto udp_fail;
+   }
+
+    udp_servaddr.sin_family = AF_INET;
+    udp_servaddr.sin_port = htons(udp_port);
+
+    // Convert IPv4 and IPv6 addresses from text to binary form
+    if (inet_pton(AF_INET, server, &udp_servaddr.sin_addr) <= 0) {
+        perror("Invalid address / Address not supported");
+        goto udp_fail;
+    }
+
+    write_log(L_DEBUG, "opened a UDP socket to %s:%d\n", server, udp_port);
+    udp_opened = true;
+
+    udp_fail: {
+        if (!udp_opened) {
+            write_log(L_WARNING, "failed to open a UDP socket to %s:%d\n", server, udp_port);
+            close(udp_fd);
+        }
+    }
 
     // Join/new room request
     SPJoined recv_data;
@@ -1140,17 +1249,17 @@ int main(int argc, char **argv) {
         strncpy(data.creator, username, USERNAME_LEN);
         data.creator[USERNAME_LEN-1] = '\0';
 
-        send_packet(fd, CP_NEW_ROOM, &data, sizeof(data), 0);
+        send_packet(tcp_fd, CP_NEW_ROOM, &data, sizeof(data), 0);
 
         uint8_t packet_type;
-        recv(fd, &packet_type, 1, 0);
+        recv(tcp_fd, &packet_type, 1, 0);
         if (packet_type != SP_JOIN_PLAYER) {
             write_log(L_INFO, "unable to create a room\n");
             return 1;
         }
         
         uint32_t data_len;
-        recv_packet(fd, &recv_data, &data_len, 0);
+        recv_packet(tcp_fd, &recv_data, &data_len, 0);
         if (data_len != sizeof(SPJoined) || recv_data.status != JOIN_OK) {
             write_log(L_INFO, "unable to create a room\n");
             return 1;
@@ -1160,17 +1269,17 @@ int main(int argc, char **argv) {
         strncpy(data.username, username, USERNAME_LEN);
         data.username[USERNAME_LEN-1] = '\0';
 
-        send_packet(fd, CP_JOIN_ROOM, &data, sizeof(data), 0);
+        send_packet(tcp_fd, CP_JOIN_ROOM, &data, sizeof(data), 0);
 
         uint8_t packet_type;
-        recv(fd, &packet_type, 1, 0);
+        recv(tcp_fd, &packet_type, 1, 0);
         if (packet_type != SP_JOIN_PLAYER) {
             write_log(L_INFO, "unable to join to the room\n");
             return 1;
         }
         
         uint32_t data_len;
-        recv_packet(fd, &recv_data, &data_len, 0);
+        recv_packet(tcp_fd, &recv_data, &data_len, 0);
         if (data_len != sizeof(SPJoined) || recv_data.status == JOIN_FAILED) {
             write_log(L_INFO, "unable to join to the room\n");
             return 1;
@@ -1209,21 +1318,47 @@ int main(int argc, char **argv) {
         team_used[i] = boids > 0;
     }
 
-    // Make socket nonblocking
+    if (udp_opened) {
+        uint32_t player_id = recv_data.player_id; // LE
+        sendto_packet(udp_fd, CP_UDP_HELLO, &player_id, sizeof(player_id), 0, (struct sockaddr*)&udp_servaddr, sizeof(udp_servaddr));
+    }
+
+    // Make sockets nonblocking
     #ifdef _WIN32
         u_long flag = 1;
-        if (ioctlsocket(fd, FIONBIO, &flag) != 0) {
+        if (ioctlsocket(tcp_fd, FIONBIO, &flag) != 0) {
+            write_log(L_ERROR, "failed to make a TCP socket nonblocking\n");
             perror("ioctlsocket FIONBIO");
-            close(fd);
+            close(tcp_fd);
+            if (udp_opened)
+                close(udp_fd);
             WSACleanup();
             return 1;
         }
+        if (udp_opened && ioctlsocket(udp_fd, FIONBIO, &flag) != 0) {
+            write_log(L_WARNING, "failed to make a UDP socket nonblocking\n");
+            perror("ioctlsocket FIONBIO");
+            close(udp_fd);
+            udp_opened = false;
+        }
     #else
-        int flags = fcntl(fd, F_GETFL, 0);
-        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        int flags = fcntl(tcp_fd, F_GETFL, 0);
+        if (fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            write_log(L_ERROR, "failed to make a TCP socket nonblocking\n");
             perror("fcntl O_NONBLOCK");
-            close(fd);
+            close(tcp_fd);
+            if (udp_opened)
+                close(udp_fd);
             return 1;
+        }
+        if (udp_opened) {
+            int flags = fcntl(udp_fd, F_GETFL, 0);
+            if (fcntl(udp_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+                write_log(L_ERROR, "failed to make a UDP socket nonblocking\n");
+                perror("fcntl O_NONBLOCK");
+                close(udp_fd);
+                udp_opened = false;
+            }
         }
     #endif
 
@@ -1322,7 +1457,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&areas_mtx, NULL);
     pthread_mutex_init(&boids_mtx, NULL);
     pthread_mutex_init(&players_mtx, NULL);
-    NetThreadArgs thread_args = {.fd = fd, .players_number = players_number, .joined_players = &joined_players, .chunk_size = chunk_size,
+    NetThreadArgs thread_args = {.players_number = players_number, .joined_players = &joined_players, .chunk_size = chunk_size,
                                  .new_room = new_room, .select_mode = &select_mode, .players_ready = players_ready, .world_size = &world_size,
                                  .boids_number = boids_number, .boids_count = &boids_count, .total_boids_number = total_boids_number,
                                  .server_tps = &server_tps, .players = players, .log = &log, .grid = &grid, .areas_count = &areas_count,
@@ -1514,7 +1649,7 @@ int main(int argc, char **argv) {
                     cleanup_areas(areas, &areas_count);
 
                     if (!hide_areas)
-                        send_areas(fd, CP_SEND_AREAS, areas, areas_count);
+                        send_areas(tcp_fd, CP_SEND_AREAS, areas, areas_count);
 
                     pthread_mutex_unlock(&areas_mtx);
                 }
@@ -1534,7 +1669,7 @@ int main(int argc, char **argv) {
                 // Send data to the server only if size of areas of all teams is greater than or equal to the number of boids
                 if (ok) {
                     pthread_mutex_lock(&areas_mtx);
-                    send_areas(fd, CP_START_PLACING, areas, areas_count);
+                    send_areas(tcp_fd, CP_START_PLACING, areas, areas_count);
                     pthread_mutex_unlock(&areas_mtx);
                     
                 } else {
@@ -1762,7 +1897,7 @@ int main(int argc, char **argv) {
                     memcpy(buf, &ncount, sizeof(count));
                     memcpy(buf+sizeof(count), data, count * sizeof(*data));
 
-                    send_packet(fd, CP_SEND_BOIDS, buf, bufsize, 0);
+                    send_packet(tcp_fd, CP_SEND_BOIDS, buf, bufsize, 0);
                     log_message(&log, L_INFO, "wait until other players are ready to start the game\n");
 
                     free(data);
@@ -1959,7 +2094,7 @@ int main(int argc, char **argv) {
                 *(BoidIndex*)(data + (packet_size - base_packet_size + 1)) = htons(selected_boids_count);
                 memcpy(data + (packet_size - base_packet_size + 1 + sizeof(BoidIndex)), selected_boids, sizeof(BoidIndex)*selected_boids_count);
 
-                send_packet(fd, CP_ORDER, data, packet_size, 0);
+                send_packet(tcp_fd, CP_ORDER, data, packet_size, 0);
                 free(data);
             }
 
@@ -2252,7 +2387,9 @@ int main(int argc, char **argv) {
     }
 
     // Close socket
-    close(fd);
+    close(tcp_fd);
+    if (udp_opened)
+        close(udp_fd);
     #ifdef _WIN32
         WSACleanup();
     #endif

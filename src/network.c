@@ -57,6 +57,32 @@ int send_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags)
     return res;
 }
 
+// sendto analog for send_packet
+int sendto_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags, struct sockaddr *addr, socklen_t addrlen) {
+    uint32_t total_len = 1 + sizeof(len) + len;
+
+    uint8_t *buffer = NULL;
+    uint8_t stack_buffer[MAX_STACK_SEND_BUFFER_SIZE];
+    bool use_heap = total_len > MAX_STACK_SEND_BUFFER_SIZE;
+    if (use_heap) {
+        buffer = malloc(total_len);
+    } else {
+        buffer = stack_buffer;
+    }
+    
+    buffer[0] = packet_type;
+    uint32_t nlen = htonl(len);
+    memcpy(buffer+1, &nlen, sizeof(nlen));
+    if (len > 0)
+        memcpy(buffer+1+sizeof(nlen), buf, len);
+
+    int res = sendto(fd, buffer, total_len, flags, addr, addrlen);
+    
+    if (use_heap) free(buffer);
+
+    return res;
+}
+
 // Receive n bytes to buf
 int recv_all(int fd, void *buf, size_t n, int flags) {
     if (n == 0) return 0;

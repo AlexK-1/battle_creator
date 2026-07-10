@@ -35,7 +35,7 @@ void set_log_config(FILE *log_file, bool print_time, LogType stdout_log_level, L
 // Write a log message to console/file
 void write_log(LogType type, const char *format, ...) {
     if (type == L_NONE) return;
-    if (type < conf.stdout_log_level && type < conf.file_log_level) return;
+    if (type < conf.stdout_log_level && type < conf.file_log_level && conf.log_file != NULL) return;
 
     char buf[MAX_LOG_MESSAGE_LEN];
     

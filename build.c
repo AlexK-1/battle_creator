@@ -37,7 +37,7 @@
 
 #define CFLAGS_COMMON "-std=c99 -Wall "
 #ifdef DEBUG
-    #define CFLAGS CFLAGS_COMMON "-Wextra -pedantic -g -fsanitize=address "
+    #define CFLAGS CFLAGS_COMMON "-Wextra -pedantic -g -fsanitize=address -DDEBUG "
 #else
     #define CFLAGS CFLAGS_COMMON "-O2 "
 #endif

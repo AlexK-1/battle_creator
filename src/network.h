@@ -1,3 +1,8 @@
+#ifndef _WIN32
+    #include <sys/socket.h>
+#else
+    #include "winsupport.h"
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #include "boids.h"
@@ -56,6 +61,7 @@ typedef enum {
 
 typedef enum {
     CP_CLOSE,
+    CP_UDP_HELLO, // First client->server UDP packet
     CP_NEW_ROOM, // Create new room
     CP_JOIN_ROOM, // Join to the room
     CP_APPROVE_PLAYER, // Approve/reject new player
@@ -110,6 +116,7 @@ typedef struct {
 
 int send_all(int fd, void *buf, size_t n, int flags); // Send n bytes from buf
 int send_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags); // Send packet_type + len + buf
+int sendto_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags, struct sockaddr *addr, socklen_t addrlen); // sendto analog for send_packet
 int recv_all(int fd, void *buf, size_t n, int flags); // Receive n bytes to buf
 int recv_packet(int fd, void *buf, uint32_t *len, int flags); // Receive len + buf
 
