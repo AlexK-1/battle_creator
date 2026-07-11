@@ -18,6 +18,14 @@ typedef enum {
 
 extern const char *log_prefixes[];
 
+typedef struct {
+    FILE *log_file;
+    bool print_time;
+    LogType stdout_log_level, file_log_level;
+} LogConfig;
+
+extern LogConfig log_conf;
+
 void set_log_config(FILE *log_file, bool print_time, LogType stdout_log_level, LogType file_log_level);
 void write_log(LogType type, const char *format, ...);
 

@@ -19,23 +19,19 @@ const char *log_prefixes[] = {
     [L_NONE] = ""
 };
 
-struct log_config {
-    FILE *log_file;
-    bool print_time;
-    LogType stdout_log_level, file_log_level;
-} conf = {.print_time = false, .log_file = NULL, .stdout_log_level = L_INFO, .file_log_level = L_DEBUG};
+LogConfig log_conf = {.print_time = false, .log_file = NULL, .stdout_log_level = L_INFO, .file_log_level = L_DEBUG};
 
 void set_log_config(FILE *log_file, bool print_time, LogType stdout_log_level, LogType file_log_level) {
-    conf.log_file = log_file;
-    conf.print_time = print_time;
-    conf.stdout_log_level = stdout_log_level;
-    conf.file_log_level = file_log_level;
+    log_conf.log_file = log_file;
+    log_conf.print_time = print_time;
+    log_conf.stdout_log_level = stdout_log_level;
+    log_conf.file_log_level = file_log_level;
 }
 
 // Write a log message to console/file
 void write_log(LogType type, const char *format, ...) {
     if (type == L_NONE) return;
-    if (type < conf.stdout_log_level && type < conf.file_log_level && conf.log_file != NULL) return;
+    if (type < log_conf.stdout_log_level && type < log_conf.file_log_level && log_conf.log_file != NULL) return;
 
     char buf[MAX_LOG_MESSAGE_LEN];
     
@@ -56,9 +52,9 @@ void write_log(LogType type, const char *format, ...) {
     vsnprintf(msg_text, sizeof(buf) - (msg_text - buf), format, args);
     va_end(args);
 
-    if (conf.log_file != NULL && type >= conf.file_log_level)
-        fprintf(conf.log_file, "%s", buf);
-    if (type >= conf.stdout_log_level)
-        printf("%s", conf.print_time ? buf : msg_type+2);
+    if (log_conf.log_file != NULL && type >= log_conf.file_log_level)
+        fprintf(log_conf.log_file, "%s", buf);
+    if (type >= log_conf.stdout_log_level)
+        printf("%s", log_conf.print_time ? buf : msg_type+2);
 }
 

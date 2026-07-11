@@ -80,7 +80,7 @@ void log_message(Log *log, LogType type, const char *format, ...) {
     // Write to console/file
     write_log(type, buf.string);
 
-    if (log->items != NULL) {
+    if (log->items != NULL && type >= log_conf.stdout_log_level) { // log_conf from logging.h
         // Count lines in message
         char *c = buf.string;
         while (*c != '\0') {
@@ -92,6 +92,7 @@ void log_message(Log *log, LogType type, const char *format, ...) {
             buf.lines++;
         }
 
+        // Push the message to the log displayed in the game window
         pthread_mutex_lock(&log_mtx);
         cstack_push(*log, buf);
         pthread_mutex_unlock(&log_mtx);
@@ -1319,8 +1320,14 @@ int main(int argc, char **argv) {
     }
 
     if (udp_opened) {
-        uint32_t player_id = recv_data.player_id; // LE
-        sendto_packet(udp_fd, CP_UDP_HELLO, &player_id, sizeof(player_id), 0, (struct sockaddr*)&udp_servaddr, sizeof(udp_servaddr));
+        /* PACKET FORMAT
+        [uint32 player_id] [int32_t player_tcp_fd]
+        */
+        char buf[sizeof(uint32_t) + sizeof(int32_t)];
+        *(uint32_t*)(buf) = recv_data.player_id;
+        *(int32_t*)(buf+sizeof(uint32_t)) = recv_data.player_tcp_fd;
+
+        sendto_packet(udp_fd, CP_UDP_HELLO, buf, sizeof(buf), 0, (struct sockaddr*)&udp_servaddr, sizeof(udp_servaddr));
     }
 
     // Make sockets nonblocking

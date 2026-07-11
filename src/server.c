@@ -553,9 +553,9 @@ void process_data(Player *p) {
                room->teams[TEAM_GREEN],
                room->teams[TEAM_YELLOW]);
 
-        SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(p->id), .players_number = room->players_number,
-                              .joined_players = room->joined_players, .player_team = p->team, .server_target_tps = tps,
-                              .world_size = data.world_size, .status = JOIN_OK};
+        SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(p->id), .player_tcp_fd = htonl(p->tcp_fd),
+                              .players_number = room->players_number, .joined_players = room->joined_players, .player_team = p->team,
+                              .server_target_tps = tps, .world_size = data.world_size, .status = JOIN_OK};
 
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i]; // other_player
@@ -654,9 +654,9 @@ void process_data(Player *p) {
             Room *room = p->room;
             room->players[room->joined_players++] = approved_player;
 
-            SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(approved_player->id), .players_number = room->players_number,
-                                  .joined_players = room->joined_players, .player_team = approved_player->team, .server_target_tps = tps,
-                                  .world_size = {htons(room->world.x), htons(room->world.y)}, .status = JOIN_OK};
+            SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(approved_player->id), .player_tcp_fd = htonl(approved_player->tcp_fd),
+                                  .players_number = room->players_number, .joined_players = room->joined_players, .player_team = approved_player->team,
+                                  .server_target_tps = tps, .world_size = {htons(room->world.x), htons(room->world.y)}, .status = JOIN_OK};
 
             for (int i = 0; i < room->joined_players; i++) {
                 Player *op = room->players[i]; // other_player
@@ -1375,7 +1375,7 @@ int main(int argc, char **argv) {
                     int flags = fcntl(client_fd, F_GETFL, 0);
                     fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
 
-                    if (client_fd > max_fd) {
+                    if (client_fd >= max_fd) {
                         close(client_fd);
                         continue;
                     }
@@ -1398,7 +1398,7 @@ int main(int argc, char **argv) {
                         close(client_fd);
                     }
                 }
-            } else if (fd == udp_fd) {
+            } else if (fd == udp_fd && udp_opened) {
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
 
@@ -1418,24 +1418,23 @@ int main(int argc, char **argv) {
 
                 if (packet_type == CP_UDP_HELLO) {
                     /* PACKET FORMAT
-                    [uint32 player_id]
+                    [uint32 player_id] [int32_t player_tcp_fd]
                     */
 
-                    if (packet_size != sizeof(uint32_t))
+                    if (packet_size != sizeof(uint32_t)*2)
                         continue;
-                    uint32_t player_id = ntohl(*(uint32_t*)data);
+                    uint32_t player_id = ntohl(*(uint32_t*)(data));
+                    int32_t player_tcp_fd = ntohl(*(int32_t*)(data+sizeof(uint32_t)));
 
-                    Player *p = NULL;
-                    for (long i = 0; i < max_fd; i++) {
-                        if (players[i] != NULL && players[i]->id == player_id) {
-                            p = players[i];
-                            break;
-                        }
-                    }
+                    if (player_tcp_fd >= max_fd)
+                        continue;
 
-                    if (p != NULL) {
+                    Player *p = players[player_tcp_fd];
+
+                    if (p != NULL && p->id == player_id && !p->udp_enabled) {
                         p->udp_addr = client_addr;
                         p->udp_enabled = true;
+                        write_log(L_INFO, "id=%d enabled UDP sync\n", p->id);
                     }
                 }
             } else if (events[i].data.fd == STDIN_FILENO) {
