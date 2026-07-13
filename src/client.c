@@ -150,15 +150,9 @@ typedef enum {
     MODE_LINE
 } GameMode;
 
-typedef enum {
-    STAGE_AREAS,
-    STAGE_PLACING,
-    STAGE_GAME
-} GameStage;
-
 typedef struct {
     int players_number, *joined_players, chunk_size;
-    bool new_room, *select_mode, *players_ready;
+    bool new_room, *select_mode;
     Point *world_size;
     BoidIndex *boids_number, *boids_count, total_boids_number;
     uint8_t *server_tps;
@@ -169,7 +163,7 @@ typedef struct {
     Area *areas;
     ClientBoid *boids;
     GameMode *mode;
-    GameStage *stage;
+    RoomStage *stage;
 } NetThreadArgs;
 
 pthread_mutex_t areas_mtx;
@@ -197,9 +191,8 @@ void *net_thread_fn(void *args) {
     uint8_t *server_tps = nargs->server_tps;
     Grid *grid = nargs->grid;
     ClientBoid *boids = nargs->boids;
-    bool *players_ready = nargs->players_ready;
     GameMode *mode = nargs->mode;
-    GameStage *stage = nargs->stage;
+    RoomStage *stage = nargs->stage;
 
     uint32_t approved_player_id = 0;
     char approved_player_username[USERNAME_LEN];
@@ -410,7 +403,7 @@ void *net_thread_fn(void *args) {
                 pthread_mutex_unlock(&players_mtx);
                 log_message(log, L_JOIN, "new player '%s' - %s\n", new_player->name, get_team_name(new_player->team));
 
-                if (new_room && players_number == *joined_players) {
+                if (new_room && players_number == *joined_players && *stage == STAGE_AREAS) {
                     log_message(log, L_INFO, "press ENTER to start placing boids\n");
                 }
                 approved_player_id = 0;
@@ -432,7 +425,7 @@ void *net_thread_fn(void *args) {
 
                 uint32_t exited_player = ntohl(*(uint32_t*)recv_buf);
 
-                if (*stage == STAGE_AREAS && exited_player == approved_player_id) {
+                if ((*stage == STAGE_AREAS || *stage == STAGE_PLACING) && exited_player == approved_player_id) {
                     log_message(log, L_DISCONNECT, "player '%s' disconnected\n", approved_player_username);
                     approved_player_id = 0;
 
@@ -518,7 +511,7 @@ void *net_thread_fn(void *args) {
                 pthread_mutex_lock(&players_mtx);
                 uint32_t id = ntohl(*(uint32_t*)recv_buf);
                 int idx = get_player_idx(players, id);
-                players_ready[players[idx].team] = true;
+                players[players[idx].team].ready = true;
                 log_message(log, L_INFO, "player '%s' is ready\n", players[idx].name);
                 pthread_mutex_unlock(&players_mtx);
             
@@ -1301,14 +1294,19 @@ int main(int argc, char **argv) {
     world_size.y = ntohs(recv_data.world_size.y);
     int server_target_tps = recv_data.server_target_tps;
     
+    RoomStage stage = recv_data.room_stage;
+    GameMode mode;
+    if (stage == STAGE_AREAS)
+        mode = new_room ? MODE_AREAS : MODE_WAIT;
+    else
+        mode = MODE_SPAWN;
+    
+    bool team_used[TEAMS_COUNT] = { 0 };
     ClientPlayer players[TEAMS_COUNT] = { 0 };
     for (int i = 0; i < joined_players; i++) {
         memcpy(&players[i], &recv_data.players[i], sizeof(ClientPlayer));
         players[i].id = ntohl(players[i].id);
     }
-
-    bool team_used[TEAMS_COUNT] = { 0 };
-    bool players_ready[TEAMS_COUNT] = { 0 };
 
     total_boids_number = 0;
     for (int i = 0; i < TEAMS_COUNT; i++) {
@@ -1402,8 +1400,6 @@ int main(int argc, char **argv) {
     SetTargetFPS(60);
 
     // Control
-    GameMode mode = new_room ? MODE_AREAS : MODE_WAIT;
-    GameStage stage = STAGE_AREAS;
     bool show_log = true, show_grid = false, show_health = false, delete_boids = false;
     int brush_size = 1;
     BoidAction action = ACT_STOP;
@@ -1465,7 +1461,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&boids_mtx, NULL);
     pthread_mutex_init(&players_mtx, NULL);
     NetThreadArgs thread_args = {.players_number = players_number, .joined_players = &joined_players, .chunk_size = chunk_size,
-                                 .new_room = new_room, .select_mode = &select_mode, .players_ready = players_ready, .world_size = &world_size,
+                                 .new_room = new_room, .select_mode = &select_mode, .world_size = &world_size,
                                  .boids_number = boids_number, .boids_count = &boids_count, .total_boids_number = total_boids_number,
                                  .server_tps = &server_tps, .players = players, .log = &log, .grid = &grid, .areas_count = &areas_count,
                                  .areas = areas, .boids = boids, .mode = &mode, .stage = &stage};
@@ -1550,44 +1546,6 @@ int main(int argc, char **argv) {
             camera.target = Vector2Add(camera.target, delta);
         }
 
-        // Get string input from keyboard
-        pthread_mutex_lock(&input_mtx);
-        if (show_log && get_input) {
-            if (!typing_string_input) {
-                // Input starts with SPACE
-                if (IsKeyPressed(KEY_SPACE)) {
-                    typing_string_input = true;
-                    input_len = 0;
-                    input_string[0] = '\0';
-                }
-            } else {
-                // Input ends with ENTER
-                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-                    typing_string_input = false;
-                    log_message(&log, L_INPUT, input_string);
-
-                    get_input = false;
-                    input_received = true;
-                } else {
-                    int key = GetCharPressed();
-                    while (key > 0) {
-                        // Only allow keys in range [32..125]
-                        if ((key >= 32) && (key <= 125) && (input_len < INPUT_STRING_LEN)) {
-                            input_string[input_len++] = (char)key;
-                            input_string[input_len] = '\0';
-                        }
-                        key = GetCharPressed();
-                    }
-                    if (IsKeyPressed(KEY_BACKSPACE)) {
-                        input_len--;
-                        if (input_len < 0) input_len = 0;
-                        input_string[input_len] = '\0';
-                    }
-                }
-            }
-        }
-        pthread_mutex_unlock(&input_mtx);
-        
         // Areas mode
         if (mode == MODE_AREAS) {
             // Selecting
@@ -1914,6 +1872,44 @@ int main(int argc, char **argv) {
                 }
             }
         }
+
+        // Get string input from keyboard
+        pthread_mutex_lock(&input_mtx);
+        if (show_log && get_input) {
+            if (!typing_string_input) {
+                // Input starts with SPACE
+                if (IsKeyPressed(KEY_SPACE)) {
+                    typing_string_input = true;
+                    input_len = 0;
+                    input_string[0] = '\0';
+                }
+            } else {
+                // Input ends with ENTER
+                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+                    typing_string_input = false;
+                    log_message(&log, L_INPUT, input_string);
+
+                    get_input = false;
+                    input_received = true;
+                } else {
+                    int key = GetCharPressed();
+                    while (key > 0) {
+                        // Only allow keys in range [32..125]
+                        if ((key >= 32) && (key <= 125) && (input_len < INPUT_STRING_LEN)) {
+                            input_string[input_len++] = (char)key;
+                            input_string[input_len] = '\0';
+                        }
+                        key = GetCharPressed();
+                    }
+                    if (IsKeyPressed(KEY_BACKSPACE)) {
+                        input_len--;
+                        if (input_len < 0) input_len = 0;
+                        input_string[input_len] = '\0';
+                    }
+                }
+            }
+        }
+        pthread_mutex_unlock(&input_mtx);
 
         // Select boids
         if (mode == MODE_SELECT) {
@@ -2376,16 +2372,19 @@ int main(int argc, char **argv) {
                 } else if (stage == STAGE_PLACING) {
                     if (team == (signed)player_team) {
                         str = (char*)TextFormat("%s: %d (%d left) %s", players[player_idx].name, boids_count, boids_number[team]-boids_count,
-                                                players_ready[team]? "ready" : "");
+                                                players[team].ready? "ready" : "");
                     } else {
-                        str = (char*)TextFormat("%s: - %s", players[player_idx].name, players_ready[team]? "(ready)" : "");
+                        if (player_joined)
+                            str = (char*)TextFormat("%s: - %s", players[player_idx].name, players[team].ready? "(ready)" : "");
+                        else
+                            str = "- : -";
                     }
                 } else if (stage == STAGE_GAME) {
                     str = (char*)TextFormat("%s: %d", players[player_idx].name, boids_number[team]);
                 }
 
                 if (str != NULL)
-                    DrawText(str, 10, 40 + (l++)*20, 20, team_color);
+                    DrawText(str, 10, 40 + (l++)*22, 20, team_color);
             }
             pthread_mutex_unlock(&players_mtx);
 

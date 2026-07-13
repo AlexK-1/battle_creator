@@ -84,6 +84,7 @@ typedef struct {
 typedef struct {
     uint32_t id;
     int8_t team;
+    uint8_t ready;
     char name[USERNAME_LEN];
 } ClientPlayer;
 
@@ -100,7 +101,7 @@ typedef struct {
     Point world_size;
     ClientPlayer players[TEAMS_COUNT];
     BoidIndex teams[TEAMS_COUNT];
-    uint8_t status;
+    uint8_t status, room_stage;
 } SPJoined;
 
 typedef struct {
@@ -114,6 +115,12 @@ typedef struct {
     uint32_t room_id;
     char username[USERNAME_LEN];
 } CPJoin;
+
+typedef enum {
+    STAGE_AREAS,
+    STAGE_PLACING,
+    STAGE_GAME
+} RoomStage;
 
 int send_all(int fd, void *buf, size_t n, int flags); // Send n bytes from buf
 int send_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags); // Send packet_type + len + buf

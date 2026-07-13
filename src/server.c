@@ -97,11 +97,7 @@ typedef struct Room {
     pthread_mutex_t boids_mtx, players_mtx;
     Area areas[MAX_AREAS_COUNT];
     uint16_t areas_count;
-    enum {
-        ROOM_AREAS,
-        ROOM_PLACING,
-        ROOM_GAME
-    } status;
+    RoomStage stage;
 } Room;
 
 /* V global variables V */
@@ -137,7 +133,7 @@ static inline int random_value(int min, int max) {
 void close_client(int);
 
 void close_room(Room *room) {
-    if (room->status == ROOM_GAME && room->thread_run) {
+    if (room->stage == STAGE_GAME && room->thread_run) {
         room->thread_run = false;
         pthread_join(room->thread, NULL);
     }
@@ -187,9 +183,9 @@ void close_client(int fd) {
         pthread_mutex_unlock(&room->players_mtx);
 
         last_room_idx = ((room->id & 0xffff0000) >> 16);
-        if ((room->status == ROOM_AREAS && player_idx == 0) || // room's creator disconnected
-            (room->status == ROOM_PLACING) ||
-            (room->status == ROOM_GAME && room->joined_players == 1)) {
+        if ((room->stage == STAGE_AREAS   && player_idx == 0) || // room's creator disconnected
+            (room->stage == STAGE_PLACING && player_idx == 0) || // room's creator disconnected
+             room->joined_players == 1) { // last player disconnected
             close_room(room); // close entire room
             room_closed = true;
         } else {
@@ -526,7 +522,7 @@ void process_data(Player *p) {
         room->hide_areas = data.hide_areas;
         for (int j = 0; j < TEAMS_COUNT; j++)
             room->teams[j] = ntohs(data.boids_number[j]);
-        room->status = ROOM_AREAS;
+        room->stage = STAGE_AREAS;
         rooms[last_room_idx] = room;
         p->room = room;
 
@@ -555,11 +551,11 @@ void process_data(Player *p) {
 
         SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(p->id), .player_tcp_fd = htonl(p->tcp_fd),
                               .players_number = room->players_number, .joined_players = room->joined_players, .player_team = p->team,
-                              .server_target_tps = tps, .world_size = data.world_size, .status = JOIN_OK};
+                              .server_target_tps = tps, .world_size = data.world_size, .room_stage = STAGE_AREAS, .status = JOIN_OK};
 
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i]; // other_player
-            send_data.players[i] = (ClientPlayer){.id = htonl(op->id), .team = op->team};
+            send_data.players[i] = (ClientPlayer){.id = htonl(op->id), .team = op->team, .ready = op->ready};
             strcpy(send_data.players[i].name, op->name);
         }
 
@@ -590,7 +586,8 @@ void process_data(Player *p) {
         }
         
         Room *room = rooms[room_idx];
-        if ((room != NULL) && (room->id == data.room_id) && (room->joined_players < room->players_number) && (room->status == ROOM_AREAS)) {
+        if ((room != NULL) && (room->id == data.room_id) && (room->joined_players < room->players_number) &&
+            (room->stage == STAGE_AREAS || room->stage == STAGE_PLACING)) {
             strcpy(p->name, data.username);
 
             Player *room_owner = room->players[0];
@@ -656,11 +653,12 @@ void process_data(Player *p) {
 
             SPJoined send_data = {.room_id = htonl(room->id), .player_id = htonl(approved_player->id), .player_tcp_fd = htonl(approved_player->tcp_fd),
                                   .players_number = room->players_number, .joined_players = room->joined_players, .player_team = approved_player->team,
-                                  .server_target_tps = tps, .world_size = {htons(room->world.x), htons(room->world.y)}, .status = JOIN_OK};
+                                  .server_target_tps = tps, .world_size = {htons(room->world.x), htons(room->world.y)}, .room_stage = room->stage,
+                                  .status = JOIN_OK};
 
             for (int i = 0; i < room->joined_players; i++) {
                 Player *op = room->players[i]; // other_player
-                send_data.players[i] = (ClientPlayer){.id = htonl(op->id), .team = op->team};
+                send_data.players[i] = (ClientPlayer){.id = htonl(op->id), .team = op->team, .ready = op->ready};
                 strcpy(send_data.players[i].name, op->name);
             }
 
@@ -732,7 +730,7 @@ void process_data(Player *p) {
         
         if (p->net.data_len < sizeof(int16_t) || room->players[0]->tcp_fd != p->tcp_fd ||
             (room->joined_players != room->players_number && package_type == CP_START_PLACING) ||
-            room->status != ROOM_AREAS)
+            room->stage != STAGE_AREAS)
             break;
 
         uint16_t areas_count = ntohs(*(int16_t*)p->net.data_buf);
@@ -761,7 +759,7 @@ void process_data(Player *p) {
             areas_count = 0;
             send_packet(p->tcp_fd, SP_START_PLACING, &areas_count, sizeof(areas_count), 0);
         
-            room->status = ROOM_PLACING;
+            room->stage = STAGE_PLACING;
             write_log(L_INFO, "room %06x started placing\n", room->id);
         }
 
@@ -775,7 +773,7 @@ void process_data(Player *p) {
         Room *room = p->room;
         
         if (p->net.data_len < sizeof(uint16_t) ||
-            room->joined_players != room->players_number || room->status != ROOM_PLACING)
+            room->stage != STAGE_PLACING)
             break;
 
         uint16_t count = ntohs(*(uint16_t*)p->net.data_buf);
@@ -799,17 +797,15 @@ void process_data(Player *p) {
             send_packet(op->tcp_fd, SP_PLAYER_READY, &nid, sizeof(nid), 0);
         }
 
-        bool all_ready = true;
+        int ready_count = 0;
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i];
-            if (!op->ready) {
-                all_ready = false;
-                break;
-            }
+            if (op->ready)
+                ready_count++;
         }
 
-        if (all_ready) {
-            room->status = ROOM_GAME;
+        if (ready_count == room->players_number) {
+            room->stage = STAGE_GAME;
             write_log(L_INFO, "room %06x started the game\n", room->id);
 
             room->thread_run = true;
@@ -831,7 +827,7 @@ void process_data(Player *p) {
         */
         Room *room = p->room;
 
-        if (room->status != ROOM_GAME)
+        if (room->stage != STAGE_GAME)
             break;
 
         uint8_t order_type = *p->net.data_buf;
