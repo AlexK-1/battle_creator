@@ -56,7 +56,11 @@ typedef enum {
     SP_PLAYER_READY, // A message, that the player is ready to start the game
     SP_START_GAME, // When all players have placed their boids
     SP_BOIDS_SYNC, // Boids sync server->clients
-    SP_ROOM_CLOSED // Room is closed
+    SP_ROOM_CLOSED, // Room is closed
+    SP_PLAYER_KICKED, // Room's admin kicked player
+    SP_CHANGE_TEAM, // Admin changed player's team
+    SP_SWAP_TEAMS, // Swap teams of two players
+    SP_CHAT_MSG // Message to the room's chat
 } SPType; // Server packet type
 
 typedef enum {
@@ -68,7 +72,12 @@ typedef enum {
     CP_SEND_AREAS, // Sending areas of the admin to other players
     CP_START_PLACING, // Admin of the room starts placing of the boids
     CP_SEND_BOIDS, // Sending player's boids before the game starts
-    CP_ORDER // Sending player's order to his boids
+    CP_ORDER, // Sending player's order to his boids
+    CP_CLOSE_ROOM, // Admin can close the room
+    CP_KICK_PLAYER, // Kick the player out of the room
+    CP_CHANGE_TEAM, // Change player's team
+    CP_SWAP_TEAMS, // Swap teams of two players
+    CP_CHAT_MSG // Send a message to the room's chat
 } CPType; // Client packet type
 
 typedef struct {

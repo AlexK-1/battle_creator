@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <signal.h>
+#include <ctype.h>
 
 #define RAYMATH_STATIC_INLINE
 #include <raylib.h>
@@ -111,19 +112,23 @@ long max_fd;
 int tps = DEFAULT_TPS;
 /* ^ global variables ^ */
 
-int get_player_idx(Player **players, int id) {
+// Search by id or fd among the ROOM players
+int get_player_idx(Player **players, int fd, uint32_t id) {
     for (int i = 0; i < TEAMS_COUNT; i++) {
-        if (players[i]->tcp_fd == id)
+        if (fd > 0 && players[i] != NULL && players[i]->tcp_fd == fd) // Search by fd
+            return i;
+        if (id > 0 && players[i] != NULL && players[i]->id == id) // Search by ID
             return i;
     }
     return -1;
 }
 
-Player *find_player(Player **players, int id) {
-    int i = get_player_idx(players, id);
-    if (i < 0)
-        return NULL;
-    return players[i];
+Player *find_player(Player **players, int players_count, uint32_t id) {
+    for (int i = 0; i < players_count; i++) {
+        if (players[i] != NULL && players[i]->id == id) // Search by ID
+            return players[i];
+    }
+    return NULL;
 }
 
 static inline int random_value(int min, int max) {
@@ -132,13 +137,19 @@ static inline int random_value(int min, int max) {
 
 void close_client(int);
 
-void close_room(Room *room) {
+void close_room(Room *room, bool auto_close) {
+    // atoclose == true - room is closed by server
+    // autoclose == false - room is closed player
+    
     if (room->stage == STAGE_GAME && room->thread_run) {
         room->thread_run = false;
         pthread_join(room->thread, NULL);
     }
     
-    write_log(L_INFO, "room %06x closed\n", room->id);
+    if (auto_close)
+        write_log(L_INFO, "room %06x closed\n", room->id);
+    else
+        write_log(L_INFO, "room %06x closed py player id=%u\n", room->id, room->players[0]->id);
 
     while (room->players[0]->approving_queue.size > 0) {
         Player *op;
@@ -147,14 +158,17 @@ void close_room(Room *room) {
         close_client(op->tcp_fd);
     }
 
+    pthread_mutex_lock(&room->players_mtx);
     for (int i = 0; i < room->joined_players; i++) {
         Player *p = room->players[i];
         if (p->joined) {
             p->joined = false;
-            send_packet(p->tcp_fd, SP_ROOM_CLOSED, NULL, 0, MSG_NOSIGNAL);
+            uint8_t buf = auto_close;
+            send_packet(p->tcp_fd, SP_ROOM_CLOSED, &buf, sizeof(buf), MSG_NOSIGNAL);
             close_client(p->tcp_fd);
         }
     }
+    pthread_mutex_unlock(&room->players_mtx);
 
     if (room->boids != NULL) free(room->boids);
     free(room);
@@ -170,7 +184,7 @@ void close_client(int fd) {
     if (p->joined && p->room != NULL) {
         Room *room = p->room;
 
-        int player_idx = get_player_idx(room->players, p->tcp_fd);
+        int player_idx = get_player_idx(room->players, p->tcp_fd, 0);
 
         // send a message to all players in the room that the player has disconnected
         uint32_t nid = htonl(p->id);
@@ -186,7 +200,7 @@ void close_client(int fd) {
         if ((room->stage == STAGE_AREAS   && player_idx == 0) || // room's creator disconnected
             (room->stage == STAGE_PLACING && player_idx == 0) || // room's creator disconnected
              room->joined_players == 1) { // last player disconnected
-            close_room(room); // close entire room
+            close_room(room, true); // close entire room
             room_closed = true;
         } else {
             // delete player from array
@@ -236,6 +250,8 @@ void close_client(int fd) {
 
         write_log(L_DISCONNECT, "fd=%d id=%d hung up\n", fd, p->id);
         
+        if (p->net.data_buf != NULL)
+            free(p->net.data_buf);
         free(p);
         players[fd] = NULL;
     }
@@ -247,7 +263,7 @@ void *room_thread_fn(void *args) {
     ServerBoid *boids = room->boids = calloc(room->total_boids_number, sizeof(*room->boids));
     if (boids == NULL) {
         room->thread_run = false;
-        close_room(room);
+        close_room(room, true);
         return NULL;
     }
     BoidIndex boids_count = 0;
@@ -302,7 +318,7 @@ void *room_thread_fn(void *args) {
     pthread_mutex_unlock(&room->players_mtx);
 
     if (boids_count > room->total_boids_number) {
-        close_room(room);
+        close_room(room, true);
         return NULL;
     }
 
@@ -475,6 +491,22 @@ void *room_thread_fn(void *args) {
     return NULL;
 }
 
+// Copy SRC to DST, removing unnecessary characters
+char *copy_correct_username(char *dst, const char *src) {
+    char *d = dst;
+    while (*src != '\0') {
+        if (isalnum(*src) || *src == '-' || *src == '_')
+            *(d++) = *src;
+        src++;
+    }
+    *d = '\0';
+
+    if (strlen(dst) == 0)
+        strcpy(dst, "noname");
+
+    return dst;
+}
+
 void process_data(Player *p) {
     int package_type = p->net.type;
     switch (package_type) {
@@ -506,7 +538,7 @@ void process_data(Player *p) {
             break;
         }
         
-        strcpy(p->name, data.creator);
+        copy_correct_username(p->name, data.creator);
         p->team = data.player_team;
         p->joined = true;
         if (p->approving_queue.max_len == 0)
@@ -588,7 +620,21 @@ void process_data(Player *p) {
         Room *room = rooms[room_idx];
         if ((room != NULL) && (room->id == data.room_id) && (room->joined_players < room->players_number) &&
             (room->stage == STAGE_AREAS || room->stage == STAGE_PLACING)) {
-            strcpy(p->name, data.username);
+            copy_correct_username(p->name, data.username);
+
+            bool unique_username;
+            do {
+                unique_username = true;
+                // If the username of the new player matches the username of another player, add a numbers to it at the end
+                for (int i = 0; i < room->joined_players; i++) {
+                    if (strcmp(p->name, room->players[i]->name) == 0) {
+                        char suffix[5];
+                        snprintf(suffix, sizeof(suffix), "_%1d", room->joined_players);
+                        strcat(p->name, suffix);
+                        unique_username = false;
+                    }
+                }
+            } while (!unique_username);
 
             Player *room_owner = room->players[0];
             if (is_queue_full(room_owner->approving_queue)) {
@@ -603,7 +649,7 @@ void process_data(Player *p) {
             
             if (room_owner->approving_queue.size == 1) {
                 SPApprove send_data = {.id = htonl(p->id), .username = { 0 }};
-                strcpy(send_data.username, data.username);
+                strcpy(send_data.username, p->name);
 
                 send_packet(room_owner->tcp_fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
             }
@@ -625,7 +671,7 @@ void process_data(Player *p) {
         memcpy(&data, p->net.data_buf, sizeof(data));
         data.id = ntohl(data.id);
 
-        if (p->approving_queue.size == 0)
+        if (p->approving_queue.size == 0 || p->room == NULL)
             break;
         
         Player *approved_player = queue_front(p->approving_queue);
@@ -727,6 +773,8 @@ void process_data(Player *p) {
         */
 
         Room *room = p->room;
+        if (room == NULL)
+            break;
         
         if (p->net.data_len < sizeof(int16_t) || room->players[0]->tcp_fd != p->tcp_fd ||
             (room->joined_players != room->players_number && package_type == CP_START_PLACING) ||
@@ -771,6 +819,8 @@ void process_data(Player *p) {
         */
 
         Room *room = p->room;
+        if (room == NULL)
+            break;
         
         if (p->net.data_len < sizeof(uint16_t) ||
             room->stage != STAGE_PLACING)
@@ -825,7 +875,10 @@ void process_data(Player *p) {
         ORDER_POINT - [int8 order_type] [uint16 point.x] [uint16 point.y] [uint16 boids_count] [uint16[boids_count] boids]
         ORDER_LINE - [int8 order_type] [uint8 points_count] [{uint16 x, y}[points_count] points] [uint16 boids_count] [uint16[boids_count] boids]
         */
+
         Room *room = p->room;
+        if (room == NULL)
+            break;
 
         if (room->stage != STAGE_GAME)
             break;
@@ -1003,6 +1056,155 @@ void process_data(Player *p) {
         
         break;
         }
+    case CP_CLOSE_ROOM: {
+        Room *room = p->room;
+        if (room == NULL)
+            break;
+        if (room->players[0] != p)
+            break;
+
+        close_room(room, false);
+        break;
+        }
+    case CP_KICK_PLAYER: {
+        /* PACKET FORMAT
+        [uint32 player_id]
+        */
+
+        if (p->net.data_len < sizeof(uint32_t))
+            break;
+
+        Room *room = p->room;
+        if (room->players[0] != p)
+            break;
+
+        uint32_t kicked_player_id = ntohl(*(uint32_t*)p->net.data_buf);
+        int kicked_player_idx = get_player_idx(room->players, 0, kicked_player_id);
+
+        if (kicked_player_idx != -1) {
+            uint32_t nid = *(uint32_t*)p->net.data_buf; // BE
+
+            pthread_mutex_lock(&room->players_mtx);
+            for (int i = 0; i < room->joined_players; i++) {
+                send_packet(room->players[i]->tcp_fd, SP_PLAYER_KICKED, &nid, sizeof(nid), 0);
+            }
+            pthread_mutex_unlock(&room->players_mtx);
+
+            close_client(room->players[kicked_player_idx]->tcp_fd);
+        }
+
+        break;
+        }
+    case CP_CHANGE_TEAM: {
+        /* PACKET FORMAT
+        [uint32 player_id] [int8 new_team]
+        */
+
+        if (p->net.data_len < sizeof(uint32_t)+1)
+            break;
+
+        Room *room = p->room;
+        if (room == NULL)
+            break;
+        if (room->players[0] != p)
+            break;
+
+        int8_t new_team = *(int8_t*)(p->net.data_buf+sizeof(uint32_t));
+        if (new_team < 0 || new_team >= TEAMS_COUNT)
+            break;
+
+        bool can_use_team = true;
+        for (int i = 0; i < room->joined_players; i++) {
+            if (room->players[i]->team == new_team) {
+                can_use_team = false;
+                break;
+            }
+        }
+        if (!can_use_team) break;
+
+        if (room->teams[new_team] == 0)
+            break;
+        
+        uint32_t player_id = ntohl(*(uint32_t*)p->net.data_buf);
+
+        pthread_mutex_lock(&room->players_mtx);
+        int player_idx = get_player_idx(room->players, 0, player_id);
+
+        if (player_idx != -1) {
+            room->players[player_idx]->team = new_team;
+            for (int i = 0; i < room->joined_players; i++) {
+                send_packet(room->players[i]->tcp_fd, SP_CHANGE_TEAM, p->net.data_buf, p->net.data_len, 0);
+            }
+        }
+        pthread_mutex_unlock(&room->players_mtx);
+        
+        break;
+        }
+    case CP_SWAP_TEAMS: {
+        /* PACKET FORMAT
+        [uint32 player1_id] [uint32 player2_id]
+        */
+
+        if (p->net.data_len < sizeof(uint32_t)*2)
+            break;
+
+        Room *room = p->room;
+        if (room == NULL)
+            break;
+        if (room->players[0] != p)
+            break;
+
+        uint32_t player1_id = ntohl(*(uint32_t*)(p->net.data_buf));
+        uint32_t player2_id = ntohl(*(uint32_t*)(p->net.data_buf+sizeof(uint32_t)));
+        
+        pthread_mutex_lock(&room->players_mtx);
+        int player1_idx = get_player_idx(room->players, 0, player1_id);
+        int player2_idx = get_player_idx(room->players, 0, player2_id);
+        
+        if (player1_idx != -1 && player2_idx != -1) {
+            int team_tmp = room->players[player1_idx]->team;
+            room->players[player1_idx]->team = room->players[player2_idx]->team;;
+            room->players[player2_idx]->team = team_tmp;
+
+            for (int i = 0; i < room->joined_players; i++) {
+                send_packet(room->players[i]->tcp_fd, SP_SWAP_TEAMS, p->net.data_buf, p->net.data_len, 0);
+            }
+        }
+        pthread_mutex_unlock(&room->players_mtx);
+
+        break;
+        }
+    case CP_CHAT_MSG: {
+        /* PACKET FORMAT
+        [uint16 msg_len] [uint8[msg_len] msg]
+        */
+
+        if (p->net.data_len < sizeof(uint16_t))
+            break;
+
+        Room *room = p->room;
+        if (room == NULL)
+            break;
+
+        uint16_t msg_len = ntohs(*(uint16_t*)p->net.data_buf);
+        if (p->net.data_len != (sizeof(msg_len) + msg_len))
+            break;
+
+        uint32_t packet_size = sizeof(uint32_t) + p->net.data_len;
+        char *buf = malloc(packet_size);
+
+        *(uint32_t*)buf = htonl(p->id);
+        memcpy(buf+sizeof(uint32_t), p->net.data_buf, p->net.data_len);
+        
+        pthread_mutex_lock(&room->players_mtx);
+        for (int i = 0; i < room->joined_players; i++) {
+            send_packet(room->players[i]->tcp_fd, SP_CHAT_MSG, buf, packet_size, 0);
+        }
+        pthread_mutex_unlock(&room->players_mtx);
+        
+        free(buf);
+        break;
+        }
     }
 }
 
@@ -1033,7 +1235,7 @@ int client_recv(Player *p) {
                 } else break;
             } else if (p->net.state == PARSE_LEN) {
                 uint32_t need = p->net.bytes_remaining;
-                uint32_t copy = (remaining < need)? remaining : need;
+                uint32_t copy = MIN(remaining, need);
 
                 if (copy > 0) {
                     memcpy((uint8_t*)&p->net.data_len + (sizeof(p->net.data_len) - p->net.bytes_remaining), ptr, copy);
@@ -1046,11 +1248,24 @@ int client_recv(Player *p) {
                     if (p->net.data_len > MAX_PACKET_SIZE)
                         return 1;
 
-                    p->net.data_buf = malloc(p->net.data_len);
-                    if (p->net.data_buf == NULL)
-                        return 1;
-                    p->net.state = PARSE_DATA;
-                    p->net.bytes_remaining = p->net.data_len;
+                    if (p->net.data_len > 0) {
+                        p->net.data_buf = malloc(p->net.data_len);
+                        if (p->net.data_buf == NULL)
+                            return 1;
+                        p->net.state = PARSE_DATA;
+                        p->net.bytes_remaining = p->net.data_len;
+                    } else { // Empty packet body
+                        int fd = p->tcp_fd;
+                        process_data(p);
+
+                        // Check that player not disconnected
+                        if (players[fd] != NULL) {
+                            p->net.data_buf = NULL;
+                            p->net.state = PARSE_TYPE;
+                        } else {
+                            return 0;
+                        }
+                    }
                 }
             } else if (p->net.state == PARSE_DATA) {
                 uint32_t need = p->net.bytes_remaining;
@@ -1063,11 +1278,17 @@ int client_recv(Player *p) {
                     ptr += copy;
                 }
                 if (p->net.bytes_remaining == 0) {
+                    int fd = p->tcp_fd;
                     process_data(p);
-                    
-                    free(p->net.data_buf);
-                    p->net.data_buf = NULL;
-                    p->net.state = PARSE_TYPE;
+
+                    // Check that player not disconnected
+                    if (players[fd] != NULL) {
+                        free(p->net.data_buf);
+                        p->net.data_buf = NULL;
+                        p->net.state = PARSE_TYPE;
+                    } else {
+                        return 0;
+                    }
                 }
             }
         }
@@ -1440,7 +1661,7 @@ int main(int argc, char **argv) {
                 if (r > 0) {
                     buf[r] = '\0';
                     if (strcmp(buf, "quit\n") == 0 || strcmp(buf, "q\n") == 0) {
-                        write_log(L_INPUT, buf);
+                        write_log(L_INPUT, "%s", buf);
                         running = false;
                         break;
                     }

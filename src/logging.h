@@ -9,6 +9,7 @@ typedef enum {
     L_INFO,
     L_JOIN,
     L_DISCONNECT,
+    L_CHAT,
     L_QUESTION,
     L_INPUT,
     L_WARNING,

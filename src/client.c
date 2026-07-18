@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <math.h>
 #include <errno.h>
+#include <ctype.h>
 
 #include <raylib.h>
 #include <raymath.h>
@@ -32,6 +33,11 @@
 
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 450
+
+#define DEFAULT_PLAYERS_COUNT 2
+#define DEFAULT_WORLD_SIZE_X 10050
+#define DEFAULT_WORLD_SIZE_Y 10050
+#define DEFAULT_USERNAME "noname"
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
@@ -78,7 +84,7 @@ void log_message(Log *log, LogType type, const char *format, ...) {
     va_end(args);
 
     // Write to console/file
-    write_log(type, buf.string);
+    write_log(type, "%s", buf.string);
 
     if (log->items != NULL && type >= log_conf.stdout_log_level) { // log_conf from logging.h
         // Count lines in message
@@ -112,6 +118,16 @@ char *get_team_name(int team) {
     }
 }
 
+int get_team_id(const char *team_name) {
+    switch (team_name[0]) {
+        case 'r': return TEAM_RED;
+        case 'b': return TEAM_BLUE;
+        case 'g': return TEAM_GREEN;
+        case 'y': return TEAM_YELLOW;
+        default: return -1;
+    }
+}
+
 int64_t get_player_idx(ClientPlayer *players, uint32_t id) {
     for (int i = 0; i < TEAMS_COUNT; i++) {
         if (players[i].id == id)
@@ -133,11 +149,20 @@ ClientPlayer *find_player(ClientPlayer *players, uint32_t id) {
 #define INPUT_STRING_LEN 1024
 
 char input_string[INPUT_STRING_LEN];
-bool get_input = false, input_received = false, typing_string_input = false, running = true;
+bool get_input = false, input_received = false, typing_keyboard_input = false, running = true;
 
 int tcp_fd, udp_fd;
 struct sockaddr_in udp_servaddr = { 0 };
 bool udp_opened = false;
+
+int players_number = DEFAULT_PLAYERS_COUNT, joined_players = 0;
+ClientPlayer players[TEAMS_COUNT] = { 0 };
+BoidIndex boids_number[TEAMS_COUNT] = { 0 }, total_boids_number = 0;
+bool teams_used[TEAMS_COUNT] = { 0 };
+uint32_t room_id = 0, player_id = 0;
+Point world_size = {DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y};
+int chunk_size = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS;
+int server_target_tps = 0;
 
 typedef enum {
     MODE_WAIT,
@@ -150,20 +175,19 @@ typedef enum {
     MODE_LINE
 } GameMode;
 
+RoomStage stage = STAGE_AREAS;
+GameMode mode = MODE_WAIT;
+
 typedef struct {
-    int players_number, *joined_players, chunk_size;
     bool new_room, *select_mode;
-    Point *world_size;
-    BoidIndex *boids_number, *boids_count, total_boids_number;
+    BoidTeam *player_team;
+    BoidIndex *boids_count;
     uint8_t *server_tps;
-    ClientPlayer *players;
     Log *log;
     Grid *grid;
     uint16_t *areas_count;
     Area *areas;
     ClientBoid *boids;
-    GameMode *mode;
-    RoomStage *stage;
 } NetThreadArgs;
 
 pthread_mutex_t areas_mtx;
@@ -172,27 +196,35 @@ pthread_mutex_t running_mtx;
 pthread_mutex_t input_mtx;
 pthread_mutex_t players_mtx;
 
+#define CHECK_LEAST_SIZE(size)                                                                                     \
+    if (packet_size < (size)) {                                                                                    \
+        log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n", \
+                  packet_type, (uint32_t)(size), packet_size);                                                               \
+        ex = true;                                                                                                 \
+        break;                                                                                                     \
+    }
+
+#define CHECK_SIZE(size)                                                                                           \
+    if (packet_size != (size)) {                                                                                   \
+        log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",          \
+                  packet_type, (uint32_t)(size), packet_size);                                                               \
+        ex = true;                                                                                                 \
+        break;                                                                                                     \
+    }
+
 void *net_thread_fn(void *args) {
     NetThreadArgs *nargs = args;
     
     bool new_room = nargs->new_room;
-    int players_number = nargs->players_number;
-    int *joined_players = nargs->joined_players;
-    int chunk_size = nargs->chunk_size;
-    Point *world = nargs->world_size;
-    BoidIndex *boids_number = nargs->boids_number;
+    bool *select_mode = nargs->select_mode;
+    BoidTeam *player_team = nargs->player_team;
     BoidIndex *boids_count = nargs->boids_count;
-    BoidIndex total_boids_number = nargs->total_boids_number;
-    ClientPlayer *players = nargs->players;
     Log *log = nargs->log;
     Area *areas = nargs->areas;
     uint16_t *areas_count = nargs->areas_count;
-    bool *select_mode = nargs->select_mode;
     uint8_t *server_tps = nargs->server_tps;
     Grid *grid = nargs->grid;
     ClientBoid *boids = nargs->boids;
-    GameMode *mode = nargs->mode;
-    RoomStage *stage = nargs->stage;
 
     uint32_t approved_player_id = 0;
     char approved_player_username[USERNAME_LEN];
@@ -244,7 +276,7 @@ void *net_thread_fn(void *args) {
 
                     bool team_used = false;
                     pthread_mutex_lock(&players_mtx);
-                    for (int i = 0; i < *joined_players; i++) {
+                    for (int i = 0; i < joined_players; i++) {
                         if (players[i].team == team) {
                             team_used = true;
                             break;
@@ -284,8 +316,8 @@ void *net_thread_fn(void *args) {
             #else
                 err_wouldblock = (errno == EWOULDBLOCK);
             #endif
-            if (err_wouldblock) {
-                recv_udp = true; // No data
+            if (err_wouldblock) { // No data in TCP
+                recv_udp = true;
             } else {
                 log_message(log, L_ERROR, "failed to receive a packet size by TCP\n");
                 perror("recv");
@@ -361,14 +393,8 @@ void *net_thread_fn(void *args) {
                 [SPApprove player]
                 */
 
-                const uint32_t expected_size = sizeof(SPApprove);
-                if (packet_size != expected_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                              packet_type, expected_size, packet_size);
-                    ex = true;
-                    break;
-                }
-
+                CHECK_SIZE( sizeof(SPApprove) );
+                
                 SPApprove *other_player = (SPApprove*)recv_buf;
 
                 approved_player_id = ntohl(other_player->id);
@@ -387,23 +413,17 @@ void *net_thread_fn(void *args) {
                 [ClientPlayer new_player]
                 */
             
-                const uint32_t expected_size = sizeof(ClientPlayer);
-                if (packet_size != expected_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                              packet_type, expected_size, packet_size);
-                    ex = true;
-                    break;
-                }
-
+                CHECK_SIZE( sizeof(ClientPlayer) );
+                
                 ClientPlayer *new_player = (ClientPlayer*)recv_buf;
                 new_player->id = ntohl(new_player->id);
 
                 pthread_mutex_lock(&players_mtx);
-                players[(*joined_players)++] = *new_player;
+                players[joined_players++] = *new_player;
                 pthread_mutex_unlock(&players_mtx);
                 log_message(log, L_JOIN, "new player '%s' - %s\n", new_player->name, get_team_name(new_player->team));
 
-                if (new_room && players_number == *joined_players && *stage == STAGE_AREAS) {
+                if (new_room && players_number == joined_players && stage == STAGE_AREAS) {
                     log_message(log, L_INFO, "press ENTER to start placing boids\n");
                 }
                 approved_player_id = 0;
@@ -415,33 +435,33 @@ void *net_thread_fn(void *args) {
                 [uin32_t player_id]
                 */
             
-                const uint32_t expected_size = sizeof(uint32_t);
-                if (packet_size != expected_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                              packet_type, expected_size, packet_size);
-                    ex = true;
-                    break;
-                }
+                CHECK_SIZE( sizeof(uint32_t) );
 
                 uint32_t exited_player = ntohl(*(uint32_t*)recv_buf);
 
-                if ((*stage == STAGE_AREAS || *stage == STAGE_PLACING) && exited_player == approved_player_id) {
+                if ((stage == STAGE_AREAS || stage == STAGE_PLACING) && exited_player == approved_player_id) {
                     log_message(log, L_DISCONNECT, "player '%s' disconnected\n", approved_player_username);
                     approved_player_id = 0;
 
                     pthread_mutex_lock(&input_mtx);
+                    if (get_input)
+                        typing_keyboard_input = false;
                     get_input = false;
-                    typing_string_input = false;
                     pthread_mutex_unlock(&input_mtx);
                 } else {
+                    pthread_mutex_lock(&players_mtx);
                     int player_idx = get_player_idx(players, exited_player);
+                    if (player_idx < 0 || player_idx >= joined_players) {
+                        pthread_mutex_unlock(&players_mtx);
+                        break;
+                    }
+
                     log_message(log, L_DISCONNECT, "player '%s' disconnected\n", players[player_idx].name);
             
                     // delete player from array
-                    pthread_mutex_lock(&players_mtx);
                     memmove(players + player_idx, players + player_idx + 1,
-                            sizeof(players[0]) * (*joined_players - player_idx - 1));
-                    (*joined_players)--;
+                            sizeof(players[0]) * (joined_players - player_idx - 1));
+                    joined_players--;
                     pthread_mutex_unlock(&players_mtx);
                 }
             
@@ -452,24 +472,12 @@ void *net_thread_fn(void *args) {
                 /* PACKET FORMAT
                 [uint16 areas_count] [Area[areas_count] areas]
                 */
-            
-                const uint32_t least_size = /*areas_count*/ sizeof(int16_t);
-                if (packet_size < least_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
-                              packet_type, least_size, packet_size);
-                    ex = true;
-                    break;
-                }
-            
+
+                CHECK_LEAST_SIZE( /*areas_count*/ sizeof(int16_t) );
+                
                 uint16_t new_areas_count = ntohs(*(int16_t*)recv_buf);
-                const uint32_t expected_size = sizeof(new_areas_count) + new_areas_count*sizeof(Area);
-                if (packet_size != expected_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                              packet_type, expected_size, packet_size);
-                    ex = true;
-                    break;
-                }
-            
+                CHECK_SIZE( sizeof(new_areas_count) + new_areas_count*sizeof(Area) );
+                
                 if (!new_room) {
                     pthread_mutex_lock(&areas_mtx);
                     *areas_count = new_areas_count;
@@ -486,8 +494,8 @@ void *net_thread_fn(void *args) {
                 }
 
                 if (packet_type == SP_START_PLACING) {
-                    *mode = MODE_SPAWN;
-                    *stage = STAGE_PLACING;
+                    mode = MODE_SPAWN;
+                    stage = STAGE_PLACING;
 
                     log_message(log, L_INFO, "now you can spawn boids on your areas");
                     log_message(log, L_INFO, "press ENTER when you will ready to start the game\n");
@@ -500,13 +508,7 @@ void *net_thread_fn(void *args) {
                 [uint32 player_id]
                 */
 
-                const uint32_t expected_size = sizeof(uint32_t);
-                if (packet_size != expected_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                              packet_type, expected_size, packet_size);
-                    ex = true;
-                    break;
-                }
+                CHECK_SIZE( sizeof(uint32_t) );
 
                 pthread_mutex_lock(&players_mtx);
                 uint32_t id = ntohl(*(uint32_t*)recv_buf);
@@ -522,23 +524,11 @@ void *net_thread_fn(void *args) {
                 [uint16 boids_count] [ServerStartNetBoid[boids_count] boids]
                 */
 
-                const uint32_t least_size = /*boids_count*/ sizeof(uint16_t);
-                if (packet_size < least_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
-                              packet_type, least_size, packet_size);
-                    ex = true;
-                    break;
-                }
+                CHECK_LEAST_SIZE( /*boids_count*/ sizeof(uint16_t) );
             
                 uint16_t recv_boids_count = ntohs(*(uint16_t*)recv_buf);
-                const uint32_t expected_size = sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid);
-                if (packet_size != expected_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                              packet_type, expected_size, packet_size);
-                    ex = true;
-                    break;
-                }
-
+                CHECK_SIZE( sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid) );
+                
                 if (recv_boids_count != total_boids_number) {
                     log_message(log, L_ERROR, "invalid number of boids in SP#%d packet (expected %d boids, %d boids received)\n",
                               packet_type, total_boids_number, recv_boids_count);
@@ -559,12 +549,12 @@ void *net_thread_fn(void *args) {
                 *boids_count = recv_boids_count;
 
                 // Reinit grid
-                init_grid(grid, boids, *boids_count, world->x, world->y, chunk_size);
+                init_grid(grid, boids, *boids_count, world_size.x, world_size.y, chunk_size);
 
                 pthread_mutex_unlock(&boids_mtx);
 
-                *mode = MODE_SELECT;
-                *stage = STAGE_GAME;
+                mode = MODE_SELECT;
+                stage = STAGE_GAME;
                 *select_mode = true;
 
                 log_message(log, L_INFO, "the game has started\n");
@@ -576,23 +566,11 @@ void *net_thread_fn(void *args) {
                 [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
                 */
 
-                const uint32_t least_size = /*current_server_tps*/ 1 + /*boids_count*/ sizeof(BoidIndex) + /*first_boid_index*/ sizeof(BoidIndex);
-                if (packet_size < least_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n",
-                              packet_type, least_size, packet_size);
-                    ex = true;
-                    break;
-                }
-            
-                BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(recv_buf+1));
-                const uint32_t expected_size = 1 + sizeof(BoidIndex) + sizeof(BoidIndex) + recv_boids_count*sizeof(NetBoid);
-                if (packet_size != expected_size) {
-                    log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",
-                              packet_type, expected_size, packet_size);
-                    ex = true;
-                    break;
-                }
+                CHECK_LEAST_SIZE( /*current_server_tps*/ 1 + /*boids_count*/ sizeof(BoidIndex) + /*first_boid_index*/ sizeof(BoidIndex) );
 
+                BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(recv_buf+1));
+                CHECK_SIZE( 1 + sizeof(BoidIndex) + sizeof(BoidIndex) + recv_boids_count*sizeof(NetBoid) );
+                
                 if (sync_proto == SYNC_PROTO_NONE) {
                     if (recv_tcp) {
                         sync_proto = SYNC_PROTO_TCP;
@@ -640,9 +618,133 @@ void *net_thread_fn(void *args) {
                 break;
                 }
             case SP_ROOM_CLOSED: {
-                log_message(log, L_INFO, "room closed\n");
+                /* PACKET FORMAT
+                [uint8 auto_close]
+                */
+
+                CHECK_SIZE( 1 );
+
+                uint8_t auto_close = *(uint8_t*)recv_buf;
+                if (auto_close) // room is closed by server
+                    log_message(log, L_INFO, "room closed\n");
+                else // room is closed player (admin)
+                    log_message(log, L_INFO, "room closed by player '%s'\n", players[0].name);
                 ex = true;
             
+                break;
+                }
+            case SP_PLAYER_KICKED: {
+                /* PACKET FORMAT
+                [uint32 player_id]
+                */
+
+                CHECK_SIZE( sizeof(uint32_t) );
+
+                uint32_t kicked_player = ntohl(*(uint32_t*)recv_buf);
+
+                pthread_mutex_lock(&players_mtx);
+                int player_idx = get_player_idx(players, kicked_player);
+                if (player_idx < 0 || player_idx >= joined_players) {
+                    pthread_mutex_unlock(&players_mtx);
+                    break;
+                }
+                
+                log_message(log, L_DISCONNECT, "player '%s' was kicked out of the room by player '%s'\n", players[player_idx].name, players[0].name);
+        
+                // delete player from array
+                memmove(players + player_idx, players + player_idx + 1,
+                        sizeof(players[0]) * (joined_players - player_idx - 1));
+                joined_players--;
+                pthread_mutex_unlock(&players_mtx);
+
+                break;
+                }
+            case SP_CHANGE_TEAM: {
+                /* PACKET FORMAT
+                [uint32 player1_id] [uint32 player2_id]
+                */
+
+                CHECK_SIZE( sizeof(uint32_t) + 1 );
+
+                uint32_t pid = ntohl(*(uint32_t*)(recv_buf)); // player ID
+
+                pthread_mutex_lock(&players_mtx);
+                int pidx = get_player_idx(players, pid); // player idx
+                if (pidx < 0 || pidx >= joined_players) {
+                    pthread_mutex_unlock(&players_mtx);
+                    break;
+                }
+
+                int8_t team = *(int8_t*)(recv_buf+sizeof(uint32_t));
+                if (team < 0 || team >= TEAMS_COUNT) {
+                    pthread_mutex_unlock(&players_mtx);
+                    break;
+                }
+                
+                players[pidx].team = team;
+                *player_team = players[get_player_idx(players, player_id)].team;
+                
+                log_message(log, L_INFO, "player '%s' changed team of player '%s' to %s\n",
+                            players[0].name, players[pidx].name, get_team_name(team));
+
+                pthread_mutex_unlock(&players_mtx);
+                break;
+                }
+            case SP_SWAP_TEAMS: {
+                /* PACKET FORMAT
+                [uint32 player1_id] [uint32 player2_id]
+                */
+
+                CHECK_SIZE( sizeof(uint32_t)*2 );
+                
+                uint32_t pid1 = ntohl(*(uint32_t*)(recv_buf));
+                uint32_t pid2 = ntohl(*(uint32_t*)(recv_buf+sizeof(uint32_t)));
+                
+                pthread_mutex_lock(&players_mtx);
+
+                int pidx1 = get_player_idx(players, pid1);
+                if (pidx1 < 0 || pidx1 >= joined_players) {
+                    pthread_mutex_unlock(&players_mtx);
+                    break;
+                }
+                int pidx2 = get_player_idx(players, pid2);
+                if (pidx2 < 0 || pidx2 >= joined_players) {
+                    pthread_mutex_unlock(&players_mtx);
+                    break;
+                }
+
+                int team_tmp = players[pidx1].team;
+                players[pidx1].team = players[pidx2].team;
+                players[pidx2].team = team_tmp;
+                *player_team = players[get_player_idx(players, player_id)].team;
+                
+                log_message(log, L_INFO, "player '%s' changed team of player '%s' to %s and team of player '%s' to %s\n",
+                            players[0].name, players[pidx1].name, get_team_name(players[pidx1].team),
+                            players[pidx2].name, get_team_name(players[pidx2].team));
+
+                pthread_mutex_unlock(&players_mtx);
+                break;
+                }
+            case SP_CHAT_MSG: {
+                /* PACKET FORMAT
+                [uint32 sender_id] [uint16 msg_len] [uint8[msg_len] msg]
+                */
+
+                CHECK_LEAST_SIZE( sizeof(uint32_t) + sizeof(uint16_t) );
+
+                uint32_t sender_id = ntohl(*(uint32_t*)(recv_buf));
+                uint32_t msg_len = ntohs(*(uint16_t*)(recv_buf+sizeof(uint32_t)));
+                
+                CHECK_SIZE( sizeof(uint32_t) + sizeof(uint16_t) + msg_len );
+
+                int sender_idx = get_player_idx(players, sender_id);
+                if (sender_idx < 0)
+                    break;
+                
+                char *msg = recv_buf+sizeof(uint32_t)+sizeof(uint16_t);
+
+                log_message(log, L_CHAT, "@%s: %.*s", players[sender_idx].name, msg_len, msg);;
+                
                 break;
                 }
             }
@@ -664,11 +766,6 @@ void *net_thread_fn(void *args) {
 
 
 /* <============================================ BOIDS AND MAIN ============================================> */
-
-#define DEFAULT_PLAYERS_COUNT 2
-#define DEFAULT_WORLD_SIZE_X 10050
-#define DEFAULT_WORLD_SIZE_Y 10050
-#define DEFAULT_USERNAME "noname"
 
 void update_boid_sprite(ClientBoid *boids, BoidIndex boid_index) {
     ClientBoid *boid = &boids[boid_index];
@@ -823,17 +920,337 @@ int send_areas(int fd, uint8_t package_type, Area *areas, uint16_t areas_count) 
     return r;
 }
 
+typedef enum {
+    CMD_HELP,
+    CMD_LOG_WARN,
+    CMD_LOG_INFO,
+    CMD_LOG_CLEAR,
+    CMD_EXIT,
+    CMD_PLAYERS_LIST,
+    CMD_ROOM_INFO,
+    CMD_ROOM_ID,
+    CMD_COPY_ROOM_ID,
+    CMD_CLOSE_ROOM,
+    CMD_KICK_PLAYER,
+    CMD_CHANGE_TEAM,
+    CMD_SWAP_TEAMS
+} Command;
+
+typedef struct {
+    char *full_cmd;
+    char *short_cmd;
+    char *description;
+} CommandInfo;
+
+CommandInfo commands_list[] = {
+    [CMD_HELP]         = {"/help",       "/h",   "[CMD] - Show help message"},
+    [CMD_LOG_WARN]     = {"/logwarn",    "/lw",  "<MSG> - Write a warning message to the log"},
+    [CMD_LOG_INFO]     = {"/loginfo",    "/li",  "<MSG> - Write an info message to the log"},
+    [CMD_LOG_CLEAR]    = {"/logclear",   "/lc",  "- Clear the log"},
+    [CMD_EXIT]         = {"/exit",       "/e",   "- Exit from the game"},
+    [CMD_PLAYERS_LIST] = {"/players",    "/p",   "- Write a list of players connected to the room"},
+    [CMD_ROOM_INFO]    = {"/room",       "/r",   "- Write information about the room"},
+    [CMD_ROOM_ID]      = {"/roomid",     "/ri",  "- Print ID of the room"},
+    [CMD_COPY_ROOM_ID] = {"/copyroomid", "/cri", "- Copy ID of the room to the clipboard"},
+    [CMD_CLOSE_ROOM]   = {"/closeroom",  "/cr",  "- Close the room and disconnect all players"},
+    [CMD_KICK_PLAYER]  = {"/kick",       "/k",   "@<NAME> - Kick the player out of the room"},
+    [CMD_CHANGE_TEAM]  = {"/changeteam", "/ct",  "@<NAME> <TEAM> - Change player's team"},
+    [CMD_SWAP_TEAMS]   = {"/swapteams",  "/st",  "@<NAME1> @<NAME2> - Swap teams of two players"}
+};
+const int commands_count = sizeof(commands_list)/sizeof(commands_list[0]);
+
+char *autocomple_word(char *word) {
+    static char new_word[LOG_BUF_SIZE];
+    strcpy(new_word, word);
+
+    size_t len = strlen(word);
+
+    if (word[0] == '/') {
+        int matches_count = 0;
+        for (int i = 0; i < commands_count; i++) {
+            if (strncmp(word, commands_list[i].full_cmd, len) == 0) {
+                const char* command = commands_list[i].full_cmd;
+                
+                char *w = new_word;
+                const char *c = command;
+                while (*w == *c && *w != '\0') {
+                    w++;
+                    c++;
+                }
+
+                if (matches_count == 0) strcpy(new_word, command);
+                else *w = '\0';
+
+                matches_count++;
+            }
+        }
+    } else if (word[0] == '@') {
+        int matches_count = 0;
+        pthread_mutex_lock(&players_mtx);
+        for (int i = 0; i < joined_players; i++) {
+            if (strncmp(word+1, players[i].name, len-1) == 0) {
+                const char* name = players[i].name;
+                
+                char *w = new_word+1;
+                const char *c = name;
+                while (*w == *c && *w != '\0') {
+                    w++;
+                    c++;
+                }
+
+                if (matches_count == 0) strcpy(new_word+1, name);
+                else *w = '\0';
+
+                matches_count++;
+            }
+        }
+        pthread_mutex_unlock(&players_mtx);
+    }
+
+    return new_word;
+}
+
+#define CHECK_ARGS(args_number)                                                               \
+    if (argc < (args_number) + 1) {                                                           \
+        log_message(log, L_WARNING, "invalid number of arguments for %s command\n", argv[0]); \
+        return 1;                                                                             \
+    }
+
+#define CHECK_ADMIN()                                                                         \
+    if (get_player_idx(players, player_id) != 0) {                                            \
+        log_message(log, L_WARNING, "command %s is not aviable\n", argv[0]);                  \
+        return 1;                                                                             \
+    }
+
+#define GET_TEAM(team_id, arg)                                                                \
+    do {                                                                                      \
+        (team_id) = get_team_id(arg);                                                         \
+        if ((team_id) == -1) {                                                                \
+            log_message(log, L_WARNING, "invalid team '%s'\n", (arg));                        \
+            return 1;                                                                         \
+        }                                                                                     \
+    } while (0)
+
+#define GET_USERNAME(username, arg)                                                           \
+    do {                                                                                      \
+        (username) = (arg);                                                                   \
+        if ((username)[0] != '@') {                                                           \
+            log_message(log, L_WARNING, "username should start with '@'\n");                  \
+            return 1;                                                                         \
+        }                                                                                     \
+        (username)++; /* skip @ before the username*/                                         \
+    } while (0)
+
+#define GET_PLAYER_ID(pid, username)                                                          \
+    do {                                                                                      \
+        pthread_mutex_lock(&players_mtx);                                                     \
+        (pid) = 0;                                                                            \
+        for (int i = 0; i < joined_players; i++) {                                            \
+            if (strcmp((username), players[i].name) == 0) {                                   \
+                (pid) = players[i].id;                                                        \
+                break;                                                                        \
+            }                                                                                 \
+        }                                                                                     \
+        pthread_mutex_unlock(&players_mtx);                                                   \
+                                                                                              \
+        if ((pid) == 0) {                                                                     \
+            log_message(log, L_WARNING, "there is no player with name '%s'\n", (username));   \
+            return 1;                                                                         \
+        }                                                                                     \
+    } while (0)
+
+int get_command(char *cmd_string) {
+    for (int i = 0; i < commands_count; i++) {
+        if (strcmp(cmd_string, commands_list[i].full_cmd) == 0 || strcmp(cmd_string, commands_list[i].short_cmd) == 0)
+            return i;
+    }
+
+    return -1;
+}
+
+int process_command(Log *log, char *command) {
+    if (command[0] != '/') {
+        log_message(log, L_WARNING, "command should start with '/'\n");
+        return 1;
+    }
+
+    int argc;
+    char **argv = TextSplit(command, ' ', &argc); // Split the command string by spaces
+
+    char delimiter[] = " ";
+    char message[LOG_BUF_SIZE];
+    char *username;
+    uint32_t pid = 0; // player ID
+    
+    Command cmd = get_command(argv[0]);
+    switch (cmd) {
+        case CMD_HELP:
+            if (argc > 1) {
+                // Help message for one command
+                int help_cmd = get_command(argv[1]);
+                if (help_cmd == -1) {
+                    log_message(log, L_WARNING, "unknown command %s\n", argv[1]);
+                    return 1;
+                }
+                CommandInfo command_data = commands_list[help_cmd];
+
+                strcat(message, command_data.full_cmd);
+                if (command_data.short_cmd != NULL)
+                    sprintf(message+strlen(message), ", %s", command_data.short_cmd);
+                if (command_data.description != NULL)
+                    sprintf(message+strlen(message), " %s", command_data.description);
+                strcat(message, "\n");
+            } else {
+                // Global help message
+                strcpy(message, "list of commands:\n");
+                for (int i = 0; i < commands_count; i++) {
+                    CommandInfo command_data = commands_list[i];
+                    sprintf(message+strlen(message), "     %s", command_data.full_cmd);
+                    if (command_data.short_cmd != NULL)
+                        sprintf(message+strlen(message), ", %s", command_data.short_cmd);
+                    if (command_data.description != NULL)
+                        sprintf(message+strlen(message), " %s", command_data.description);
+                    strcat(message, "\n");
+                }
+            }
+
+            log_message(log, L_INFO, "%s", message);
+            break;
+        case CMD_LOG_WARN:
+            CHECK_ARGS(1);
+            
+            log_message(log, L_WARNING, "%s", TextJoin(argv+1, argc-1, delimiter));
+            break;
+        case CMD_LOG_INFO:
+            CHECK_ARGS(1);
+        
+            log_message(log, L_INFO, "%s", TextJoin(argv+1, argc-1, delimiter));
+            break;
+        case CMD_LOG_CLEAR:
+            pthread_mutex_lock(&log_mtx);
+            log->size = 0;
+            pthread_mutex_unlock(&log_mtx);
+            break;
+        case CMD_EXIT:
+            pthread_mutex_lock(&running_mtx);
+            running = false;
+            pthread_mutex_unlock(&running_mtx);
+            break;
+        case CMD_PLAYERS_LIST:
+            strcpy(message, "players:\n");
+            pthread_mutex_lock(&players_mtx);
+            for (int i = 0; i < joined_players; i++) {
+                ClientPlayer *op = &players[i];
+
+                char *team = get_team_name(op->team);
+
+                snprintf(message+strlen(message), sizeof(message), "  %s - %s\n", op->name, team);
+            }
+            pthread_mutex_unlock(&players_mtx);
+            log_message(log, L_INFO, "%s", message);
+            break;
+        case CMD_ROOM_INFO:
+            log_message(log, L_INFO, "room info\n     id: %06x\n     teams: %d\n     world: %dx%d\n     chunk: %d\n     server tps: %d\n     creator: %s\n"
+                            "     boids:  %-4d\n     red:    %-4d\n     blue:   %-4d\n     green:  %-4d\n     yellow: %-4d\n",
+                   room_id, players_number, world_size.x, world_size.y, chunk_size, server_target_tps, players[0].name, total_boids_number,
+                   boids_number[TEAM_RED],
+                   boids_number[TEAM_BLUE],
+                   boids_number[TEAM_GREEN],
+                   boids_number[TEAM_YELLOW]);
+            break;
+        case CMD_ROOM_ID:
+            log_message(log, L_INFO, "%06x\n", room_id);
+            break;
+        case CMD_COPY_ROOM_ID:
+            SetClipboardText(TextFormat("%06x", room_id));
+            break;
+        case CMD_CLOSE_ROOM:
+            CHECK_ADMIN();
+
+            send_packet(tcp_fd, CP_CLOSE_ROOM, NULL, 0, 0);
+            break;
+        case CMD_KICK_PLAYER:
+            CHECK_ARGS(1);
+            CHECK_ADMIN();
+            
+            GET_USERNAME(username, argv[1]);
+            GET_PLAYER_ID(pid, username);
+            
+            pid = htonl(pid);
+            send_packet(tcp_fd, CP_KICK_PLAYER, &pid, sizeof(pid), 0);
+            
+            break;
+        case CMD_CHANGE_TEAM:
+            CHECK_ARGS(2);
+            CHECK_ADMIN();
+
+            if (stage != STAGE_AREAS) {
+                log_message(log, L_WARNING, "you can use %s command only during areas stage\n", argv[0]);
+                return 1;
+            }
+
+            GET_USERNAME(username, argv[1]);
+            GET_PLAYER_ID(pid, username);
+
+            int8_t team;
+            GET_TEAM(team, argv[2]);
+
+            if (!teams_used[team]) {
+                log_message(log, L_WARNING, "there are no boids for %s team\n", get_team_name(team));
+                return 1;
+            }
+
+            for (int i = 0; i < joined_players; i++) {
+                if (players[i].team == team) {
+                    log_message(log, L_WARNING, "%s team already used\n", get_team_name(team));
+                    return 1;
+                }
+            }
+            
+            char ct_buf[sizeof(pid) + sizeof(team)];
+            *(uint32_t*)(ct_buf) = htonl(pid);
+            *(int8_t*)(ct_buf+sizeof(pid)) = team;
+            send_packet(tcp_fd, CP_CHANGE_TEAM, ct_buf, sizeof(ct_buf), 0);
+
+            break;
+        case CMD_SWAP_TEAMS:
+            CHECK_ARGS(2);
+            CHECK_ADMIN();
+
+            if (stage != STAGE_AREAS) {
+                log_message(log, L_WARNING, "you can use %s command only during areas stage\n", argv[0]);
+                return 1;
+            }
+
+            char *username1, *username2;
+            int pid1, pid2;
+
+            GET_USERNAME(username1, argv[1]);
+            GET_PLAYER_ID(pid1, username1);
+
+            GET_USERNAME(username2, argv[2]);
+            GET_PLAYER_ID(pid2, username2);
+
+            char st_buf[sizeof(pid)*2];
+            *(uint32_t*)(st_buf) = htonl(pid1);
+            *(uint32_t*)(st_buf+sizeof(pid)) = htonl(pid2);
+            send_packet(tcp_fd, CP_SWAP_TEAMS, st_buf, sizeof(st_buf), 0);
+
+            break;
+        default:
+            log_message(log, L_WARNING, "unknown command %s\n", argv[0]);
+            return 1;
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv) {
     // room/player settings, argparse
-    bool new_room, hide_areas = false, show_global_help = false, show_command_help = false;
-    uint32_t room_id = 0;
-    int players_number = DEFAULT_PLAYERS_COUNT;
+    bool new_room = false, hide_areas = false, show_global_help = false, show_command_help = false;
     BoidTeam player_team = TEAM_RED;
-    BoidIndex boids_number[TEAMS_COUNT] = { 0 }, total_boids_number = 0;
     char *prog = argv[0], username[USERNAME_LEN] = DEFAULT_USERNAME , server[INET_ADDRSTRLEN] = DEFAULT_SERVER;
-    Point world_size = {DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y};
     unsigned short tcp_port = TCP_PORT, udp_port = UDP_PORT;
-    int chunk_size = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS;
     
     if (argc < 2) {
         ERR("missed argument: new/join\n");
@@ -940,13 +1357,11 @@ int main(int argc, char **argv) {
                         char *value_str = *(++argv);
                         argc--;
 
-                        if (*value_str == 'r') player_team = TEAM_RED;
-                        else if (*value_str == 'b') player_team = TEAM_BLUE;
-                        else if (*value_str == 'g') player_team = TEAM_GREEN;
-                        else if (*value_str == 'y') player_team = TEAM_YELLOW;
-                        else {
+                        int team = get_team_id(value_str);
+                        if (team == -1) {
                             ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                         }
+                        player_team = team;
                     } else if (strcmp(arg, "--world") == 0 || strcmp(arg, "-w") == 0) {
                         if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
@@ -986,12 +1401,8 @@ int main(int argc, char **argv) {
             for (c = arg; *c != '\0'; c++) {
                 if (isdigit(*c)) break;
                 
-                int team;
-                if (*c == 'r') team = TEAM_RED;
-                else if (*c == 'b') team = TEAM_BLUE;
-                else if (*c == 'g') team = TEAM_GREEN;
-                else if (*c == 'y') team = TEAM_YELLOW;
-                else {
+                int team = get_team_id(c);
+                if (team == -1) {
                     err = true;
                     break;
                 }
@@ -1063,9 +1474,9 @@ int main(int argc, char **argv) {
                 "    Show this message and exit\n"
                 "  -s, --server <IP>\n"
                 "    Server's IP address (default: %s)\n"
-                "  -T, --tcp-server <NUM>\n"
+                "  -T, --tcp-port <NUM>\n"
                 "    TCP port of the game server (default: %d)\n"
-                "  -U, --udp-server <NUM>\n"
+                "  -U, --udp-port <NUM>\n"
                 "    UDP port of the game server (default: %d)\n"
                 "  -n, --name <STR>\n"
                 "    Username (default: %s)\n"
@@ -1103,9 +1514,9 @@ int main(int argc, char **argv) {
                 "    Show this message and exit\n"
                 "  -s, --server <IP>\n"
                 "    Server's IP address (default: %s)\n"
-                "  -T, --tcp-server <NUM>\n"
+                "  -T, --tcp-port <NUM>\n"
                 "    TCP port of the game server (default: %d)\n"
-                "  -U, --udp-server <NUM>\n"
+                "  -U, --udp-port <NUM>\n"
                 "    UDP port of the game server (default: %d)\n"
                 "  -n, --name <STR>\n"
                 "    Username (default: %s)\n"
@@ -1289,24 +1700,24 @@ int main(int argc, char **argv) {
 
     room_id = ntohl(recv_data.room_id);
     players_number = recv_data.players_number;
-    int joined_players = recv_data.joined_players;
+    joined_players = recv_data.joined_players;
     world_size.x = ntohs(recv_data.world_size.x);
     world_size.y = ntohs(recv_data.world_size.y);
-    int server_target_tps = recv_data.server_target_tps;
+    server_target_tps = recv_data.server_target_tps;
     
-    RoomStage stage = recv_data.room_stage;
-    GameMode mode;
+    stage = recv_data.room_stage;
     if (stage == STAGE_AREAS)
         mode = new_room ? MODE_AREAS : MODE_WAIT;
     else
         mode = MODE_SPAWN;
     
-    bool team_used[TEAMS_COUNT] = { 0 };
-    ClientPlayer players[TEAMS_COUNT] = { 0 };
+    memcpy(&players, &recv_data.players, sizeof(players));
     for (int i = 0; i < joined_players; i++) {
-        memcpy(&players[i], &recv_data.players[i], sizeof(ClientPlayer));
+        if (players[i].id == recv_data.player_id)
+            strncpy(username, players[i].name, sizeof(username)-1);
         players[i].id = ntohl(players[i].id);
     }
+    player_id = ntohl(recv_data.player_id);
 
     total_boids_number = 0;
     for (int i = 0; i < TEAMS_COUNT; i++) {
@@ -1314,7 +1725,7 @@ int main(int argc, char **argv) {
         boids_number[i] = boids;
         total_boids_number += boids;
 
-        team_used[i] = boids > 0;
+        teams_used[i] = boids > 0;
     }
 
     if (udp_opened) {
@@ -1371,7 +1782,7 @@ int main(int argc, char **argv) {
     Log log;
     init_cstack(log, MAX_LOG_LEN);
     
-    log_message(&log, L_INFO, "%s\n     id: %06x\n     teams: %d\n     world: %dx%d\n     chunk: %d\n     server tps: %d\n     creator: %s\n"    
+    log_message(&log, L_INFO, "%s\n     id: %06x\n     teams: %d\n     world: %dx%d\n     chunk: %d\n     server tps: %d\n     creator: %s\n"
                     "     boids:  %-4d\n     red:    %-4d\n     blue:   %-4d\n     green:  %-4d\n     yellow: %-4d\n",
            new_room? "created a room" : "joined to the room",
            room_id, players_number, world_size.x, world_size.y, chunk_size, server_target_tps, players[0].name, total_boids_number,
@@ -1389,18 +1800,20 @@ int main(int argc, char **argv) {
 
             snprintf(players_info+strlen(players_info), sizeof(players_info), "  %s - %s\n", op->name, team);
         }
-        log_message(&log, L_INFO, players_info);
+        log_message(&log, L_INFO, "%s", players_info);
     }
+
+    log_message(&log, L_INFO, "your username is '%s' and your team is %s\n", username, TextToUpper(get_team_name(player_team)));
 
     // Init Raylib
     SetTraceLogLevel(LOG_WARNING);
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_FULLSCREEN_MODE);
-    
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Battle creator");
     SetTargetFPS(60);
 
     // Control
     bool show_log = true, show_grid = false, show_health = false, delete_boids = false;
+    int input_cursor = 0;
     int brush_size = 1;
     BoidAction action = ACT_STOP;
 
@@ -1453,18 +1866,15 @@ int main(int argc, char **argv) {
     } tps_display_type = TPS_NUM;
     const int tps_display_types_count = 3;
     uint8_t server_tps = 0;
-    
+
     // Start a thread to receive messages from the server
     pthread_mutex_init(&log_mtx, NULL);
     pthread_mutex_init(&input_mtx, NULL);
     pthread_mutex_init(&areas_mtx, NULL);
     pthread_mutex_init(&boids_mtx, NULL);
     pthread_mutex_init(&players_mtx, NULL);
-    NetThreadArgs thread_args = {.players_number = players_number, .joined_players = &joined_players, .chunk_size = chunk_size,
-                                 .new_room = new_room, .select_mode = &select_mode, .world_size = &world_size,
-                                 .boids_number = boids_number, .boids_count = &boids_count, .total_boids_number = total_boids_number,
-                                 .server_tps = &server_tps, .players = players, .log = &log, .grid = &grid, .areas_count = &areas_count,
-                                 .areas = areas, .boids = boids, .mode = &mode, .stage = &stage};
+    NetThreadArgs thread_args = {.new_room = new_room, .select_mode = &select_mode, .player_team = &player_team, .boids_count = &boids_count,
+                                 .server_tps = &server_tps, .log = &log, .grid = &grid, .areas_count = &areas_count, .areas = areas, .boids = boids};
     pthread_t net_thread;
     pthread_create(&net_thread, NULL, net_thread_fn, &thread_args);
     
@@ -1477,7 +1887,7 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&running_mtx);
         
         // Keys
-        if (!show_log || !typing_string_input) {
+        if (!typing_keyboard_input) {
             if (IsKeyPressed(KEY_L)) show_log = !show_log;
             if (IsKeyPressed(KEY_K)) show_grid = !show_grid;
             if (IsKeyPressed(KEY_M)) tps_display_type++, tps_display_type %= tps_display_types_count;
@@ -1486,7 +1896,7 @@ int main(int argc, char **argv) {
                 selecting_shift_pressed |= IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
         
             if (mode == MODE_AREAS) {
-                if (!show_log || !get_input) {
+                if (!typing_keyboard_input) {
                     if (IsKeyPressed(KEY_Q)) selecting_team = TEAM_RED;
                     if (IsKeyPressed(KEY_W)) selecting_team = TEAM_BLUE;
                     if (IsKeyPressed(KEY_E)) selecting_team = TEAM_GREEN;
@@ -1549,7 +1959,7 @@ int main(int argc, char **argv) {
         // Areas mode
         if (mode == MODE_AREAS) {
             // Selecting
-            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && areas_count < MAX_AREAS_COUNT && (selecting_team == -1 || team_used[selecting_team])) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && areas_count < MAX_AREAS_COUNT && (selecting_team == -1 || teams_used[selecting_team])) {
                 int x = roundf(mouse_position.x/BOID_SIZE);
                 if (x < 0) x = 0;
                 if (x > world_size.x/BOID_SIZE) x = world_size.x/BOID_SIZE;
@@ -1563,7 +1973,7 @@ int main(int argc, char **argv) {
                     area_start_selecting = area_end_selecting;
                     selecting = true;
                 }
-            } else if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) && (selecting_team == -1 || team_used[selecting_team])) {
+            } else if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) && (selecting_team == -1 || teams_used[selecting_team])) {
                 // Create new area
                 
                 selecting = false;
@@ -1622,10 +2032,10 @@ int main(int argc, char **argv) {
 
             // Start placing
             pthread_mutex_lock(&players_mtx);
-            if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && !typing_string_input && new_room && players_number == joined_players) {
+            if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && !typing_keyboard_input && new_room && players_number == joined_players) {
                 bool ok = true;
                 for (int team = 0; team < TEAMS_COUNT; team++) {
-                    if (team_used[team] && boids_number[team] > areas_size[team]) {
+                    if (teams_used[team] && boids_number[team] > areas_size[team]) {
                         ok = false;
                         break;
                     }
@@ -1818,7 +2228,7 @@ int main(int argc, char **argv) {
 
             
             // Send boids and a message that the player is ready to start the game
-            if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && !typing_string_input) {
+            if ((IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) && !typing_keyboard_input) {
                 if (boids_count == boids_number[player_team]) {
                     ClientStartNetBoids *data = calloc((boids_count + 1)*2, sizeof(*data));
                     data[0].team = -1;
@@ -1874,39 +2284,173 @@ int main(int argc, char **argv) {
         }
 
         // Get string input from keyboard
+        bool input_key_pressed = false;
         pthread_mutex_lock(&input_mtx);
-        if (show_log && get_input) {
-            if (!typing_string_input) {
-                // Input starts with SPACE
-                if (IsKeyPressed(KEY_SPACE)) {
-                    typing_string_input = true;
+        if (!typing_keyboard_input) {
+            bool command = IsKeyPressed(KEY_SLASH) || IsKeyPressed(KEY_KP_DIVIDE);
+            
+            if (IsKeyPressed(KEY_SPACE) || (!get_input && command)) {
+                typing_keyboard_input = true;
+                if (!command) {
                     input_len = 0;
-                    input_string[0] = '\0';
+                } else {
+                    input_len = 1;
+                    input_string[0] = '/'; // Command starts with '/'
                 }
-            } else {
-                // Input ends with ENTER
-                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-                    typing_string_input = false;
-                    log_message(&log, L_INPUT, input_string);
+                input_string[input_len] = '\0';
+                input_cursor = input_len;
+            }
+        } else {
+            // Input ends with ENTER
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+                typing_keyboard_input = false;
 
+                if (get_input) {
                     get_input = false;
                     input_received = true;
-                } else {
-                    int key = GetCharPressed();
-                    while (key > 0) {
-                        // Only allow keys in range [32..125]
-                        if ((key >= 32) && (key <= 125) && (input_len < INPUT_STRING_LEN)) {
-                            input_string[input_len++] = (char)key;
-                            input_string[input_len] = '\0';
-                        }
-                        key = GetCharPressed();
+                    log_message(&log, L_INPUT, "%s", input_string);
+                } else if (input_string[0] == '/') { // command
+                    log_message(&log, L_INPUT, "%s", input_string);
+                    process_command(&log, input_string);
+                } else { // message for chat
+                    uint32_t packet_size = sizeof(uint16_t) + input_len+1;
+                    uint8_t *buf = malloc(packet_size);
+
+                    *(uint16_t*)buf = htons(input_len+1);
+                    memcpy(buf+sizeof(uint16_t), input_string, input_len+1);
+                    
+                    send_packet(tcp_fd, CP_CHAT_MSG, buf, packet_size, 0);
+                    free(buf);
+                }
+            } else {
+                const int min_len = get_input ? 0 : 1;
+
+                char pressed_keys[128];
+                int pressed_keys_count = 0;
+
+                // Receive characters
+                int key = GetCharPressed();
+                while (key > 0) {
+                    // Only allow keys in range [32..125]
+                    if ((key >= 32) && (key <= 125) && (input_len < INPUT_STRING_LEN)) {
+                        pressed_keys[pressed_keys_count++] = (char)key;
                     }
-                    if (IsKeyPressed(KEY_BACKSPACE)) {
-                        input_len--;
-                        if (input_len < 0) input_len = 0;
+                    key = GetCharPressed();
+                    input_key_pressed = true;
+                }
+
+                // Insert characters
+                if (pressed_keys_count > 0 && input_len+pressed_keys_count < LOG_BUF_SIZE-1) {
+                    memmove(input_string + input_cursor + pressed_keys_count, input_string + input_cursor, input_len - input_cursor);
+                    memcpy(input_string + input_cursor, pressed_keys, pressed_keys_count);
+                    input_len += pressed_keys_count;
+                    input_cursor += pressed_keys_count;
+                    input_string[input_len] = '\0';
+                }
+                
+                if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
+                    input_key_pressed = true;
+                    if (input_cursor > min_len) {
+                        int del_start;
+                        int del_end;
+                        if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) { // Delete a word
+                            del_start = input_cursor;
+                            del_end = input_cursor;
+                            
+                            while (del_start >= min_len && !isalnum(input_string[--del_start]))
+                                ;
+                            while (del_start >= min_len && isalnum(input_string[--del_start]))
+                                ;
+                            del_start++;
+
+                        } else {
+                            // Delete one character
+                            del_start = input_cursor - 1;
+                            del_end = input_cursor;
+                        }
+                        memmove(input_string + del_start, input_string + del_end, input_len - del_end);
+                        input_cursor = del_start;
+                        input_len -= del_end - del_start;
+                        input_string[input_len] = '\0';
+                    } else {
+                        typing_keyboard_input = false;
+                    }
+                }
+
+                if (IsKeyPressed(KEY_DELETE) || IsKeyPressedRepeat(KEY_DELETE)) {
+                    input_key_pressed = true;
+                    if (input_cursor < input_len) {
+                        int del_start;
+                        int del_end;
+                        if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) { // Delete a word
+                            del_start = input_cursor;
+                            del_end = input_cursor;
+                            while (del_end < input_len && !isalnum(input_string[++del_end]))
+                                ;
+                            while (del_end < input_len && isalnum(input_string[++del_end]))
+                                ;
+                        } else {
+                            // Delete one character
+                            del_start = input_cursor;
+                            del_end = input_cursor + 1;
+                        }
+                        memmove(input_string + del_start, input_string + del_end, input_len - del_end);
+                        input_len -= del_end - del_start;
                         input_string[input_len] = '\0';
                     }
                 }
+
+                if ((IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) && input_cursor < input_len) {
+                    input_key_pressed = true;
+                    if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) { // Move through the words
+                        while (input_cursor < input_len && !isalnum(input_string[++input_cursor]))
+                            ;
+                        while (input_cursor < input_len && isalnum(input_string[++input_cursor]))
+                            ;
+                    } else {
+                        // Move through the characters
+                        input_cursor++;
+                    }
+                }
+                if ((IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) && input_cursor > min_len) {
+                    input_key_pressed = true;
+                    if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) { // Move through the words
+                        while (input_cursor >= min_len && !isalnum(input_string[--input_cursor]))
+                            ;
+                        while (input_cursor >= min_len && isalnum(input_string[--input_cursor]))
+                            ;
+                        input_cursor++;
+                    } else {
+                        // Move through the characters
+                        input_cursor--;
+                    }
+                }
+
+                // Autocomplete last word
+                if (IsKeyPressed(KEY_TAB)) {
+                    // Get the word before the cursor
+                    char word[LOG_BUF_SIZE];
+                    char *word_ptr = input_string + input_cursor;
+                    char *cursor_ptr = word_ptr;
+                    while (word_ptr > input_string && !isspace(*(word_ptr-1)))
+                        word_ptr--;
+                    int word_len = cursor_ptr - word_ptr;
+                    memcpy(word, word_ptr, word_len);
+                    word[word_len] = '\0';
+
+                    // Get new word
+                    char *new_word = autocomple_word(word);
+                    int new_word_len = strlen(new_word);
+                    
+                    // Insert new word
+                    memmove(cursor_ptr + (new_word_len - word_len), cursor_ptr, input_len - input_cursor + (new_word_len - word_len));
+                    memmove(word_ptr, new_word, new_word_len);
+                    input_cursor += new_word_len - word_len;
+                    input_len += new_word_len - word_len;
+                }
+
+                if (IsKeyPressed(KEY_HOME)) input_cursor = min_len;
+                if (IsKeyPressed(KEY_END)) input_cursor = input_len;
             }
         }
         pthread_mutex_unlock(&input_mtx);
@@ -2167,6 +2711,7 @@ int main(int argc, char **argv) {
                 pthread_mutex_lock(&areas_mtx);
                 for (int i = 0; i < areas_count; i++) {
                     Area area = areas[i];
+                    
                     Color color = RAYWHITE;
                     switch (area.team) {
                         case TEAM_RED: color = (Color){RED.r, RED.g, RED.b, (mode == MODE_AREAS)? 50: 20}; break;
@@ -2310,16 +2855,18 @@ int main(int argc, char **argv) {
                 [L_DEBUG] = GRAY,
                 [L_JOIN] = LIME,
                 [L_DISCONNECT] = ORANGE,
-                [L_QUESTION] = DARKBLUE,
+                [L_CHAT] = DARKBLUE,
+                [L_QUESTION] = BLUE,
                 [L_INPUT] = DARKPURPLE,
                 [L_INFO] = BLACK,
                 [L_WARNING] = RED,
-                [L_ERROR] = DARKRED
+                [L_ERROR] = DARKRED,
+                [L_NONE] = BLANK
             };
             
             // Draw log
             if (show_log) {
-                int line = typing_string_input, idx = log.front;
+                int line = 1, idx = log.front;
                 pthread_mutex_lock(&log_mtx);
                 for (int i = 0; i < log.size; i++) {
                     line += log.items[idx].lines;
@@ -2336,8 +2883,28 @@ int main(int argc, char **argv) {
 
             // Draw keyboard input
             pthread_mutex_lock(&input_mtx);
-            if (typing_string_input) {
-                DrawText(TextFormat("%s%s", log_prefixes[L_INPUT], input_string), 10, screen_height - 22 - 5, 20, log_colors[L_INPUT]);
+            if (typing_keyboard_input) {
+                static int timer = 0;
+                timer++;
+                if (timer > 80 || input_key_pressed) timer = 0;
+                
+                const char *text = TextFormat("%s%s", log_prefixes[L_INPUT], input_string);
+                DrawText(text, 10, screen_height - 22 - 5, 20, log_colors[L_INPUT]);
+
+                if (timer < 40) {
+                    char text_copy[LOG_BUF_SIZE];
+                    const int len = input_cursor + strlen(log_prefixes[L_INPUT]);
+                    strncpy(text_copy, text, len);
+                    text_copy[len] = '\0';
+
+                    float width = MeasureText(text_copy, 20);
+                    DrawText("|", 10 + width, screen_height - 22 - 5, 20, BLACK);
+                }
+                // DrawText(TextFormat("%d\n%d", input_len, input_cursor), 10, 100, 20, BLACK);
+            } else {
+                DrawText(log_prefixes[L_INPUT], 10, screen_height - 22 - 5, 20, log_colors[L_INPUT]);
+                DrawText("Press '/' or SPACE to start typing . . .", 10 + 22, screen_height - 22 - 5, 20, GRAY);
+                
             }
             pthread_mutex_unlock(&input_mtx);
 
@@ -2345,7 +2912,7 @@ int main(int argc, char **argv) {
             int l = 0; // line
             pthread_mutex_lock(&players_mtx);
             for (int team = 0; team < TEAMS_COUNT; team++) {
-                if (!team_used[team]) continue;
+                if (!teams_used[team]) continue;
                 
                 bool player_joined = false;
                 int player_idx = 0;
@@ -2364,23 +2931,23 @@ int main(int argc, char **argv) {
                     case TEAM_YELLOW: team_color = ORANGE; break;
                 }
 
-                char *str = NULL;
+                const char *str = NULL;
                 if (stage == STAGE_AREAS) {
                     // <player_name>: <target_boids_number> (<areas_size><! if boids_count less than areas_size>)
-                    str = (char*)TextFormat("%s: %d%c(%d%s", player_joined ? players[player_idx].name : "-", boids_number[team], new_room ? ' ' : '\0',
+                    str = TextFormat("%s: %d%c(%d%s", player_joined ? players[player_idx].name : "-", boids_number[team], new_room ? ' ' : '\0',
                                             areas_size[team], (boids_number[team] < areas_size[team])? ")" : "!)");
                 } else if (stage == STAGE_PLACING) {
                     if (team == (signed)player_team) {
-                        str = (char*)TextFormat("%s: %d (%d left) %s", players[player_idx].name, boids_count, boids_number[team]-boids_count,
+                        str = TextFormat("%s: %d (%d left) %s", players[player_idx].name, boids_count, boids_number[team]-boids_count,
                                                 players[team].ready? "ready" : "");
                     } else {
                         if (player_joined)
-                            str = (char*)TextFormat("%s: - %s", players[player_idx].name, players[team].ready? "(ready)" : "");
+                            str = TextFormat("%s: - %s", players[player_idx].name, players[team].ready? "(ready)" : "");
                         else
                             str = "- : -";
                     }
                 } else if (stage == STAGE_GAME) {
-                    str = (char*)TextFormat("%s: %d", players[player_idx].name, boids_number[team]);
+                    str = TextFormat("%s: %d", players[player_idx].name, boids_number[team]);
                 }
 
                 if (str != NULL)
