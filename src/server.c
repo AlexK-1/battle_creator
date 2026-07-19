@@ -223,7 +223,7 @@ void close_client(int fd) {
             int find_idx = -1;
             for (int i = 0; i < p->in_queue->size; i++) {
                 int idx = (p->in_queue->front + i) % p->in_queue->max_len;
-                if (p->in_queue->items[idx]->tcp_fd == p->tcp_fd) {
+                if (p->in_queue->items[idx] == p) {
                     find_idx = idx;
                     break;
                 }
@@ -232,20 +232,29 @@ void close_client(int fd) {
             if (find_idx != -1) {
                 Player **q = p->in_queue->items;
                 if (find_idx < p->in_queue->max_len-1)
-                    memmove(q + p->in_queue->front + 1, q + find_idx + 1, sizeof(*q) * (p->in_queue->max_len-1 - find_idx));
+                    memmove(q + find_idx, q + find_idx + 1, sizeof(*q) * (p->in_queue->max_len-1 - find_idx));
                 if (p->in_queue->rear < p->in_queue->front) {
                     q[p->in_queue->max_len-1] = q[0];
                     memmove(q, q + 1, sizeof(*q) * (p->in_queue->rear));
                 }
             }
 
+            p->in_queue->size--;
+            p->in_queue->rear--;
+            
             if (find_idx == p->in_queue->front) {
                 uint32_t nid = htonl(p->id);
                 send_packet(p->approving_player->tcp_fd, SP_PLAYER_EXIT, &nid, sizeof(nid), 0);
-            }
+
+                if (p->in_queue->size > 0) {
+                    Player *new_approved_player = queue_front(*p->in_queue);
             
-            p->in_queue->size--;
-            p->in_queue->rear--;
+                    SPApprove send_data = {.id = htonl(new_approved_player->id), .username = { 0 }};
+                    strcpy(send_data.username, new_approved_player->name);
+
+                    send_packet(p->approving_player->tcp_fd, SP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
+                }
+            }
         }
 
         write_log(L_DISCONNECT, "fd=%d id=%d hung up\n", fd, p->id);
@@ -679,6 +688,7 @@ void process_data(Player *p) {
             break;
         
         dequeue(p->approving_queue, approved_player);
+        approved_player->in_queue = NULL;
 
         if (approved_player->joined)
             break;
@@ -692,7 +702,6 @@ void process_data(Player *p) {
             approved_player->ready = false;
             approved_player->team = data.team;
             approved_player->room = p->room;
-            approved_player->in_queue = NULL;
 
             Room *room = p->room;
             room->players[room->joined_players++] = approved_player;

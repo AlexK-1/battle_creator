@@ -1,5 +1,6 @@
 #ifndef _WIN32
     #include <sys/socket.h>
+    #include <sys/select.h>
     #include <arpa/inet.h>
     #include <netinet/tcp.h>
     #include <fcntl.h>
@@ -188,6 +189,8 @@ typedef struct {
     uint16_t *areas_count;
     Area *areas;
     ClientBoid *boids;
+    uint32_t approved_player_id;
+    char approved_player_username[USERNAME_LEN];
 } NetThreadArgs;
 
 pthread_mutex_t areas_mtx;
@@ -199,35 +202,392 @@ pthread_mutex_t players_mtx;
 #define CHECK_LEAST_SIZE(size)                                                                                     \
     if (packet_size < (size)) {                                                                                    \
         log_message(log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n", \
-                  packet_type, (uint32_t)(size), packet_size);                                                               \
-        ex = true;                                                                                                 \
-        break;                                                                                                     \
+                  packet_type, (uint32_t)(size), packet_size);                                                     \
+        return 1;                                                                                                  \
     }
 
 #define CHECK_SIZE(size)                                                                                           \
     if (packet_size != (size)) {                                                                                   \
         log_message(log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",          \
-                  packet_type, (uint32_t)(size), packet_size);                                                               \
-        ex = true;                                                                                                 \
-        break;                                                                                                     \
+                  packet_type, (uint32_t)(size), packet_size);                                                     \
+        return 1;                                                                                                  \
     }
+
+int process_data(NetThreadArgs *thread_args, uint8_t packet_type, uint32_t packet_size, char *packet_data) {
+    bool new_room = thread_args->new_room;
+    bool *select_mode = thread_args->select_mode;
+    BoidTeam *player_team = thread_args->player_team;
+    BoidIndex *boids_count = thread_args->boids_count;
+    Log *log = thread_args->log;
+    Area *areas = thread_args->areas;
+    uint16_t *areas_count = thread_args->areas_count;
+    uint8_t *server_tps = thread_args->server_tps;
+    Grid *grid = thread_args->grid;
+    ClientBoid *boids = thread_args->boids;
+    uint32_t *approved_player_id = &thread_args->approved_player_id;
+    char *approved_player_username = thread_args->approved_player_username;
+
+    switch (packet_type) {
+    case SP_APPROVE_PLAYER: { // Approve/reject new player
+        /* PACKET FORMAT
+        [SPApprove player]
+        */
+
+        CHECK_SIZE( sizeof(SPApprove) );
+        
+        SPApprove *other_player = (SPApprove*)packet_data;
+
+        *approved_player_id = ntohl(other_player->id);
+        strcpy(approved_player_username, other_player->username);
+
+        pthread_mutex_lock(&input_mtx);
+        get_input = true;
+        pthread_mutex_unlock(&input_mtx);
+
+        log_message(log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", other_player->username);
+
+        break;   
+        }
+    case SP_NEW_JOIN: {
+        /* PACKET FORMAT
+        [ClientPlayer new_player]
+        */
+    
+        CHECK_SIZE( sizeof(ClientPlayer) );
+        
+        ClientPlayer *new_player = (ClientPlayer*)packet_data;
+        new_player->id = ntohl(new_player->id);
+
+        pthread_mutex_lock(&players_mtx);
+        players[joined_players++] = *new_player;
+        pthread_mutex_unlock(&players_mtx);
+        log_message(log, L_JOIN, "new player '%s' - %s\n", new_player->name, get_team_name(new_player->team));
+
+        if (new_room && players_number == joined_players && stage == STAGE_AREAS) {
+            log_message(log, L_INFO, "press ENTER to start placing boids\n");
+        }
+        *approved_player_id = 0;
+    
+        break;
+        }
+    case SP_PLAYER_EXIT: {
+        /* PACKET FORMAT
+        [uin32_t player_id]
+        */
+    
+        CHECK_SIZE( sizeof(uint32_t) );
+
+        uint32_t exited_player = ntohl(*(uint32_t*)packet_data);
+
+        if ((stage == STAGE_AREAS || stage == STAGE_PLACING) && exited_player == *approved_player_id) {
+            log_message(log, L_DISCONNECT, "player '%s' disconnected\n", approved_player_username);
+            *approved_player_id = 0;
+
+            pthread_mutex_lock(&input_mtx);
+            if (get_input)
+                typing_keyboard_input = false;
+            get_input = false;
+            pthread_mutex_unlock(&input_mtx);
+        } else {
+            pthread_mutex_lock(&players_mtx);
+            int player_idx = get_player_idx(players, exited_player);
+            if (player_idx < 0 || player_idx >= joined_players) {
+                pthread_mutex_unlock(&players_mtx);
+                break;
+            }
+
+            log_message(log, L_DISCONNECT, "player '%s' disconnected\n", players[player_idx].name);
+    
+            // delete player from array
+            memmove(players + player_idx, players + player_idx + 1,
+                    sizeof(players[0]) * (joined_players - player_idx - 1));
+            joined_players--;
+            pthread_mutex_unlock(&players_mtx);
+        }
+    
+        break;
+        }
+    case SP_START_PLACING:
+    case SP_SEND_AREAS: {
+        /* PACKET FORMAT
+        [uint16 areas_count] [Area[areas_count] areas]
+        */
+
+        CHECK_LEAST_SIZE( /*areas_count*/ sizeof(int16_t) );
+        
+        uint16_t new_areas_count = ntohs(*(int16_t*)packet_data);
+        CHECK_SIZE( sizeof(new_areas_count) + new_areas_count*sizeof(Area) );
+        
+        if (!new_room) {
+            pthread_mutex_lock(&areas_mtx);
+            *areas_count = new_areas_count;
+            Area *a = (Area*)(packet_data + sizeof(new_areas_count));
+            for (int i = 0; i < *areas_count; i++) {
+                areas[i].team = a->team;
+                areas[i].rec.x1 = ntohs(a->rec.x1);
+                areas[i].rec.x2 = ntohs(a->rec.x2);
+                areas[i].rec.y1 = ntohs(a->rec.y1);
+                areas[i].rec.y2 = ntohs(a->rec.y2);
+                a++;
+            }
+            pthread_mutex_unlock(&areas_mtx);
+        }
+
+        if (packet_type == SP_START_PLACING) {
+            mode = MODE_SPAWN;
+            stage = STAGE_PLACING;
+
+            log_message(log, L_INFO, "now you can spawn boids on your areas");
+            log_message(log, L_INFO, "press ENTER when you will ready to start the game\n");
+        }
+    
+        break;
+        }
+    case SP_PLAYER_READY: {
+        /* PACKET FORMAT
+        [uint32 player_id]
+        */
+
+        CHECK_SIZE( sizeof(uint32_t) );
+
+        pthread_mutex_lock(&players_mtx);
+        uint32_t id = ntohl(*(uint32_t*)packet_data);
+        int idx = get_player_idx(players, id);
+        players[players[idx].team].ready = true;
+        log_message(log, L_INFO, "player '%s' is ready\n", players[idx].name);
+        pthread_mutex_unlock(&players_mtx);
+    
+        break;
+        }
+    case SP_START_GAME: {
+        /* PACKET FORMAT
+        [uint16 boids_count] [ServerStartNetBoid[boids_count] boids]
+        */
+
+        CHECK_LEAST_SIZE( /*boids_count*/ sizeof(uint16_t) );
+    
+        uint16_t recv_boids_count = ntohs(*(uint16_t*)packet_data);
+        CHECK_SIZE( sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid) );
+        
+        if (recv_boids_count != total_boids_number) {
+            log_message(log, L_ERROR, "invalid number of boids in SP#%d packet (expected %d boids, %d boids received)\n",
+                      packet_type, total_boids_number, recv_boids_count);
+            return 1;
+        }
+
+        ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(packet_data + sizeof(recv_boids_count));
+
+        pthread_mutex_lock(&boids_mtx);
+        for (int i = 0; i < recv_boids_count; i++) {
+            ServerStartNetBoid recv_boid = recv_boids[i];
+            ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed/100.0f, .health = BOID_MAX_HEALTH, .xp = recv_boid.xp,
+                                         .team = recv_boid.team, .action = ACT_STOP},
+                                   .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
+            boids[i] = new_boid;
+        }
+        *boids_count = recv_boids_count;
+
+        // Reinit grid
+        init_grid(grid, boids, *boids_count, world_size.x, world_size.y, chunk_size);
+
+        pthread_mutex_unlock(&boids_mtx);
+
+        mode = MODE_SELECT;
+        stage = STAGE_GAME;
+        *select_mode = true;
+
+        log_message(log, L_INFO, "the game has started\n");
+    
+        break;
+        }
+    case SP_BOIDS_SYNC: {
+        /* PACKET FORMAT
+        [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
+        */
+
+        CHECK_LEAST_SIZE( /*current_server_tps*/ 1 + /*boids_count*/ sizeof(BoidIndex) + /*first_boid_index*/ sizeof(BoidIndex) );
+
+        BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(packet_data+1));
+        CHECK_SIZE( 1 + sizeof(BoidIndex) + sizeof(BoidIndex) + recv_boids_count*sizeof(NetBoid) );
+        
+        *server_tps = *(uint8_t*)packet_data;
+        BoidIndex boids_first_index = ntohs(*(BoidIndex*)(packet_data+1+sizeof(BoidIndex)));
+
+        NetBoid *recv_boids = (NetBoid*)(packet_data + 1 + sizeof(recv_boids_count)*2);
+
+        pthread_mutex_lock(&boids_mtx);
+        for (int i = 0; i < recv_boids_count; i++) {
+            NetBoid *recv_boid = &recv_boids[i];
+            ClientBoid *boid = &boids[boids_first_index + i];
+            boid->b.health = recv_boid->health;
+            boid->b.xp = recv_boid->xp;
+            if (recv_boid->action == ACT_FALL || recv_boid->action == ACT_SURRENDER) {
+                boid->is_selected = false;
+                if ((recv_boid->action == ACT_FALL && boid->b.action != ACT_FALL) ||
+                    (recv_boid->action == ACT_SURRENDER && boid->b.action != ACT_SURRENDER))
+                    boid->sprite_timer = 0;
+                boid->b.action = recv_boid->action;
+                continue;
+            }
+            boid->b.action = recv_boid->action;
+            boid->target_pos = (Vector2){ntohs(recv_boid->x), ntohs(recv_boid->y)};
+            boid->b.velocity.x = recv_boid->vel/255.0*BOID_MAX_SPEED * cos(recv_boid->angle/127.0*PI);
+            boid->b.velocity.y = recv_boid->vel/255.0*BOID_MAX_SPEED * sin(recv_boid->angle/127.0*PI);
+            // if (recv_boid->vel > 0 && !boid->b.is_fighting)
+            //     boid->direction = boid->b.velocity;
+            boid->go_target = true;
+        }
+
+        // Update grid
+        clear_grid(grid);
+        fill_grid(grid, boids, *boids_count);
+
+        pthread_mutex_unlock(&boids_mtx);
+
+        break;
+        }
+    case SP_ROOM_CLOSED: {
+        /* PACKET FORMAT
+        [uint8 auto_close]
+        */
+
+        CHECK_SIZE( 1 );
+
+        uint8_t auto_close = *(uint8_t*)packet_data;
+        if (auto_close) // room is closed by server
+            log_message(log, L_INFO, "room closed\n");
+        else // room is closed player (admin)
+            log_message(log, L_INFO, "room closed by player '%s'\n", players[0].name);
+    
+        break;
+        }
+    case SP_PLAYER_KICKED: {
+        /* PACKET FORMAT
+        [uint32 player_id]
+        */
+
+        CHECK_SIZE( sizeof(uint32_t) );
+
+        uint32_t kicked_player = ntohl(*(uint32_t*)packet_data);
+
+        pthread_mutex_lock(&players_mtx);
+        int player_idx = get_player_idx(players, kicked_player);
+        if (player_idx < 0 || player_idx >= joined_players) {
+            pthread_mutex_unlock(&players_mtx);
+            break;
+        }
+        
+        log_message(log, L_DISCONNECT, "player '%s' was kicked out of the room by player '%s'\n", players[player_idx].name, players[0].name);
+
+        // delete player from array
+        memmove(players + player_idx, players + player_idx + 1,
+                sizeof(players[0]) * (joined_players - player_idx - 1));
+        joined_players--;
+        pthread_mutex_unlock(&players_mtx);
+
+        break;
+        }
+    case SP_CHANGE_TEAM: {
+        /* PACKET FORMAT
+        [uint32 player1_id] [uint32 player2_id]
+        */
+
+        CHECK_SIZE( sizeof(uint32_t) + 1 );
+
+        uint32_t pid = ntohl(*(uint32_t*)(packet_data)); // player ID
+
+        pthread_mutex_lock(&players_mtx);
+        int pidx = get_player_idx(players, pid); // player idx
+        if (pidx < 0 || pidx >= joined_players) {
+            pthread_mutex_unlock(&players_mtx);
+            break;
+        }
+
+        int8_t team = *(int8_t*)(packet_data+sizeof(uint32_t));
+        if (team < 0 || team >= TEAMS_COUNT) {
+            pthread_mutex_unlock(&players_mtx);
+            break;
+        }
+        
+        players[pidx].team = team;
+        *player_team = players[get_player_idx(players, player_id)].team;
+        
+        log_message(log, L_INFO, "player '%s' changed team of player '%s' to %s\n",
+                    players[0].name, players[pidx].name, get_team_name(team));
+
+        pthread_mutex_unlock(&players_mtx);
+        break;
+        }
+    case SP_SWAP_TEAMS: {
+        /* PACKET FORMAT
+        [uint32 player1_id] [uint32 player2_id]
+        */
+
+        CHECK_SIZE( sizeof(uint32_t)*2 );
+        
+        uint32_t pid1 = ntohl(*(uint32_t*)(packet_data));
+        uint32_t pid2 = ntohl(*(uint32_t*)(packet_data+sizeof(uint32_t)));
+        
+        pthread_mutex_lock(&players_mtx);
+
+        int pidx1 = get_player_idx(players, pid1);
+        if (pidx1 < 0 || pidx1 >= joined_players) {
+            pthread_mutex_unlock(&players_mtx);
+            break;
+        }
+        int pidx2 = get_player_idx(players, pid2);
+        if (pidx2 < 0 || pidx2 >= joined_players) {
+            pthread_mutex_unlock(&players_mtx);
+            break;
+        }
+
+        int team_tmp = players[pidx1].team;
+        players[pidx1].team = players[pidx2].team;
+        players[pidx2].team = team_tmp;
+        *player_team = players[get_player_idx(players, player_id)].team;
+        
+        log_message(log, L_INFO, "player '%s' changed team of player '%s' to %s and team of player '%s' to %s\n",
+                    players[0].name, players[pidx1].name, get_team_name(players[pidx1].team),
+                    players[pidx2].name, get_team_name(players[pidx2].team));
+
+        pthread_mutex_unlock(&players_mtx);
+        break;
+        }
+    case SP_CHAT_MSG: {
+        /* PACKET FORMAT
+        [uint32 sender_id] [uint16 msg_len] [uint8[msg_len] msg]
+        */
+
+        CHECK_LEAST_SIZE( sizeof(uint32_t) + sizeof(uint16_t) );
+
+        uint32_t sender_id = ntohl(*(uint32_t*)(packet_data));
+        uint32_t msg_len = ntohs(*(uint16_t*)(packet_data+sizeof(uint32_t)));
+        
+        CHECK_SIZE( sizeof(uint32_t) + sizeof(uint16_t) + msg_len );
+
+        int sender_idx = get_player_idx(players, sender_id);
+        if (sender_idx < 0)
+            break;
+        
+        char *msg = packet_data+sizeof(uint32_t)+sizeof(uint16_t);
+
+        log_message(log, L_CHAT, "@%s: %.*s", players[sender_idx].name, msg_len, msg);;
+        
+        break;
+        }
+    }
+
+    return 0;
+}
 
 void *net_thread_fn(void *args) {
     NetThreadArgs *nargs = args;
-    
-    bool new_room = nargs->new_room;
-    bool *select_mode = nargs->select_mode;
-    BoidTeam *player_team = nargs->player_team;
-    BoidIndex *boids_count = nargs->boids_count;
-    Log *log = nargs->log;
-    Area *areas = nargs->areas;
-    uint16_t *areas_count = nargs->areas_count;
-    uint8_t *server_tps = nargs->server_tps;
-    Grid *grid = nargs->grid;
-    ClientBoid *boids = nargs->boids;
+    uint32_t *approved_player_id = &nargs->approved_player_id;
+    char *approved_player_username = nargs->approved_player_username;
 
-    uint32_t approved_player_id = 0;
-    char approved_player_username[USERNAME_LEN];
+    Log *log = nargs->log;
+    *approved_player_id = 0;
+    approved_player_username[0] = '\0';
     
     enum {
         SYNC_PROTO_NONE = 0,
@@ -235,7 +595,9 @@ void *net_thread_fn(void *args) {
         SYNC_PROTO_UDP,
     } sync_proto = SYNC_PROTO_NONE;
     
-    bool ex = false; // exit from loop
+    struct timeval timeout;
+    fd_set read_fds;
+
     while (1) {
         pthread_mutex_lock(&running_mtx);
         if (!running) {
@@ -246,25 +608,19 @@ void *net_thread_fn(void *args) {
         
         pthread_mutex_lock(&input_mtx);
         if (input_received) {
-            if (approved_player_id != 0) { // 0 is an invalid player id
+            if (*approved_player_id != 0) { // 0 is an invalid player id
                 bool ok = true;
-                int8_t team = -1;
-                char team_char = *input_string;
-            
-                if (team_char == 'r')
-                    team = TEAM_RED;
-                else if (team_char == 'b')
-                    team = TEAM_BLUE;
-                else if (team_char == 'g')
-                    team = TEAM_GREEN;
-                else if (team_char == 'y')
-                    team = TEAM_YELLOW;
-                else if (team_char == 'n')
-                    team = -1;
-                else {
-                    log_message(log, L_WARNING, "enter valid team\n");
-                    get_input = true;
-                    ok = false;
+                int8_t team;
+
+                if (input_string[0] == 'n') {
+                    team = -1; // reject new player
+                } else {
+                    team = get_team_id(input_string);
+                    if (team < 0) {
+                        log_message(log, L_WARNING, "enter valid team\n");
+                        get_input = true;
+                        ok = false;
+                    }
                 }
 
                 if (team >= 0) {
@@ -289,9 +645,9 @@ void *net_thread_fn(void *args) {
                         ok = false;
                     }
                 }
-
+                
                 if (ok) {
-                    CPApprove send_data = {.id = htonl(approved_player_id), .team = team};
+                    CPApprove send_data = {.id = htonl(*approved_player_id), .team = team};
                     send_packet(tcp_fd, CP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
                 }
             }
@@ -300,470 +656,109 @@ void *net_thread_fn(void *args) {
         }
         pthread_mutex_unlock(&input_mtx);
         
-        uint8_t packet_type;
-        bool recv_udp = false, recv_tcp = false;
+        FD_ZERO(&read_fds);
+        FD_SET(tcp_fd, &read_fds);
+        if (udp_opened)
+            FD_SET(udp_fd, &read_fds);
 
-        // Try to receive a packet by TCP
-        int r = recv(tcp_fd, &packet_type, 1, 0);
-        if (r == 0) {
-            log_message(log, L_DEBUG, "TCP connection closed\n");
-            break;
-        } else if (r < 0) {
-            bool err_wouldblock;
-            #ifdef _WIN32
-                int err = WSAGetLastError();
-                err_wouldblock = (err == WSAEWOULDBLOCK);
-            #else
-                err_wouldblock = (errno == EWOULDBLOCK);
-            #endif
-            if (err_wouldblock) { // No data in TCP
-                recv_udp = true;
-            } else {
-                log_message(log, L_ERROR, "failed to receive a packet size by TCP\n");
-                perror("recv");
-                break;
-            }
-        } else {
-            recv_tcp = true;
-        }
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100*1000; // 100 ms
 
-        uint32_t packet_size;
-        char recv_buf_stack[32 * 1024], *recv_buf;
-
-        // Receive data by TCP
-        if (recv_tcp) {
-            recv_all(tcp_fd, &packet_size, sizeof(uint32_t), 0);
-            packet_size = ntohl(packet_size);
-            recv_buf = malloc(packet_size);
-
-            if (recv_all(tcp_fd, recv_buf, packet_size, 0)) {
-                log_message(log, L_ERROR, "error receiving SP#%d packet\n", packet_type);
-                perror("recv_all");
-                free(recv_buf);
-                break;
-            }
-        }
-
-        // Try to receive a packet by UDP
-        if (recv_udp) {
-            socklen_t addrlen = sizeof(udp_servaddr);
-            ssize_t n = recvfrom(udp_fd, recv_buf_stack, sizeof(recv_buf_stack), 0, (struct sockaddr*)&udp_servaddr, &addrlen);
-            if (n == 0) {
-                log_message(log, L_DEBUG, "UDP connection closed\n");
-                break;
-            } else if (n < 0) {
-                bool err_wouldblock;
-                #ifdef _WIN32
-                    int err = WSAGetLastError();
-                    err_wouldblock = (err == WSAEWOULDBLOCK);
-                #else
-                    err_wouldblock = (errno == EWOULDBLOCK);
-                #endif
-                if (err_wouldblock) {
-                    recv_udp = false; // No data
-                } else {
-                    log_message(log, L_ERROR, "failed to receive data by UDP\n");
-                    perror("recv");
+        const int max_fd = udp_opened? MAX(tcp_fd, udp_fd) : tcp_fd;
+        int ready = select(max_fd+1, &read_fds, NULL, NULL, &timeout);
+        if (ready > 0) {
+            // Check TCP
+            if (FD_ISSET(tcp_fd, &read_fds)) {
+                uint32_t packet_type;
+                int r = recv(tcp_fd, (void*)&packet_type, 1, 0);
+                if (r == 0) {
+                    log_message(log, L_DEBUG, "TCP connection closed\n");
                     break;
-                }
-            } else {
-                if ((uint32_t)n >= (1 + sizeof(packet_size))) {
-                    // Prepare data to processing
-                    recv_buf = recv_buf_stack;
-                    packet_type = *(uint8_t*)recv_buf;
-                    packet_size = ntohl(*(uint32_t*)(recv_buf + 1));
-                    recv_buf += 1 + sizeof(packet_size); // Skip header
-
-                    recv_udp = (uint32_t)n == (1 + sizeof(packet_size) + packet_size);
+                } else if (r < 0) {
+                    bool err_wouldblock;
+                    #ifdef _WIN32
+                        int err = WSAGetLastError();
+                        err_wouldblock = (err == WSAEWOULDBLOCK);
+                    #else
+                        err_wouldblock = (errno == EWOULDBLOCK);
+                    #endif
+                    if (!err_wouldblock) {
+                        log_message(log, L_ERROR, "failed to receive a packet size by TCP\n");
+                        perror("recv");
+                        break;
+                    }
                 } else {
-                    recv_udp = false; // Invalid packet
-                }
-            }
-        }
+                    uint32_t packet_size;
+                    recv_all(tcp_fd, &packet_size, sizeof(uint32_t), 0);
+                    packet_size = ntohl(packet_size);
+                    char *packet_data = malloc(packet_size);
 
-        if (!recv_tcp && !recv_udp) {
-            // No data at all (neither TCP nor UDP)
-            WaitTime(0.03);
-        } else {
-            // Process received data
-            
-            switch (packet_type) {
-            case SP_APPROVE_PLAYER: { // Approve/reject new player
-                /* PACKET FORMAT
-                [SPApprove player]
-                */
-
-                CHECK_SIZE( sizeof(SPApprove) );
-                
-                SPApprove *other_player = (SPApprove*)recv_buf;
-
-                approved_player_id = ntohl(other_player->id);
-                strcpy(approved_player_username, other_player->username);
-
-                pthread_mutex_lock(&input_mtx);
-                get_input = true;
-                pthread_mutex_unlock(&input_mtx);
-
-                log_message(log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", other_player->username);
-
-                break;   
-                }
-            case SP_NEW_JOIN: {
-                /* PACKET FORMAT
-                [ClientPlayer new_player]
-                */
-            
-                CHECK_SIZE( sizeof(ClientPlayer) );
-                
-                ClientPlayer *new_player = (ClientPlayer*)recv_buf;
-                new_player->id = ntohl(new_player->id);
-
-                pthread_mutex_lock(&players_mtx);
-                players[joined_players++] = *new_player;
-                pthread_mutex_unlock(&players_mtx);
-                log_message(log, L_JOIN, "new player '%s' - %s\n", new_player->name, get_team_name(new_player->team));
-
-                if (new_room && players_number == joined_players && stage == STAGE_AREAS) {
-                    log_message(log, L_INFO, "press ENTER to start placing boids\n");
-                }
-                approved_player_id = 0;
-            
-                break;
-                }
-            case SP_PLAYER_EXIT: {
-                /* PACKET FORMAT
-                [uin32_t player_id]
-                */
-            
-                CHECK_SIZE( sizeof(uint32_t) );
-
-                uint32_t exited_player = ntohl(*(uint32_t*)recv_buf);
-
-                if ((stage == STAGE_AREAS || stage == STAGE_PLACING) && exited_player == approved_player_id) {
-                    log_message(log, L_DISCONNECT, "player '%s' disconnected\n", approved_player_username);
-                    approved_player_id = 0;
-
-                    pthread_mutex_lock(&input_mtx);
-                    if (get_input)
-                        typing_keyboard_input = false;
-                    get_input = false;
-                    pthread_mutex_unlock(&input_mtx);
-                } else {
-                    pthread_mutex_lock(&players_mtx);
-                    int player_idx = get_player_idx(players, exited_player);
-                    if (player_idx < 0 || player_idx >= joined_players) {
-                        pthread_mutex_unlock(&players_mtx);
+                    if (recv_all(tcp_fd, packet_data, packet_size, 0)) {
+                        log_message(log, L_ERROR, "error receiving SP#%d packet\n", packet_type);
+                        perror("recv_all");
+                        free(packet_data);
                         break;
                     }
 
-                    log_message(log, L_DISCONNECT, "player '%s' disconnected\n", players[player_idx].name);
-            
-                    // delete player from array
-                    memmove(players + player_idx, players + player_idx + 1,
-                            sizeof(players[0]) * (joined_players - player_idx - 1));
-                    joined_players--;
-                    pthread_mutex_unlock(&players_mtx);
-                }
-            
-                break;
-                }
-            case SP_START_PLACING:
-            case SP_SEND_AREAS: {
-                /* PACKET FORMAT
-                [uint16 areas_count] [Area[areas_count] areas]
-                */
-
-                CHECK_LEAST_SIZE( /*areas_count*/ sizeof(int16_t) );
-                
-                uint16_t new_areas_count = ntohs(*(int16_t*)recv_buf);
-                CHECK_SIZE( sizeof(new_areas_count) + new_areas_count*sizeof(Area) );
-                
-                if (!new_room) {
-                    pthread_mutex_lock(&areas_mtx);
-                    *areas_count = new_areas_count;
-                    Area *a = (Area*)(recv_buf + sizeof(new_areas_count));
-                    for (int i = 0; i < *areas_count; i++) {
-                        areas[i].team = a->team;
-                        areas[i].rec.x1 = ntohs(a->rec.x1);
-                        areas[i].rec.x2 = ntohs(a->rec.x2);
-                        areas[i].rec.y1 = ntohs(a->rec.y1);
-                        areas[i].rec.y2 = ntohs(a->rec.y2);
-                        a++;
-                    }
-                    pthread_mutex_unlock(&areas_mtx);
-                }
-
-                if (packet_type == SP_START_PLACING) {
-                    mode = MODE_SPAWN;
-                    stage = STAGE_PLACING;
-
-                    log_message(log, L_INFO, "now you can spawn boids on your areas");
-                    log_message(log, L_INFO, "press ENTER when you will ready to start the game\n");
-                }
-            
-                break;
-                }
-            case SP_PLAYER_READY: {
-                /* PACKET FORMAT
-                [uint32 player_id]
-                */
-
-                CHECK_SIZE( sizeof(uint32_t) );
-
-                pthread_mutex_lock(&players_mtx);
-                uint32_t id = ntohl(*(uint32_t*)recv_buf);
-                int idx = get_player_idx(players, id);
-                players[players[idx].team].ready = true;
-                log_message(log, L_INFO, "player '%s' is ready\n", players[idx].name);
-                pthread_mutex_unlock(&players_mtx);
-            
-                break;
-                }
-            case SP_START_GAME: {
-                /* PACKET FORMAT
-                [uint16 boids_count] [ServerStartNetBoid[boids_count] boids]
-                */
-
-                CHECK_LEAST_SIZE( /*boids_count*/ sizeof(uint16_t) );
-            
-                uint16_t recv_boids_count = ntohs(*(uint16_t*)recv_buf);
-                CHECK_SIZE( sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid) );
-                
-                if (recv_boids_count != total_boids_number) {
-                    log_message(log, L_ERROR, "invalid number of boids in SP#%d packet (expected %d boids, %d boids received)\n",
-                              packet_type, total_boids_number, recv_boids_count);
-                    ex = true;
-                    break;
-                }
-
-                ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(recv_buf + sizeof(recv_boids_count));
-
-                pthread_mutex_lock(&boids_mtx);
-                for (int i = 0; i < recv_boids_count; i++) {
-                    ServerStartNetBoid recv_boid = recv_boids[i];
-                    ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed/100.0f, .health = BOID_MAX_HEALTH, .xp = recv_boid.xp,
-                                                 .team = recv_boid.team, .action = ACT_STOP},
-                                           .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
-                    boids[i] = new_boid;
-                }
-                *boids_count = recv_boids_count;
-
-                // Reinit grid
-                init_grid(grid, boids, *boids_count, world_size.x, world_size.y, chunk_size);
-
-                pthread_mutex_unlock(&boids_mtx);
-
-                mode = MODE_SELECT;
-                stage = STAGE_GAME;
-                *select_mode = true;
-
-                log_message(log, L_INFO, "the game has started\n");
-            
-                break;
-                }
-            case SP_BOIDS_SYNC: {
-                /* PACKET FORMAT
-                [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
-                */
-
-                CHECK_LEAST_SIZE( /*current_server_tps*/ 1 + /*boids_count*/ sizeof(BoidIndex) + /*first_boid_index*/ sizeof(BoidIndex) );
-
-                BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(recv_buf+1));
-                CHECK_SIZE( 1 + sizeof(BoidIndex) + sizeof(BoidIndex) + recv_boids_count*sizeof(NetBoid) );
-                
-                if (sync_proto == SYNC_PROTO_NONE) {
-                    if (recv_tcp) {
+                    if (process_data(args, packet_type, packet_size, packet_data))
+                        break;
+                    if (packet_type == SP_BOIDS_SYNC && sync_proto != SYNC_PROTO_TCP) {
                         sync_proto = SYNC_PROTO_TCP;
                         log_message(log, L_DEBUG, "Using TCP as a protocol for boids sync\n");
-                    } else if (recv_udp) {
-                        sync_proto = SYNC_PROTO_UDP;
-                        log_message(log, L_DEBUG, "Using UDP as a protocol for boids sync\n");
                     }
-                }
-
-                *server_tps = *(uint8_t*)recv_buf;
-                BoidIndex boids_first_index = ntohs(*(BoidIndex*)(recv_buf+1+sizeof(BoidIndex)));
-
-                NetBoid *recv_boids = (NetBoid*)(recv_buf + 1 + sizeof(recv_boids_count)*2);
-
-                pthread_mutex_lock(&boids_mtx);
-                for (int i = 0; i < recv_boids_count; i++) {
-                    NetBoid *recv_boid = &recv_boids[i];
-                    ClientBoid *boid = &boids[boids_first_index + i];
-                    boid->b.health = recv_boid->health;
-                    boid->b.xp = recv_boid->xp;
-                    if (recv_boid->action == ACT_FALL || recv_boid->action == ACT_SURRENDER) {
-                        boid->is_selected = false;
-                        if ((recv_boid->action == ACT_FALL && boid->b.action != ACT_FALL) ||
-                            (recv_boid->action == ACT_SURRENDER && boid->b.action != ACT_SURRENDER))
-                            boid->sprite_timer = 0;
-                        boid->b.action = recv_boid->action;
-                        continue;
-                    }
-                    boid->b.action = recv_boid->action;
-                    boid->target_pos = (Vector2){ntohs(recv_boid->x), ntohs(recv_boid->y)};
-                    boid->b.velocity.x = recv_boid->vel/255.0*BOID_MAX_SPEED * cos(recv_boid->angle/127.0*PI);
-                    boid->b.velocity.y = recv_boid->vel/255.0*BOID_MAX_SPEED * sin(recv_boid->angle/127.0*PI);
-                    // if (recv_boid->vel > 0 && !boid->b.is_fighting)
-                    //     boid->direction = boid->b.velocity;
-                    boid->go_target = true;
-                }
-
-                // Update grid
-                clear_grid(grid);
-                fill_grid(grid, boids, *boids_count);
-
-                pthread_mutex_unlock(&boids_mtx);
-
-                break;
-                }
-            case SP_ROOM_CLOSED: {
-                /* PACKET FORMAT
-                [uint8 auto_close]
-                */
-
-                CHECK_SIZE( 1 );
-
-                uint8_t auto_close = *(uint8_t*)recv_buf;
-                if (auto_close) // room is closed by server
-                    log_message(log, L_INFO, "room closed\n");
-                else // room is closed player (admin)
-                    log_message(log, L_INFO, "room closed by player '%s'\n", players[0].name);
-                ex = true;
-            
-                break;
-                }
-            case SP_PLAYER_KICKED: {
-                /* PACKET FORMAT
-                [uint32 player_id]
-                */
-
-                CHECK_SIZE( sizeof(uint32_t) );
-
-                uint32_t kicked_player = ntohl(*(uint32_t*)recv_buf);
-
-                pthread_mutex_lock(&players_mtx);
-                int player_idx = get_player_idx(players, kicked_player);
-                if (player_idx < 0 || player_idx >= joined_players) {
-                    pthread_mutex_unlock(&players_mtx);
-                    break;
-                }
-                
-                log_message(log, L_DISCONNECT, "player '%s' was kicked out of the room by player '%s'\n", players[player_idx].name, players[0].name);
-        
-                // delete player from array
-                memmove(players + player_idx, players + player_idx + 1,
-                        sizeof(players[0]) * (joined_players - player_idx - 1));
-                joined_players--;
-                pthread_mutex_unlock(&players_mtx);
-
-                break;
-                }
-            case SP_CHANGE_TEAM: {
-                /* PACKET FORMAT
-                [uint32 player1_id] [uint32 player2_id]
-                */
-
-                CHECK_SIZE( sizeof(uint32_t) + 1 );
-
-                uint32_t pid = ntohl(*(uint32_t*)(recv_buf)); // player ID
-
-                pthread_mutex_lock(&players_mtx);
-                int pidx = get_player_idx(players, pid); // player idx
-                if (pidx < 0 || pidx >= joined_players) {
-                    pthread_mutex_unlock(&players_mtx);
-                    break;
-                }
-
-                int8_t team = *(int8_t*)(recv_buf+sizeof(uint32_t));
-                if (team < 0 || team >= TEAMS_COUNT) {
-                    pthread_mutex_unlock(&players_mtx);
-                    break;
-                }
-                
-                players[pidx].team = team;
-                *player_team = players[get_player_idx(players, player_id)].team;
-                
-                log_message(log, L_INFO, "player '%s' changed team of player '%s' to %s\n",
-                            players[0].name, players[pidx].name, get_team_name(team));
-
-                pthread_mutex_unlock(&players_mtx);
-                break;
-                }
-            case SP_SWAP_TEAMS: {
-                /* PACKET FORMAT
-                [uint32 player1_id] [uint32 player2_id]
-                */
-
-                CHECK_SIZE( sizeof(uint32_t)*2 );
-                
-                uint32_t pid1 = ntohl(*(uint32_t*)(recv_buf));
-                uint32_t pid2 = ntohl(*(uint32_t*)(recv_buf+sizeof(uint32_t)));
-                
-                pthread_mutex_lock(&players_mtx);
-
-                int pidx1 = get_player_idx(players, pid1);
-                if (pidx1 < 0 || pidx1 >= joined_players) {
-                    pthread_mutex_unlock(&players_mtx);
-                    break;
-                }
-                int pidx2 = get_player_idx(players, pid2);
-                if (pidx2 < 0 || pidx2 >= joined_players) {
-                    pthread_mutex_unlock(&players_mtx);
-                    break;
-                }
-
-                int team_tmp = players[pidx1].team;
-                players[pidx1].team = players[pidx2].team;
-                players[pidx2].team = team_tmp;
-                *player_team = players[get_player_idx(players, player_id)].team;
-                
-                log_message(log, L_INFO, "player '%s' changed team of player '%s' to %s and team of player '%s' to %s\n",
-                            players[0].name, players[pidx1].name, get_team_name(players[pidx1].team),
-                            players[pidx2].name, get_team_name(players[pidx2].team));
-
-                pthread_mutex_unlock(&players_mtx);
-                break;
-                }
-            case SP_CHAT_MSG: {
-                /* PACKET FORMAT
-                [uint32 sender_id] [uint16 msg_len] [uint8[msg_len] msg]
-                */
-
-                CHECK_LEAST_SIZE( sizeof(uint32_t) + sizeof(uint16_t) );
-
-                uint32_t sender_id = ntohl(*(uint32_t*)(recv_buf));
-                uint32_t msg_len = ntohs(*(uint16_t*)(recv_buf+sizeof(uint32_t)));
-                
-                CHECK_SIZE( sizeof(uint32_t) + sizeof(uint16_t) + msg_len );
-
-                int sender_idx = get_player_idx(players, sender_id);
-                if (sender_idx < 0)
-                    break;
-                
-                char *msg = recv_buf+sizeof(uint32_t)+sizeof(uint16_t);
-
-                log_message(log, L_CHAT, "@%s: %.*s", players[sender_idx].name, msg_len, msg);;
-                
-                break;
                 }
             }
+
+            // Check UDP
+            if (udp_opened && FD_ISSET(udp_fd, &read_fds)) {
+                char recv_buf[1500];
+                socklen_t addrlen = sizeof(udp_servaddr);
+                ssize_t n = recvfrom(udp_fd, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&udp_servaddr, &addrlen);
+                if (n == 0) {
+                    log_message(log, L_DEBUG, "UDP connection closed\n");
+                    break;
+                } else if (n < 0) {
+                    bool err_wouldblock;
+                    #ifdef _WIN32
+                        int err = WSAGetLastError();
+                        err_wouldblock = (err == WSAEWOULDBLOCK);
+                    #else
+                        err_wouldblock = (errno == EWOULDBLOCK);
+                    #endif
+                    if (!err_wouldblock) {
+                        log_message(log, L_ERROR, "failed to receive data by UDP\n");
+                        perror("recv");
+                        break;
+                    }
+                } else {
+                    if ((uint32_t)n >= (1 + sizeof(uint32_t))) {
+                        // Prepare data to processing
+                        uint8_t packet_type = *(uint8_t*)recv_buf;
+                        uint32_t packet_size = ntohl(*(uint32_t*)(recv_buf + 1));
+                        char *packet_data = recv_buf + 1 + sizeof(packet_size); // Skip header
+
+                        if ((uint32_t)n == (1 + sizeof(packet_size) + packet_size)) {
+                            if (process_data(args, packet_type, packet_size, packet_data))
+                                break;
+                            if (packet_type == SP_BOIDS_SYNC && sync_proto != SYNC_PROTO_UDP) {
+                                sync_proto = SYNC_PROTO_UDP;
+                                log_message(log, L_DEBUG, "Using UDP as a protocol for boids sync\n");
+                            }
+                        }
+                    }
+                }
+                        }
+        } else if (ready < 0) {
+            perror("select");
         }
-
-        if (recv_tcp)
-            free(recv_buf);
-
-        if (ex)
-            break;
     }
-    
+
     pthread_mutex_lock(&running_mtx);
     running = false;
     pthread_mutex_unlock(&running_mtx);
-    
+
     return NULL;
 }
-
 
 /* <============================================ BOIDS AND MAIN ============================================> */
 
@@ -1657,7 +1652,7 @@ int main(int argc, char **argv) {
         send_packet(tcp_fd, CP_NEW_ROOM, &data, sizeof(data), 0);
 
         uint8_t packet_type;
-        recv(tcp_fd, &packet_type, 1, 0);
+        recv(tcp_fd, (void*)&packet_type, 1, 0);
         if (packet_type != SP_JOIN_PLAYER) {
             write_log(L_INFO, "unable to create a room\n");
             return 1;
@@ -1677,7 +1672,7 @@ int main(int argc, char **argv) {
         send_packet(tcp_fd, CP_JOIN_ROOM, &data, sizeof(data), 0);
 
         uint8_t packet_type;
-        recv(tcp_fd, &packet_type, 1, 0);
+        recv(tcp_fd, (void*)&packet_type, 1, 0);
         if (packet_type != SP_JOIN_PLAYER) {
             write_log(L_INFO, "unable to join to the room\n");
             return 1;
@@ -1782,7 +1777,7 @@ int main(int argc, char **argv) {
     Log log;
     init_cstack(log, MAX_LOG_LEN);
     
-    log_message(&log, L_INFO, "%s\n     id: %06x\n     teams: %d\n     world: %dx%d\n     chunk: %d\n     server tps: %d\n     creator: %s\n"
+    log_message(&log, L_INFO, "%s\n     id: %06x\n     teams: %d\n     world: %dx%d\n     chunk: %d\n     server tps: %d\n     creator: %s\n"    
                     "     boids:  %-4d\n     red:    %-4d\n     blue:   %-4d\n     green:  %-4d\n     yellow: %-4d\n",
            new_room? "created a room" : "joined to the room",
            room_id, players_number, world_size.x, world_size.y, chunk_size, server_target_tps, players[0].name, total_boids_number,
@@ -2959,6 +2954,13 @@ int main(int argc, char **argv) {
         EndDrawing();
     }
 
+    // Close the second (network) thread
+    // pthread_cancel(net_thread);
+    pthread_mutex_lock(&running_mtx);
+    running = false;
+    pthread_mutex_unlock(&running_mtx);
+    pthread_join(net_thread, NULL);
+
     // Close socket
     close(tcp_fd);
     if (udp_opened)
@@ -2966,13 +2968,6 @@ int main(int argc, char **argv) {
     #ifdef _WIN32
         WSACleanup();
     #endif
-
-    // Close the second (network) thread
-    // pthread_cancel(net_thread);
-    pthread_mutex_lock(&running_mtx);
-    running = false;
-    pthread_mutex_unlock(&running_mtx);
-    pthread_join(net_thread, NULL);
 
     log_message(&log, L_INFO, "exit\n");
     

@@ -77,6 +77,8 @@ typedef struct tagBITMAPINFOHEADER {
   DWORD biClrImportant;
 } BITMAPINFOHEADER, *PBITMAPINFOHEADER;
 
+#define ssize_t int
+
 #endif
 
 #endif // WINFUCK_H

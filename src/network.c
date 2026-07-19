@@ -19,7 +19,7 @@ int send_all(int fd, void *buf, size_t n, int flags) {
     
     size_t total = 0;
     while (total < n) {
-        ssize_t sent = send(fd, (uint8_t*)buf + total, n - total, flags);
+        ssize_t sent = send(fd, (char*)buf + total, n - total, flags);
         if (sent < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
@@ -76,7 +76,7 @@ int sendto_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flag
     if (len > 0)
         memcpy(buffer+1+sizeof(nlen), buf, len);
 
-    int res = sendto(fd, buffer, total_len, flags, addr, addrlen);
+    int res = sendto(fd, (void*)buffer, total_len, flags, addr, addrlen);
     
     if (use_heap) free(buffer);
 
@@ -89,7 +89,7 @@ int recv_all(int fd, void *buf, size_t n, int flags) {
     
     size_t total = 0;
     while (total < n) {
-        ssize_t received = recv(fd, (uint8_t*)buf + total, n - total, flags);
+        ssize_t received = recv(fd, (char*)buf + total, n - total, flags);
         if (received < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
