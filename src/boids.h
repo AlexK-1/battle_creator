@@ -10,6 +10,7 @@
 #define MAX_BOIDS_COUNT 6000
 #define BOID_MAX_SPEED 1.5f
 #define BOID_MIN_SPEED 0.7f
+#define BOID_MIN_HEALTH 50
 #define BOID_MAX_HEALTH 100
 #define BOID_MAX_XP 30
 #define BOID_MAX_FIGHTING_TIMER 60
@@ -104,7 +105,7 @@ typedef struct {
 typedef struct {
     Vector2 pos, velocity;
     float speed;
-    int8_t health;
+    int8_t health, max_health;
     uint8_t xp, fighting_timer;
     uint16_t timer;
     BoidTeam team;
@@ -126,7 +127,7 @@ typedef struct {
 
 typedef struct {
     uint16_t x, y;
-    uint8_t speed, xp, team;
+    uint8_t speed, xp, team, max_health;
 } ServerStartNetBoid; // First placement of boids on the map (server -> clients)
 
 typedef struct {

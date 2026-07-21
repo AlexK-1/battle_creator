@@ -218,6 +218,7 @@ void update_base_boid(void *boids, Grid *grid, BoidIndex boid_index, size_t boid
         boid->is_fighting = true;
         boid->fighting_timer = BOID_MAX_FIGHTING_TIMER;
         if (boid->xp < BOID_MAX_XP) boid->xp++;
+        boid->hit = false;
         
         nearest_enemy->health -= 5 + ((boid->action == ACT_RETREAT)? 0 : 10*((float)boid->xp / BOID_MAX_XP));
         nearest_enemy->is_fighting = true;
@@ -238,7 +239,7 @@ void update_base_boid(void *boids, Grid *grid, BoidIndex boid_index, size_t boid
         boid->timer++;
         if (boid->timer > BOID_HEALTH_REGEN_INTERVAL) {
             boid->timer = 0;
-            if (boid->health < BOID_MAX_HEALTH) boid->health++;
+            if (boid->health < boid->max_health) boid->health++;
         }
     }
     

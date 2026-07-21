@@ -132,7 +132,7 @@ Player *find_player(Player **players, int players_count, uint32_t id) {
 }
 
 static inline int random_value(int min, int max) {
-    return rand() % (max-min) + min;
+    return rand() % (max-min+1) + min;
 }
 
 void close_client(int);
@@ -306,8 +306,10 @@ void *room_thread_fn(void *args) {
 
                     if (in_area) {
                         ServerBoid new_boid = {.b = {.pos = {cell_x*BOID_SIZE + (int)(BOID_SIZE/2.0), cell_y*BOID_SIZE + (int)(BOID_SIZE/2.0)},
-                                                     .velocity = { 0 }, .speed = random_value(80, 130)/100.0, .health = BOID_MAX_HEALTH,
+                                                     .velocity = { 0 }, .speed = random_value(80, 130)/100.0,
+                                                     .max_health = random_value(BOID_MIN_HEALTH, BOID_MAX_HEALTH),
                                                      .xp = random_value(0, 5), .team = player->team, .action = ACT_STOP}};
+                        new_boid.b.health = new_boid.b.max_health;
                         room->boids[boids_count++] = new_boid;
                     }
                 
@@ -341,8 +343,8 @@ void *room_thread_fn(void *args) {
 
     for (int i = 0; i < boids_count; i++) {
         ServerBoid *orig_boid = &room->boids[i];
-        ServerStartNetBoid boid = {.x = htons(orig_boid->b.pos.x), .y = htons(orig_boid->b.pos.y),
-                                   .speed = orig_boid->b.speed*100.0, .xp = orig_boid->b.xp, .team = orig_boid->b.team};
+        ServerStartNetBoid boid = {.x = htons(orig_boid->b.pos.x), .y = htons(orig_boid->b.pos.y), .speed = orig_boid->b.speed*100.0,
+                                   .xp = orig_boid->b.xp, .team = orig_boid->b.team, .max_health = orig_boid->b.max_health};
         boids_data[i] = boid;
     }
 

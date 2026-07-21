@@ -48,14 +48,26 @@ All players places their boids on areas of their team's color using clicking the
 he must press `Enter`.
 When all players are ready, the game will begin!
 
+You can press `Space` to write a message, then press `Enter` to send it to the room's chat.
+
+You can run various commands to control the game or get information by pressing `/` key.
+Some of them are:
+  - `/copyroomid`, `/cri` - copy ID of the room to the clipboard
+  - `/kick`, `/k @<NAME>` - kick the player out of the room (example: `/kick @user`)
+  - `/changeteam`, `/ct @<NAME> <TEAM>` - change player's team (example `/ct @user blue`)
+  - `/swapteams`, `/st @<>NAME1> @<NAME2>` - Swap teams of two players
+For more information, see the `/help` command.
+
 ### Control
 
 Global game control:
   - `Left mouse button` - move camera
-  - `Mouse wheel` or `+`/'-' - zoom in/out
+  - `Mouse wheel` or `+`/`-` - zoom in/out
   - `K` - show/hide grid
   - `L` - show/hide log
   - `M` - change server TPS display mode
+  - `Space` - write a message to the room's chat
+  - `/` - write and execute command
 
 Stage/mode-specific control:
 1. Connecting/areas stage
@@ -65,19 +77,19 @@ Stage/mode-specific control:
       - `Right mouse button` - drawing rectangle area
       - When a new player is trying to joint to the room, press `Space`, type a message, then `Enter`
       - `Enter` - start placing
-      - joiner (wait mode): can't do anything
+    - joiner (wait mode): can't do anything
 2. Spawn boids stage
     - all (place mode):
       - `Right mouse button` - spawn boids
       - `Enter` - you are ready
 3. Game stage:
     - all (select, direction, point and line modes):
-      - `S` - Select mode; the right mouse button (you can use it with the `Shift` key) highlights the boids;
+      - `S` - select mode; the right mouse button (you can use it with the `Shift` key) highlights the boids;
         you can select only the boids of a specific team using the keys `Q`, `W`, `E`, and `R`;
         pressing the `X` key removes the boids, and `Z` removes all orders for the movement of the boids (which are set in the following modes)
-      - `D` - Direction mode; the right mouse button draws an arrow in the direction in which the selected boids will move
-      - `F` - Point mode; the boids go to the point indicated on the map using the right mouse button
-      - `G` - Line mode; clicking the right mouse button creates points of a polyline along which the selected boids will line up after pressing the `T` key
+      - `D` - direction mode; the right mouse button draws an arrow in the direction in which the selected boids will move
+      - `F` - point mode; the boids go to the point indicated on the map using the right mouse button
+      - `G` - line mode; clicking the right mouse button creates points of a polyline along which the selected boids will line up after pressing the `T` key
 
 ## Server side
 

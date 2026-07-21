@@ -380,7 +380,8 @@ int process_data(NetThreadArgs *thread_args, uint8_t packet_type, uint32_t packe
         pthread_mutex_lock(&boids_mtx);
         for (int i = 0; i < recv_boids_count; i++) {
             ServerStartNetBoid recv_boid = recv_boids[i];
-            ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed/100.0f, .health = BOID_MAX_HEALTH, .xp = recv_boid.xp,
+            ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed/100.0f,
+                                         .health = recv_boid.max_health, .max_health = recv_boid.max_health, .xp = recv_boid.xp,
                                          .team = recv_boid.team, .action = ACT_STOP},
                                    .direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}};
             boids[i] = new_boid;
@@ -760,160 +761,8 @@ void *net_thread_fn(void *args) {
     return NULL;
 }
 
-/* <============================================ BOIDS AND MAIN ============================================> */
 
-void update_boid_sprite(ClientBoid *boids, BoidIndex boid_index) {
-    ClientBoid *boid = &boids[boid_index];
-    
-    if (boid->b.action == ACT_FALL) {
-        boid->sprite = SPRITE_FALL;
-        if (boid->sprite_timer < 45)
-            boid->sprite_timer++;
-        return;
-    }
-    if (boid->b.action == ACT_SURRENDER) {
-        boid->sprite = SPRITE_SURRENDER;
-        if (boid->sprite_timer < 50)
-            boid->sprite_timer++;
-        return;
-    }
-
-    // Determine if the boid should fall
-    if (boid->sprite_timer > 0) boid->sprite_timer--;
-
-    if (boid->b.is_fighting && boid->sprite_timer == 0 && boid->b.fighting_timer == BOID_MAX_FIGHTING_TIMER) {
-        boid->sprite_timer = 5;
-        if (boid->b.hit) {
-            boid->sprite = SPRITE_OUCH;
-        } else {
-            boid->sprite = (rand()%2)? SPRITE_HIT_LEFT : SPRITE_HIT_RIGHT;
-        }
-    }
-
-    if (((boid->sprite == SPRITE_HIT_LEFT || boid->sprite == SPRITE_HIT_RIGHT || boid->sprite == SPRITE_OUCH) && boid->sprite_timer == 0) || !boid->b.is_fighting) {
-        if (boid->b.action == ACT_ATTACK) boid->sprite = SPRITE_ANGRY;
-        if (boid->b.action == ACT_RETREAT) boid->sprite = SPRITE_SAD;
-        if (boid->b.action == ACT_STOP) boid->sprite = SPRITE_NORMAL;
-        boid->b.hit = false;
-    }
-    if (boid->b.is_fighting) {
-        boid->direction = Vector2Add(boid->direction, Vector2Scale(Vector2Subtract(boids[boid->b.nearest_enemy_idx].b.pos, boid->b.pos), BOID_FIGHTING_FACTOR));
-    }
-}
-
-void draw_boid(ClientBoid *boid, Texture2D texture) {
-    static Rectangle sprites[SPRITES_COUNT] = {
-         [SPRITE_NORMAL] = {0, 0, 146, 152},
-         [SPRITE_ANGRY] = {160, 0, 146, 152},
-         [SPRITE_HIT_LEFT] = {320, 0, 146, 152},
-         [SPRITE_HIT_RIGHT] = {480, 0, 146, 152},
-         [SPRITE_OUCH] = {640, 0, 146, 152},
-         [SPRITE_SAD] = {800, 0, 146, 152},
-         [SPRITE_SURRENDER] = {960, 0, 144, 252},
-         [SPRITE_FALL] = {1120, 0, 265, 203},
-    };
-
-    Rectangle sprite = sprites[boid->sprite];
-    sprite.y += 260 * boid->b.team;
-    
-    Rectangle destRec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE, BOID_SIZE};
-    if (boid->sprite == SPRITE_SURRENDER) {
-        destRec.height = BOID_SIZE * (128/75.0);
-    } else if (boid->sprite == SPRITE_FALL) {
-        destRec.width = BOID_SIZE * (132/75.0);
-        destRec.height = BOID_SIZE * (100/75.0);
-    }
-
-    Color tint = WHITE;
-    if ((boid->sprite == SPRITE_SURRENDER) || (boid->sprite == SPRITE_FALL)) {
-        tint.a = (255.0/50.0) * (50 - boid->sprite_timer);
-    }
-    
-    DrawTexturePro(texture, sprite, destRec, (Vector2){BOID_SIZE/2.0, BOID_SIZE/2.0},
-                   atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, tint);
-}
-
-void draw_selection(ClientBoid *boid, Texture2D texture, float scale, Color color) {
-    static Rectangle white_sprite = {0, 260*TEAMS_COUNT, 146, 149};
-    Rectangle dest_rec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE*scale, BOID_SIZE*scale};
-    
-    DrawTexturePro(texture, white_sprite, dest_rec, (Vector2){BOID_SIZE*1.2/2.0, BOID_SIZE*1.2/2.0},
-                   atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, color);
-}
-
-// Original function by @G-5ars
-void cleanup_areas(Area *areas, uint16_t *areas_count) {
-    // x pass
-    for (int i = 0; i < *areas_count; i++) {
-        Area *area = &areas[i];
-        if (area->team == -1)
-            continue;
-        for (int j = i+1; j < *areas_count; j++) {
-            Area *other = &areas[j];
-            if (i == j ||
-                area->team != other->team ||
-                other->team == -1)
-                continue;
-
-            if (area->rec.x1 == other->rec.x1 && area->rec.x2 == other->rec.x2 && (area->rec.y1 == other->rec.y2 || area->rec.y2 == other->rec.y1)) {
-                area->rec.y1 = MIN(area->rec.y1, other->rec.y1);
-                area->rec.y2 = MAX(area->rec.y2, other->rec.y2);
-                other->team = -1; // Mark areas as deleted
-            }
-        }
-    }
-
-    // y pass
-    for (int i = 0; i < *areas_count; i++) {
-        Area *area = &areas[i];
-        if (area->team == -1)
-            continue;
-        for (int j = i+1; j < *areas_count; j++) {
-            Area *other = &areas[j];
-            if (i == j ||
-                area->team != other->team ||
-                other->team == -1)
-                continue;
-
-            if (area->rec.y1 == other->rec.y1 && area->rec.y2 == other->rec.y2 && (area->rec.x1 == other->rec.x2 || area->rec.x2 == other->rec.x1)) {
-                area->rec.x1 = MIN(area->rec.x1, other->rec.x1);
-                area->rec.x2 = MAX(area->rec.x2, other->rec.x2);
-                other->team = -1; // Mark area as deleted
-            }
-        }
-    }
-
-    // Remove deleted areas from array
-    int offset = 0;
-    for (int i = 0; i < *areas_count; i++) {
-        areas[i - offset] = areas[i];
-        Area *area = &areas[i];
-        if (area->team == -1)
-            offset++;
-    }
-    *areas_count -= offset;
-}
-
-int send_areas(int fd, uint8_t package_type, Area *areas, uint16_t areas_count) {
-    uint32_t buf_size = areas_count * sizeof(*areas) + sizeof(areas_count);
-    char *buf = malloc(buf_size);
-
-    *(uint16_t*)buf = htons(areas_count);
-    Area *a = (Area*)(buf + sizeof(areas_count));
-    for (int i = 0; i < areas_count; i++) {
-        *a = areas[i];
-        a->rec.x1 = htons(a->rec.x1);
-        a->rec.x2 = htons(a->rec.x2);
-        a->rec.y1 = htons(a->rec.y1);
-        a->rec.y2 = htons(a->rec.y2);
-        a++;
-    }
-
-    int r = send_packet(fd, package_type, buf, buf_size, 0);
-
-    free(buf);
-    return r;
-}
+/* <=============================================== COMMANDS ===============================================> */
 
 typedef enum {
     CMD_HELP,
@@ -1238,6 +1087,222 @@ int process_command(Log *log, char *command) {
     }
 
     return 0;
+}
+
+
+/* <============================================ BOIDS AND MAIN ============================================> */
+
+void update_boid_sprite(ClientBoid *boids, BoidIndex boid_index) {
+    ClientBoid *boid = &boids[boid_index];
+    
+    if (boid->b.action == ACT_FALL) {
+        boid->sprite = SPRITE_FALL;
+        if (boid->sprite_timer < 45)
+            boid->sprite_timer++;
+        return;
+    }
+    if (boid->b.action == ACT_SURRENDER) {
+        boid->sprite = SPRITE_SURRENDER;
+        if (boid->sprite_timer < 50)
+            boid->sprite_timer++;
+        return;
+    }
+
+    // Determine if the boid should fall
+    if (boid->sprite_timer > 0) boid->sprite_timer--;
+
+    if (boid->b.is_fighting && boid->sprite_timer == 0 && boid->b.fighting_timer == BOID_MAX_FIGHTING_TIMER) {
+        boid->sprite_timer = 5;
+        if (boid->b.hit) {
+            boid->sprite = SPRITE_OUCH;
+        } else {
+            boid->sprite = (rand()%2)? SPRITE_HIT_LEFT : SPRITE_HIT_RIGHT;
+        }
+    }
+
+    if (((boid->sprite == SPRITE_HIT_LEFT || boid->sprite == SPRITE_HIT_RIGHT || boid->sprite == SPRITE_OUCH) && boid->sprite_timer == 0) || !boid->b.is_fighting) {
+        if (boid->b.action == ACT_ATTACK) boid->sprite = SPRITE_ANGRY;
+        if (boid->b.action == ACT_RETREAT) boid->sprite = SPRITE_SAD;
+        if (boid->b.action == ACT_STOP) boid->sprite = SPRITE_NORMAL;
+        boid->b.hit = false;
+    }
+    if (boid->b.is_fighting) {
+        boid->direction = Vector2Add(boid->direction, Vector2Scale(Vector2Subtract(boids[boid->b.nearest_enemy_idx].b.pos, boid->b.pos), BOID_FIGHTING_FACTOR));
+    }
+}
+
+void draw_boid(ClientBoid *boid, Texture2D texture) {
+    static Rectangle sprites[SPRITES_COUNT] = {
+         [SPRITE_NORMAL] = {0, 0, 146, 152},
+         [SPRITE_ANGRY] = {160, 0, 146, 152},
+         [SPRITE_HIT_LEFT] = {320, 0, 146, 152},
+         [SPRITE_HIT_RIGHT] = {480, 0, 146, 152},
+         [SPRITE_OUCH] = {640, 0, 146, 152},
+         [SPRITE_SAD] = {800, 0, 146, 152},
+         [SPRITE_SURRENDER] = {960, 0, 144, 252},
+         [SPRITE_FALL] = {1120, 0, 265, 203},
+    };
+
+    Rectangle sprite = sprites[boid->sprite];
+    sprite.y += 260 * boid->b.team;
+    
+    Rectangle destRec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE, BOID_SIZE};
+    if (boid->sprite == SPRITE_SURRENDER) {
+        destRec.height = BOID_SIZE * (128/75.0);
+    } else if (boid->sprite == SPRITE_FALL) {
+        destRec.width = BOID_SIZE * (132/75.0);
+        destRec.height = BOID_SIZE * (100/75.0);
+    }
+
+    Color tint = WHITE;
+    if ((boid->sprite == SPRITE_SURRENDER) || (boid->sprite == SPRITE_FALL)) {
+        tint.a = (255.0/50.0) * (50 - boid->sprite_timer);
+    }
+    
+    DrawTexturePro(texture, sprite, destRec, (Vector2){BOID_SIZE/2.0, BOID_SIZE/2.0},
+                   atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, tint);
+}
+
+void draw_selection(ClientBoid *boid, Texture2D texture, float scale, Color color) {
+    static Rectangle white_sprite = {0, 260*TEAMS_COUNT, 146, 149};
+    Rectangle dest_rec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE*scale, BOID_SIZE*scale};
+    
+    DrawTexturePro(texture, white_sprite, dest_rec, (Vector2){BOID_SIZE*1.2/2.0, BOID_SIZE*1.2/2.0},
+                   atan2f(boid->direction.y, boid->direction.x)*RAD2DEG, color);
+}
+
+typedef struct {
+    Vector2 pos, vel;
+    int dir;
+    int size;
+    bool incrase;
+    Color color;
+} Confetti;
+
+#define MAX_CONFETTI_COUNT 500
+void draw_confetti() {
+    static Confetti confetti[MAX_CONFETTI_COUNT];
+    static int confetti_count;
+    static bool confetti_initialized = false;
+
+    int screen_width = GetScreenWidth();
+    int screen_height = GetScreenHeight();
+
+    if (!confetti_initialized) {
+        confetti_count = MIN(screen_width * MAX_CONFETTI_COUNT/1920, MAX_CONFETTI_COUNT);
+        for (int i = 0; i < confetti_count; i++) {
+            Confetti c = {.pos = (Vector2){0, screen_height*0.4f - GetRandomValue(-100, 100)},
+                          .vel = Vector2Scale(Vector2Normalize((Vector2){GetRandomValue(0, 1000)/1000.0f, -GetRandomValue(0, 600)/1000.0f}), GetRandomValue(100, 1000)/1000.0f),
+                          .dir = GetRandomValue(0, 360),
+                          .size = GetRandomValue(1, 10),
+                          .incrase = rand()%2,
+                          .color = ColorFromHSV(GetRandomValue(0, 360), 0.9f, 0.95f)};
+            c.vel.y *= 0.7;
+            if (i > confetti_count/2) {
+                c.pos.x = screen_width;
+                c.vel.x *= -1;
+            }
+            confetti[i] = c;
+        }
+        
+        confetti_initialized = true;
+    } else {
+        for (int i = 0; i < confetti_count; i++) {
+            Confetti *c = &confetti[i];
+            
+            c->vel.x *= 0.975f;
+            c->vel.y += 0.007f;
+            c->pos = Vector2Add(c->pos, Vector2Scale(c->vel, screen_width * 40.0f/1920.0f));
+
+            c->dir += 5;
+            if (c->dir > 360) c->dir = 0.0f;
+
+            if (c->incrase) {
+                c->size++;
+                if (c->size > 10) c->incrase = false;
+            } else {
+                c->size--;
+                if (c->size == 0) c->incrase = true;
+            }
+
+            Rectangle rec = {.x = c->pos.x, .y = c->pos.y, .width = 30, .height = 8 + c->size};
+            DrawRectanglePro(rec, (Vector2){rec.width/2, rec.height/2}, c->dir, c->color);
+        }
+    }
+}
+
+// Original function by @G-5ars
+void cleanup_areas(Area *areas, uint16_t *areas_count) {
+    // x pass
+    for (int i = 0; i < *areas_count; i++) {
+        Area *area = &areas[i];
+        if (area->team == -1)
+            continue;
+        for (int j = i+1; j < *areas_count; j++) {
+            Area *other = &areas[j];
+            if (i == j ||
+                area->team != other->team ||
+                other->team == -1)
+                continue;
+
+            if (area->rec.x1 == other->rec.x1 && area->rec.x2 == other->rec.x2 && (area->rec.y1 == other->rec.y2 || area->rec.y2 == other->rec.y1)) {
+                area->rec.y1 = MIN(area->rec.y1, other->rec.y1);
+                area->rec.y2 = MAX(area->rec.y2, other->rec.y2);
+                other->team = -1; // Mark areas as deleted
+            }
+        }
+    }
+
+    // y pass
+    for (int i = 0; i < *areas_count; i++) {
+        Area *area = &areas[i];
+        if (area->team == -1)
+            continue;
+        for (int j = i+1; j < *areas_count; j++) {
+            Area *other = &areas[j];
+            if (i == j ||
+                area->team != other->team ||
+                other->team == -1)
+                continue;
+
+            if (area->rec.y1 == other->rec.y1 && area->rec.y2 == other->rec.y2 && (area->rec.x1 == other->rec.x2 || area->rec.x2 == other->rec.x1)) {
+                area->rec.x1 = MIN(area->rec.x1, other->rec.x1);
+                area->rec.x2 = MAX(area->rec.x2, other->rec.x2);
+                other->team = -1; // Mark area as deleted
+            }
+        }
+    }
+
+    // Remove deleted areas from array
+    int offset = 0;
+    for (int i = 0; i < *areas_count; i++) {
+        areas[i - offset] = areas[i];
+        Area *area = &areas[i];
+        if (area->team == -1)
+            offset++;
+    }
+    *areas_count -= offset;
+}
+
+int send_areas(int fd, uint8_t package_type, Area *areas, uint16_t areas_count) {
+    uint32_t buf_size = areas_count * sizeof(*areas) + sizeof(areas_count);
+    char *buf = malloc(buf_size);
+
+    *(uint16_t*)buf = htons(areas_count);
+    Area *a = (Area*)(buf + sizeof(areas_count));
+    for (int i = 0; i < areas_count; i++) {
+        *a = areas[i];
+        a->rec.x1 = htons(a->rec.x1);
+        a->rec.x2 = htons(a->rec.x2);
+        a->rec.y1 = htons(a->rec.y1);
+        a->rec.y2 = htons(a->rec.y2);
+        a++;
+    }
+
+    int r = send_packet(fd, package_type, buf, buf_size, 0);
+
+    free(buf);
+    return r;
 }
 
 int main(int argc, char **argv) {
@@ -2754,8 +2819,10 @@ int main(int argc, char **argv) {
                 ClientBoid *boid = &boids[i];
                 if ((boid->sprite != SPRITE_FALL) && (boid->b.action != ACT_DELETE)) {
                     draw_boid(boid, texture);
-                    // if (show_health)
-                    //     DrawText(TextFormat("%d", boid->b.health), boid->b.pos.x - 5 - ((int)log10(boid->b.health) * 7), boid->b.pos.y - 50, 20, BLACK);
+                    // if (show_health) {
+                    //     const char *text = TextFormat("%d %d", boid->b.health, boid->b.xp);
+                    //     DrawText(text, boid->b.pos.x - MeasureText(text, 20)/2.0f, boid->b.pos.y - 50, 20, BLACK);
+                    // }
                 }
             }
             pthread_mutex_unlock(&boids_mtx);
@@ -2895,7 +2962,6 @@ int main(int argc, char **argv) {
                     float width = MeasureText(text_copy, 20);
                     DrawText("|", 10 + width, screen_height - 22 - 5, 20, BLACK);
                 }
-                // DrawText(TextFormat("%d\n%d", input_len, input_cursor), 10, 100, 20, BLACK);
             } else {
                 DrawText(log_prefixes[L_INPUT], 10, screen_height - 22 - 5, 20, log_colors[L_INPUT]);
                 DrawText("Press '/' or SPACE to start typing . . .", 10 + 22, screen_height - 22 - 5, 20, GRAY);
@@ -2951,6 +3017,37 @@ int main(int argc, char **argv) {
             pthread_mutex_unlock(&players_mtx);
 
             DrawFPS(10, 10);
+
+            if (stage == STAGE_GAME) {
+                static bool win_message = false;
+                static uint32_t winner_id;
+
+                if (!win_message) {
+                    int active_players_count = 0;
+                    ClientPlayer *winner;
+                    for (int i = 0; i < joined_players; i++) {
+                        ClientPlayer *p = &players[i];
+                        if (boids_number[p->team] > 0) {
+                            active_players_count++;
+                            winner_id = p->id;
+                            winner = p;
+                        }
+                    }
+
+                    if (active_players_count == 1) {
+                        win_message = true;
+                        log_message(&log, L_INFO, "player '%s' has won!\n", winner->name);
+                    }
+                }
+
+                if (win_message && winner_id == player_id) {
+                    static int confetti_timer = 0;
+                    if (confetti_timer < 60*60) {
+                        confetti_timer++;
+                        draw_confetti();
+                    }
+                }
+            }
         EndDrawing();
     }
 
