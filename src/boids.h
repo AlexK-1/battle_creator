@@ -110,8 +110,8 @@ typedef struct {
     uint16_t timer;
     BoidTeam team;
     BoidAction action;
-    bool is_fighting, hit;
-    BoidIndex nearest_enemy_idx;
+    bool is_fighting, hit, kdtree_is_used;
+    BoidIndex nearest_enemy_idx, boid_idx;
 } BaseBoid; // Default boid
 
 typedef struct {
@@ -131,18 +131,26 @@ typedef struct {
 } ServerStartNetBoid; // First placement of boids on the map (server -> clients)
 
 typedef struct {
-    BaseBoid b;
     Vector2 order_vector;
     uint16_t order_timer;
-    bool direction_order, point_order, is_used;
-} ServerBoid; // Boid on server (default boid + order fields)
+    bool direction_order, point_order;
+} OrderBoidPart; // Order fields for boids
 
 typedef struct {
     BaseBoid b;
+    OrderBoidPart o;
+} ServerBoid; // Boid on server (default boid + order fields)
+
+typedef struct {
     Vector2 direction, target_pos;
     uint8_t sprite_timer;
     uint8_t sprite;
     bool is_selected, go_target;
+} VisualizationBoidsPart; // Visualization and selecting fields for boids
+
+typedef struct {
+    BaseBoid b;
+    VisualizationBoidsPart v;
 } ClientBoid; // Boid on client (default boid + fields for visualization and selecting)
 
 typedef enum {
@@ -178,7 +186,7 @@ void clear_grid(Grid *grid); // Clear all chunks (set counts to zero)
 void perform_boid_in_fill_grid(Grid *grid, BaseBoid *boid, BoidIndex i); // One iteration of fill_grid cycle
 
 // Fill chunks with boids
-#define fill_grid(grid, boids, boids_count)                                    \
+#define FILL_GRID(grid, boids, boids_count)                                    \
     do {                                                                       \
         for (BoidIndex i = 0; i < (boids_count); i++) {                        \
             perform_boid_in_fill_grid((grid), (BaseBoid*)&(boids)[i], i);      \
@@ -186,7 +194,7 @@ void perform_boid_in_fill_grid(Grid *grid, BaseBoid *boid, BoidIndex i); // One 
     } while (0)
 
 // Initialize grid and fully rebuild chunks (delete and recreate all chunks)
-#define init_grid(grid, boids, boids_count, width, height, chunk_size_pizels)  \
+#define INIT_GRID(grid, boids, boids_count, width, height, chunk_size_pizels)  \
     do {                                                                       \
         (grid)->screen_width = (width);                                        \
         (grid)->screen_height = (height);                                      \
@@ -200,7 +208,7 @@ void perform_boid_in_fill_grid(Grid *grid, BaseBoid *boid, BoidIndex i); // One 
         }                                                                      \
         (grid)->chunks = calloc((grid)->chunks_count, sizeof(Chunk));          \
                                                                                \
-        fill_grid((grid), (boids), (boids_count));                             \
+        FILL_GRID((grid), (boids), (boids_count));                             \
     } while (0)
 
 #endif // BOIDS_H

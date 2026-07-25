@@ -49,7 +49,7 @@ void boid_bound(BaseBoid *boid, int width, int height) {
     if (boid->pos.y < BOID_SIZE/2.0)
         boid->pos.y = BOID_SIZE/2.0;
     else if (boid->pos.y > height-BOID_SIZE/2.0)
-        boid->pos.y = width-BOID_SIZE/2.0;
+        boid->pos.y = height-BOID_SIZE/2.0;
     
     // if (boid->pos.x < BOID_BOUND_PADDING)
     //     boid->velocity.x += BOID_BOUND_FACTOR;
@@ -127,7 +127,7 @@ void update_base_boid(void *boids, Grid *grid, BoidIndex boid_index, size_t boid
             Chunk *chunk = &grid->chunks[chunk_index];
 
             // Process boids from neighboring chunks
-            for (size_t i = 0; i < chunk->count; i++) {
+            for (BoidIndex i = 0; i < chunk->count; i++) {
                 BoidIndex other_boid_index = chunk->boids[i];
                 if (other_boid_index == boid_index) continue;
 

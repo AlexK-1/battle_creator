@@ -61,8 +61,8 @@ For more information, see the `/help` command.
 ### Control
 
 Global game control:
-  - `Left mouse button` - move camera
-  - `Mouse wheel` or `+`/`-` - zoom in/out
+  - Left mouse button - move camera
+  - Mouse wheel or `+`/`-` - zoom in/out
   - `K` - show/hide grid
   - `L` - show/hide log
   - `M` - change server TPS display mode
@@ -74,22 +74,51 @@ Stage/mode-specific control:
     - creator (areas mode):
       - `Q`, `W`, `E`, `R` - change area color to red, blue, green or yellow
       - `Z` - change mode to area deletion
-      - `Right mouse button` - drawing rectangle area
+      - Right mouse button - drawing rectangle area
       - When a new player is trying to joint to the room, press `Space`, type a message, then `Enter`
       - `Enter` - start placing
     - joiner (wait mode): can't do anything
 2. Spawn boids stage
-    - all (place mode):
-      - `Right mouse button` - spawn boids
+    - all players (spawn, select and delete modes):
+      - `A` - switch to *spawn mode*; the right mouse button creates new boids
+      - `S` - switch to *select mode*; the right mouse button (you can use it with the `Shift` key) highlights the boids;
+        pressing the `X` key removes the boids
+      - `D` - switch to *delete mode*; the right mouse button deletes the boids
+      - `P`/`O` - zoom in/out the brush to create or delete boids
       - `Enter` - you are ready
 3. Game stage:
-    - all (select, direction, point and line modes):
-      - `S` - select mode; the right mouse button (you can use it with the `Shift` key) highlights the boids;
-        you can select only the boids of a specific team using the keys `Q`, `W`, `E`, and `R`;
+    - all players (select, direction, point and line modes):
+      - `S` - switch to *select mode*; the right mouse button (you can use it with the `Shift` key) highlights the boids;
         pressing the `X` key removes the boids, and `Z` removes all orders for the movement of the boids (which are set in the following modes)
-      - `D` - direction mode; the right mouse button draws an arrow in the direction in which the selected boids will move
-      - `F` - point mode; the boids go to the point indicated on the map using the right mouse button
-      - `G` - line mode; clicking the right mouse button creates points of a polyline along which the selected boids will line up after pressing the `T` key
+      - `D` - switch to *direction mode*; the right mouse button draws an arrow in the direction in which the selected boids will move
+      - `F` - switch to *point mode*; the boids go to the point indicated on the map using the right mouse button
+      - `G` - switch to *line mode*; clicking the right mouse button creates points of a polyline along which the selected boids will line up
+        after pressing the `T` key
+## Local game mode
+
+You can run the game in local mode and not depend on any server by running this command:
+```sh
+./client local
+```
+
+In the local mode, the simulation runs with greater accuracy and better response speed than in the multiplayer mode.
+But due to the higher accuracy, the load on the processor can incrases.
+
+Control:
+  - Left mouse button - move camera
+  - Mouse wheel or `+`/`-` - zoom in/out
+  - `A` - switch to *spawn mode*; the right mouse button creates new boids;
+    you can define the mode of action of new boids using the keys `1`, `2`, and `3` and their team using the keys `Q`, `W`, `E`, and `R`
+  - `S` - switch to *selec modet*; the right mouse button (you can use it with the `Shift` key) highlights the boids;
+    you can select only the boids of a specific team using the keys `Q`, `W`, `E`, and `R`;
+    pressing the `X` key removes the boids, and `Z` removes all orders for the movement of the boids (which are set in the following modes)
+  - `D` - switch to *direction mode*; the right mouse button draws an arrow in the direction in which the selected boids will move
+  - `F` - switch to *point mode*; the boids go to the point indicated on the map using the right mouse button
+  - `G` - switch to *line mode*; clicking the right mouse button creates points of a polyline along which the selected boids will line up
+    after pressing the `T` key
+
+> [!TIP]
+> If the game is lagging, you can try to run it with the -c flag with the chunk size value less than the default 1050 (for example: `./client local -c 300`)
 
 ## Server side
 

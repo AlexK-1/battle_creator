@@ -13,7 +13,7 @@
 #define RIGHT_PART 0
 
 typedef struct KDNode {
-    ServerBoid **boids;
+    BaseBoid **boids;
     BoidIndex boids_count;
     bool axis; // true - x axis, false - y axis
     bool part; // true - left part, false - right part
@@ -21,10 +21,10 @@ typedef struct KDNode {
     struct KDNode *l, *r, *parent;
 } KDNode; // Node/leaf of k-d tree
 
-KDNode* build_kdtree(ServerBoid **boids, BoidIndex boids_count, BoidIndex leaf_size, bool axis);
-ServerBoid* find_nearest_in_kdtree_approx(KDNode *tree, Vector2 pos, Rectangle rec);
+KDNode* build_kdtree(BaseBoid **boids, BoidIndex boids_count, BoidIndex leaf_size, bool axis);
+BaseBoid* find_nearest_in_kdtree_approx(KDNode *tree, Vector2 pos, Rectangle rec);
 void clear_kdtree(KDNode *root);
 
-#define create_kdtree(boids, boids_count, leaf_size) build_kdtree(boids, boids_count, leaf_size, Y_AXIS)
+#define CREATE_KDTREE(boids, boids_count, leaf_size) build_kdtree(boids, boids_count, leaf_size, Y_AXIS)
 
 #endif // KDTREE_H

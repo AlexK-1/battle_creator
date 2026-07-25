@@ -308,7 +308,7 @@ void *room_thread_fn(void *args) {
                         ServerBoid new_boid = {.b = {.pos = {cell_x*BOID_SIZE + (int)(BOID_SIZE/2.0), cell_y*BOID_SIZE + (int)(BOID_SIZE/2.0)},
                                                      .velocity = { 0 }, .speed = random_value(80, 130)/100.0,
                                                      .max_health = random_value(BOID_MIN_HEALTH, BOID_MAX_HEALTH),
-                                                     .xp = random_value(0, 5), .team = player->team, .action = ACT_STOP}};
+                                                     .xp = random_value(0, 5), .team = player->team, .action = ACT_STOP, .boid_idx = boids_count}};
                         new_boid.b.health = new_boid.b.max_health;
                         room->boids[boids_count++] = new_boid;
                     }
@@ -358,7 +358,7 @@ void *room_thread_fn(void *args) {
 
     // Grid of chunks
     Grid grid = { 0 };
-    init_grid(&grid, (BaseBoid*)boids, boids_count, room->world.x, room->world.y, chunk_size);
+    INIT_GRID(&grid, (BaseBoid*)boids, boids_count, room->world.x, room->world.y, chunk_size);
 
     double target_delay = 1.0 / (double)tps;
     double delay = 0.0;
@@ -373,23 +373,23 @@ void *room_thread_fn(void *args) {
 
             if (boid->b.action == ACT_DELETE) continue;
 
-            if (boid->order_timer > 0) {
-                boid->order_timer--;
+            if (boid->o.order_timer > 0) {
+                boid->o.order_timer--;
 
-                if (boid->point_order && Vector2Distance(boid->order_vector, boid->b.pos) < BOID_SIZE) {
-                    boid->order_timer = 0;
+                if (boid->o.point_order && Vector2Distance(boid->o.order_vector, boid->b.pos) < BOID_SIZE) {
+                    boid->o.order_timer = 0;
                     boid->b.action = ACT_STOP;
                 }
 
                 // Change direction by order
                 Vector2 direction = { 0 };
-                if (boid->direction_order)
-                    direction = boid->order_vector;
-                else if (boid->point_order)
-                    direction = Vector2Normalize(Vector2Subtract(boid->order_vector, boid->b.pos));
+                if (boid->o.direction_order)
+                    direction = boid->o.order_vector;
+                else if (boid->o.point_order)
+                    direction = Vector2Normalize(Vector2Subtract(boid->o.order_vector, boid->b.pos));
                 boid->b.velocity = Vector2Add(boid->b.velocity, Vector2Scale(direction, BOID_ORDER_FACTOR));
             }
-            update_base_boid(boids, &grid, i, sizeof(*boids), /*can_change_action*/ boid->order_timer == 0, /*can_fall*/ true);
+            update_base_boid(boids, &grid, i, sizeof(*boids), /*can_change_action=*/ boid->o.order_timer == 0, /*can_fall=*/ true);
 
             if (boid->b.action != ACT_SURRENDER && boid->b.action != ACT_FALL) {
                 boid_normal_speed((BaseBoid*)boid);
@@ -474,7 +474,7 @@ void *room_thread_fn(void *args) {
         timer--;
         
         clear_grid(&grid);
-        fill_grid(&grid, boids, boids_count);
+        FILL_GRID(&grid, boids, boids_count);
         pthread_mutex_unlock(&room->boids_mtx);
 
         
@@ -909,8 +909,8 @@ void process_data(Player *p) {
                 if (boid->b.team != p->team)
                     continue;
 
-                boid->direction_order = false;
-                boid->point_order = false;                
+                boid->o.direction_order = false;
+                boid->o.point_order = false;                
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -933,7 +933,7 @@ void process_data(Player *p) {
                     boid->b.velocity = (Vector2){random_value(-10, 10)/10.0, random_value(-10, 10)/10.0};
 
                 boid->b.action = action;
-                boid->order_timer = random_value(20, 30)*tps; // 20-30 seconds
+                boid->o.order_timer = random_value(20, 30)*tps; // 20-30 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -953,10 +953,10 @@ void process_data(Player *p) {
                 if (boid->b.team != p->team)
                     continue;
                 
-                boid->order_vector = direction;
-                boid->direction_order = true;
-                boid->point_order = false;
-                boid->order_timer = random_value(30, 45)*tps; // 30-45 seconds
+                boid->o.order_vector = direction;
+                boid->o.direction_order = true;
+                boid->o.point_order = false;
+                boid->o.order_timer = random_value(30, 45)*tps; // 30-45 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -976,10 +976,10 @@ void process_data(Player *p) {
                 if (boid->b.team != p->team)
                     continue;
                 
-                boid->order_vector = point;
-                boid->direction_order = false;
-                boid->point_order = true;
-                boid->order_timer = random_value(30, 45)*tps; // 30-45 seconds
+                boid->o.order_vector = point;
+                boid->o.direction_order = false;
+                boid->o.point_order = true;
+                boid->o.order_timer = random_value(30, 45)*tps; // 30-45 seconds
             }
             room->sync_boids = true;
             pthread_mutex_unlock(&room->boids_mtx);
@@ -993,7 +993,7 @@ void process_data(Player *p) {
             BoidIndex boids_count = ntohs(*(BoidIndex*)(p->net.data_buf + 1+1+line_points_count*sizeof(Point)));
             BoidIndex *boids = (BoidIndex*)(p->net.data_buf + 1+1+line_points_count*sizeof(Point)+sizeof(BoidIndex));
 
-            ServerBoid **b = malloc(boids_count * sizeof(*b)); // Array of selected boids
+            BaseBoid **b = malloc(boids_count * sizeof(*b)); // Array of selected boids
             BoidIndex bc = 0;
 
             pthread_mutex_lock(&room->boids_mtx);
@@ -1003,11 +1003,11 @@ void process_data(Player *p) {
                 if (boid->b.team != p->team)
                     continue;
 
-                boid->is_used = false;
-                b[bc++] = boid;
+                boid->b.kdtree_is_used = false;
+                b[bc++] = &boid->b;
             }
 
-            KDNode *tree = create_kdtree(b, bc, 16);
+            KDNode *tree = CREATE_KDTREE(b, bc, 16);
 
             Vector2 *line_points = calloc(line_points_count, sizeof(*line_points));
             float line_len = 0;
@@ -1021,12 +1021,13 @@ void process_data(Player *p) {
                 line_len += Vector2Distance(line_points[i-1], line_points[i]);
             }
 
-            float interval = line_len / (bc - 1), remains = 0;
-            BoidIndex point_idx = 0;
+            float interval = line_len / (bc - 1);
+            float remains = 0;
+            int point_idx = 0;
             Rectangle rec = {0, 0, room->world.x, room->world.y};
             
             // Cycle for each segment
-            for (uint8_t segment_idx = 1; segment_idx < line_points_count; segment_idx++) {
+            for (int segment_idx = 1; segment_idx < line_points_count; segment_idx++) {
                 Vector2 segment_start = line_points[segment_idx-1];
                 Vector2 segment_end = line_points[segment_idx];
                 Vector2 segment_dir = Vector2Normalize(Vector2Subtract(segment_end, segment_start));
@@ -1034,20 +1035,21 @@ void process_data(Player *p) {
                                                                                                // remainder of previous segment
 
                 float segment_len = Vector2Distance(segment_end, segment_start);
-                BoidIndex segment_points_count = floorf(segment_len / interval) + ((segment_len > interval) || (segment_idx == 0));
+                int segment_points_count = floorf(segment_len / interval) + (int)((segment_len > interval) || (segment_idx == 0));
 
                 Vector2 point = segment_start;
                 float path_len = 0;
                 // Placing boids on segment
                 for (BoidIndex segment_point_idx = 0; segment_point_idx < segment_points_count; segment_point_idx++, point_idx++) {
-                    ServerBoid *nearest_boid = find_nearest_in_kdtree_approx(tree, point, rec);
-                    if (nearest_boid == NULL) break;
+                    BaseBoid *nearest_base_boid = find_nearest_in_kdtree_approx(tree, point, rec);
+                    if (nearest_base_boid == NULL) break;
+                    ServerBoid *nearest_boid = &room->boids[nearest_base_boid->boid_idx];
                     
-                    nearest_boid->order_vector = point;
-                    nearest_boid->order_timer = Vector2Distance(nearest_boid->b.pos, point) / BOID_MIN_SPEED / (60.0/tps);
-                    nearest_boid->is_used = true;
-                    nearest_boid->point_order = true;
-                    nearest_boid->direction_order = false;
+                    nearest_boid->o.order_vector = point;
+                    nearest_boid->o.order_timer = Vector2Distance(nearest_boid->b.pos, point) / BOID_MIN_SPEED / (60.0/tps);
+                    nearest_boid->o.point_order = true;
+                    nearest_boid->o.direction_order = false;
+                    nearest_boid->b.kdtree_is_used = true;
                     
                     path_len += interval;
                     point = Vector2Add(point, Vector2Scale(segment_dir, interval));
@@ -1055,7 +1057,21 @@ void process_data(Player *p) {
                 remains = path_len - segment_len;
             }
 
-            // printf("boids: %d | used: %d | remains: %d\n", bc, point_idx, bc-point_idx);
+            if (bc - point_idx > 0) {
+                for (BoidIndex i = 0; i < bc; i++) {
+                    BaseBoid *base_boid = b[i];
+                    if (!base_boid->kdtree_is_used) {
+                        ServerBoid *boid = &room->boids[base_boid->boid_idx];
+                        Vector2 point = line_points[line_points_count-1];
+                        
+                        boid->o.order_vector = point;
+                        boid->o.order_timer = Vector2Distance(boid->b.pos, point) / BOID_MIN_SPEED / (60.0/tps);
+                        boid->o.point_order = true;
+                        boid->o.direction_order = false;
+                        boid->b.kdtree_is_used = true;
+                    }
+                }
+            }
 
             clear_kdtree(tree);
             free(line_points);

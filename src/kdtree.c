@@ -7,34 +7,34 @@
 #include "kdtree.h"
 
 static int comp_x(const void *a, const void *b) {
-    ServerBoid *boid_a = *(ServerBoid**)a;
-    ServerBoid *boid_b = *(ServerBoid**)b;
+    BaseBoid *boid_a = *(BaseBoid**)a;
+    BaseBoid *boid_b = *(BaseBoid**)b;
 
-    return boid_a->b.pos.x - boid_b->b.pos.x;
+    return boid_a->pos.x - boid_b->pos.x;
 }
 
 static int comp_y(const void *a, const void *b) {
-    ServerBoid *boid_a = *(ServerBoid**)a;
-    ServerBoid *boid_b = *(ServerBoid**)b;
+    BaseBoid *boid_a = *(BaseBoid**)a;
+    BaseBoid *boid_b = *(BaseBoid**)b;
 
-    return boid_a->b.pos.y - boid_b->b.pos.y;
+    return boid_a->pos.y - boid_b->pos.y;
 }
 
-KDNode* build_kdtree(ServerBoid **boids, BoidIndex boids_count, BoidIndex leaf_size, bool axis) {
+KDNode* build_kdtree(BaseBoid **boids, BoidIndex boids_count, BoidIndex leaf_size, bool axis) {
     if (boids_count <= leaf_size) { // Create a leaf
         KDNode *leaf = malloc(sizeof(KDNode));
         leaf->boids_count = boids_count;
-        leaf->boids = malloc(boids_count * sizeof(ServerBoid*));
-        memcpy(leaf->boids, boids, boids_count * sizeof(ServerBoid*));
+        leaf->boids = malloc(boids_count * sizeof(BaseBoid*));
+        memcpy(leaf->boids, boids, boids_count * sizeof(BaseBoid*));
         leaf->l = leaf->r = leaf->parent = NULL;
         return leaf;
     }
 
     axis = !axis;
 
-    qsort(boids, boids_count, sizeof(ServerBoid*), (axis == X_AXIS)? comp_y : comp_x);
+    qsort(boids, boids_count, sizeof(BaseBoid*), (axis == X_AXIS)? comp_y : comp_x);
     BoidIndex median_idx = boids_count / 2;
-    float median = (axis == X_AXIS)? boids[median_idx]->b.pos.y : boids[median_idx]->b.pos.x;
+    float median = (axis == X_AXIS)? boids[median_idx]->pos.y : boids[median_idx]->pos.x;
 
     KDNode *node = malloc(sizeof(KDNode));
     node->axis = axis;
@@ -53,7 +53,7 @@ KDNode* build_kdtree(ServerBoid **boids, BoidIndex boids_count, BoidIndex leaf_s
     return node;
 }
 
-ServerBoid* find_nearest_in_kdtree_approx(KDNode *tree, Vector2 pos, Rectangle rec) {
+BaseBoid* find_nearest_in_kdtree_approx(KDNode *tree, Vector2 pos, Rectangle rec) {
     // Find nearest node
     KDNode *nearest_node = tree;
     Rectangle nearest_node_rec = rec;
@@ -79,13 +79,13 @@ ServerBoid* find_nearest_in_kdtree_approx(KDNode *tree, Vector2 pos, Rectangle r
 
     // Find nearest boid
     float min_dist = INFINITY;
-    ServerBoid *nearest_boid = NULL;
+    BaseBoid *nearest_boid = NULL;
     for (BoidIndex i = 0; i < nearest_node->boids_count; i++) {
-        ServerBoid *boid = nearest_node->boids[i];
-        if (boid->is_used)
+        BaseBoid *boid = nearest_node->boids[i];
+        if (boid->kdtree_is_used)
             continue;
         
-        float dist = Vector2DistanceSqr(pos, boid->b.pos);
+        float dist = Vector2DistanceSqr(pos, boid->pos);
         if (dist < min_dist) {
             min_dist = dist;
             nearest_boid = boid;

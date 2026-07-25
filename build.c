@@ -387,10 +387,11 @@ int main(int argc, char **argv) {
 
     if (build_client) {
         char *client_files[] = {
-            SRC_DIR "client.c",     SRC_DIR "boids.h", SRC_DIR "network.h", SRC_DIR "logging.h", SRC_DIR "queue.h", SRC_DIR "winsupport.h", NULL,
+            SRC_DIR "client.c",     SRC_DIR "boids.h", SRC_DIR "network.h", SRC_DIR "logging.h", SRC_DIR "queue.h", SRC_DIR "kdtree.h", SRC_DIR "winsupport.h", NULL,
             SRC_DIR "boids.c",      SRC_DIR "boids.h", NULL,
             SRC_DIR "network.c",    SRC_DIR "network.h", SRC_DIR "boids.h", SRC_DIR "winsupport.h", NULL,
             SRC_DIR "logging.c",    SRC_DIR "logging.h", NULL,
+            SRC_DIR "kdtree.c",     SRC_DIR "kdtree.h", SRC_DIR "boids.h", NULL,
             NULL
         };
 
