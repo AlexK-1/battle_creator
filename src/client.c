@@ -1132,6 +1132,35 @@ void update_boid_sprite(ClientBoid *boids, BoidIndex boid_index) {
     }
 }
 
+Texture2D generate_boids_texture(Image image, Color clothes_tint) {
+    // Get boids image
+    Image boids_img = ImageCopy(image);
+    ImageCrop(&boids_img, (Rectangle){0, 0,  image.width, 260-1}); // Crop only the boids sprites
+    
+    // Get a mask of the boids' clothes
+    Image boids_mask = ImageCopy(image);
+    ImageCrop(&boids_mask, (Rectangle){0, 260, image.width, 260-1}); // Crop only the mask sprites
+    ImageAlphaClear(&boids_mask, BLACK, 0.5f); // Replace the transparent color with black
+
+    // Get colored clothes image
+    Image clothes_img = ImageCopy(boids_img);
+    ImageAlphaMask(&clothes_img, boids_mask);
+    ImageColorTint(&clothes_img, clothes_tint);
+    UnloadImage(boids_mask);
+
+    // Combine clothes and boids images
+    if (boids_img.format != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8) ImageFormat(&boids_img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    ImageDraw(&boids_img, clothes_img, (Rectangle){0, 0, clothes_img.width, clothes_img.height},
+              (Rectangle){0, 0, boids_img.width, boids_img.height}, WHITE);
+    UnloadImage(clothes_img);
+
+    // Generate texture
+    Texture2D result_tex = LoadTextureFromImage(boids_img);
+    UnloadImage(boids_img);
+
+    return result_tex;
+}
+
 void draw_boid(ClientBoid *boid, Texture2D texture) {
     static Rectangle sprites[SPRITES_COUNT] = {
          [SPRITE_NORMAL] = {0, 0, 146, 152},
@@ -1145,14 +1174,13 @@ void draw_boid(ClientBoid *boid, Texture2D texture) {
     };
 
     Rectangle sprite = sprites[boid->v.sprite];
-    sprite.y += 260 * boid->b.team;
     
-    Rectangle destRec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE, BOID_SIZE};
+    Rectangle dest_rec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE, BOID_SIZE};
     if (boid->v.sprite == SPRITE_SURRENDER) {
-        destRec.height = BOID_SIZE * (128/75.0);
+        dest_rec.height = BOID_SIZE * (128/75.0);
     } else if (boid->v.sprite == SPRITE_FALL) {
-        destRec.width = BOID_SIZE * (132/75.0);
-        destRec.height = BOID_SIZE * (100/75.0);
+        dest_rec.width = BOID_SIZE * (132/75.0);
+        dest_rec.height = BOID_SIZE * (100/75.0);
     }
 
     Color tint = WHITE;
@@ -1160,12 +1188,12 @@ void draw_boid(ClientBoid *boid, Texture2D texture) {
         tint.a = (255.0/50.0) * (50 - boid->v.sprite_timer);
     }
     
-    DrawTexturePro(texture, sprite, destRec, (Vector2){BOID_SIZE/2.0, BOID_SIZE/2.0},
+    DrawTexturePro(texture, sprite, dest_rec, (Vector2){BOID_SIZE/2.0, BOID_SIZE/2.0},
                    atan2f(boid->v.direction.y, boid->v.direction.x)*RAD2DEG, tint);
 }
 
 void draw_selection(ClientBoid *boid, Texture2D texture, float scale, Color color) {
-    static Rectangle white_sprite = {0, 260*TEAMS_COUNT, 146, 149};
+    static Rectangle white_sprite = {0, 520, 146, 149};
     Rectangle dest_rec = {boid->b.pos.x, boid->b.pos.y, BOID_SIZE*scale, BOID_SIZE*scale};
     
     DrawTexturePro(texture, white_sprite, dest_rec, (Vector2){BOID_SIZE*1.2/2.0, BOID_SIZE*1.2/2.0},
@@ -1954,9 +1982,25 @@ int main(int argc, char **argv) {
     INIT_GRID(&grid, boids, boids_count, world_size.x, world_size.y, chunk_size);
 
     // Textures
-    Texture2D texture = LoadTexture("resources/texture.png");
+    Image image = LoadImage("resources/texture.png");
+    Texture2D texture = LoadTextureFromImage(image);
     GenTextureMipmaps(&texture);
     SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+
+    // Get textures of boids
+    Color teams_colors[TEAMS_COUNT] = {
+        [TEAM_RED] = RED,
+        [TEAM_BLUE] = BLUE,
+        [TEAM_GREEN] = GREEN,
+        [TEAM_YELLOW] = YELLOW,
+    };
+    Texture2D boids_textures[TEAMS_COUNT];
+    for (int team = 0; team < TEAMS_COUNT; team++) {
+        boids_textures[team] = generate_boids_texture(image, teams_colors[team]);
+        GenTextureMipmaps(&boids_textures[team]);
+        SetTextureFilter(boids_textures[team], TEXTURE_FILTER_TRILINEAR);
+    }
+    UnloadImage(image);
 
     // Server TPS
     enum {
@@ -2900,61 +2944,69 @@ int main(int argc, char **argv) {
         }
 
         // Update boids
-        if (stage == STAGE_GAME && !game_paused) {
+        if (stage == STAGE_GAME) {
             memset(boids_number, 0, sizeof(boids_number)); // Clear boids_number
 
             pthread_mutex_lock(&boids_mtx);
-            for (BoidIndex i = 0; i < boids_count; i++) {
-                ClientBoid *boid = &boids[i];
-
-                if (boid->b.action == ACT_DELETE) continue;
-
-                if (local_game) {
-                    OrderBoidPart *order_data = &order_parts[boid->b.boid_idx];
-                    if (order_data->order_timer > 0) {
-                        order_data->order_timer--;
-
-                        if (order_data->point_order && Vector2Distance(order_data->order_vector, boid->b.pos) < BOID_SIZE) {
-                            order_data->order_timer = 0;
-                            boid->b.action = ACT_STOP;
-                        }
-
-                        // Change direction by order
-                        Vector2 direction = { 0 };
-                        if (order_data->direction_order)
-                            direction = order_data->order_vector;
-                        else if (order_data->point_order)
-                            direction = Vector2Normalize(Vector2Subtract(order_data->order_vector, boid->b.pos));
-                        boid->b.velocity = Vector2Add(boid->b.velocity, Vector2Scale(direction, BOID_ORDER_FACTOR));
-                    }
-                    update_base_boid(boids, &grid, i, sizeof(*boids), /*can_change_action=*/ order_data->order_timer == 0, /*can_fall=*/ true);
-                } else
-                    update_base_boid(boids, &grid, i, sizeof(*boids), /*can_change_action=*/ true, /*can_fall=*/ false);
-                update_boid_sprite(boids, i);
-
-                if (boid->b.action != ACT_SURRENDER && boid->b.action != ACT_FALL) {
-                    if (boid->v.go_target) {
-                        Vector2 target_dir = Vector2Subtract(boid->v.target_pos, boid->b.pos);
-                        if (Vector2LengthSqr(target_dir) >= BOID_SIZE*BOID_SIZE) {
-                            target_dir = Vector2Normalize(target_dir);
-                            boid->b.velocity = Vector2Add(boid->b.velocity, Vector2Scale(target_dir, BOID_TARGET_FACTOR));
-                        } else {
-                            boid->v.go_target = false;
-                        }
-                    }
-                    
-                    boid_normal_speed(&boid->b);
-                    boid_bound(&boid->b, world_size.x, world_size.y);
-
-                    boid->v.direction.x = boid->v.direction.x*0.97f + boid->b.velocity.x*0.03f;
-                    boid->v.direction.y = boid->v.direction.y*0.97f + boid->b.velocity.y*0.03f;
-
-                    boids_number[boid->b.team]++;
-                } else {
-                    boid->v.is_selected = false;
+            if (game_paused) {
+                for (BoidIndex i = 0; i < boids_count; i++) {
+                    ClientBoid *boid = &boids[i];
+                    if (boid->b.action != ACT_DELETE && boid->b.action != ACT_SURRENDER && boid->b.action != ACT_FALL)
+                        boids_number[boid->b.team]++;
                 }
+            } else {
+                for (BoidIndex i = 0; i < boids_count; i++) {
+                    ClientBoid *boid = &boids[i];
 
-                boid->b.pos = Vector2Add(boid->b.pos, Vector2Scale(boid->b.velocity, boid->b.speed));
+                    if (boid->b.action == ACT_DELETE) continue;
+
+                    if (local_game) {
+                        OrderBoidPart *order_data = &order_parts[boid->b.boid_idx];
+                        if (order_data->order_timer > 0) {
+                            order_data->order_timer--;
+
+                            if (order_data->point_order && Vector2Distance(order_data->order_vector, boid->b.pos) < BOID_SIZE) {
+                                order_data->order_timer = 0;
+                                boid->b.action = ACT_STOP;
+                            }
+
+                            // Change direction by order
+                            Vector2 direction = { 0 };
+                            if (order_data->direction_order)
+                                direction = order_data->order_vector;
+                            else if (order_data->point_order)
+                                direction = Vector2Normalize(Vector2Subtract(order_data->order_vector, boid->b.pos));
+                            boid->b.velocity = Vector2Add(boid->b.velocity, Vector2Scale(direction, BOID_ORDER_FACTOR));
+                        }
+                        update_base_boid(boids, &grid, i, sizeof(*boids), /*can_change_action=*/ order_data->order_timer == 0, /*can_fall=*/ true);
+                    } else
+                        update_base_boid(boids, &grid, i, sizeof(*boids), /*can_change_action=*/ true, /*can_fall=*/ false);
+                    update_boid_sprite(boids, i);
+
+                    if (boid->b.action != ACT_SURRENDER && boid->b.action != ACT_FALL) {
+                        if (boid->v.go_target) {
+                            Vector2 target_dir = Vector2Subtract(boid->v.target_pos, boid->b.pos);
+                            if (Vector2LengthSqr(target_dir) >= BOID_SIZE*BOID_SIZE) {
+                                target_dir = Vector2Normalize(target_dir);
+                                boid->b.velocity = Vector2Add(boid->b.velocity, Vector2Scale(target_dir, BOID_TARGET_FACTOR));
+                            } else {
+                                boid->v.go_target = false;
+                            }
+                        }
+                    
+                        boid_normal_speed(&boid->b);
+                        boid_bound(&boid->b, world_size.x, world_size.y);
+
+                        boid->v.direction.x = boid->v.direction.x*0.97f + boid->b.velocity.x*0.03f;
+                        boid->v.direction.y = boid->v.direction.y*0.97f + boid->b.velocity.y*0.03f;
+
+                        boids_number[boid->b.team]++;
+                    } else {
+                        boid->v.is_selected = false;
+                    }
+
+                    boid->b.pos = Vector2Add(boid->b.pos, Vector2Scale(boid->b.velocity, boid->b.speed));
+                }
             }
             pthread_mutex_unlock(&boids_mtx);
         }
@@ -3012,7 +3064,7 @@ int main(int argc, char **argv) {
             for (BoidIndex i = 0; i < boids_count; i++) {
                 ClientBoid *boid = &boids[i];
                 if (boid->v.sprite == SPRITE_FALL)
-                    draw_boid(boid, texture);
+                    draw_boid(boid, boids_textures[boid->b.team]);
             }
 
             // Draw selection
@@ -3029,7 +3081,7 @@ int main(int argc, char **argv) {
             for (BoidIndex i = 0; i < boids_count; i++) {
                 ClientBoid *boid = &boids[i];
                 if ((boid->v.sprite != SPRITE_FALL) && (boid->b.action != ACT_DELETE)) {
-                    draw_boid(boid, texture);
+                    draw_boid(boid, boids_textures[boid->b.team]);
                     // if (show_health) {
                     //     const char *text = TextFormat("%d %d", boid->b.health, boid->b.xp);
                     //     DrawText(text, boid->b.pos.x - MeasureText(text, 20)/2.0f, boid->b.pos.y - 50, 20, BLACK);
@@ -3320,6 +3372,8 @@ int main(int argc, char **argv) {
 
     // Close Raylib
     UnloadTexture(texture);
+    for (int team = 0; team < TEAMS_COUNT; team++)
+        UnloadTexture(boids_textures[team]);
     CloseWindow();
 
     return 0;
