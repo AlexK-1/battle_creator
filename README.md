@@ -63,9 +63,7 @@ For more information, see the `/help` command.
 Global game control:
   - Left mouse button - move camera
   - Mouse wheel or `+`/`-` - zoom in/out
-  - `K` - show/hide grid
   - `L` - show/hide log
-  - `M` - change server TPS display mode
   - `Space` - write a message to the room's chat
   - `/` - write and execute command
 
@@ -74,6 +72,7 @@ Stage/mode-specific control:
     - creator (areas mode):
       - `Q`, `W`, `E`, `R` - change area color to red, blue, green or yellow
       - `Z` - change mode to area deletion
+      - `K` - show/hide grid
       - Right mouse button - drawing rectangle area
       - When a new player is trying to joint to the room, press `Space`, type a message, then `Enter`
       - `Enter` - start placing
@@ -85,16 +84,20 @@ Stage/mode-specific control:
         pressing the `X` key removes the boids
       - `D` - switch to *delete mode*; the right mouse button deletes the boids
       - `P`/`O` - zoom in/out the brush to create or delete boids
+      - `K` - show/hide grid
       - `Enter` - you are ready
 3. Game stage:
     - all players (select, direction, point and line modes):
+      - `N` - Enable/disable auto-selection (if enabled, you will automatically return to select mode after using direction, point or line mode)
+      - `M` - change server TPS display mode
       - `S` - switch to *select mode*; the right mouse button (you can use it with the `Shift` key) highlights the boids;
         pressing the `X` key removes the boids, and `Z` removes all orders for the movement of the boids (which are set in the following modes)
       - `D` - switch to *direction mode*; the right mouse button draws an arrow in the direction in which the selected boids will move
       - `F` - switch to *point mode*; the boids go to the point indicated on the map using the right mouse button
       - `G` - switch to *line mode*; clicking the right mouse button creates points of a polyline along which the selected boids will line up
         after pressing the `T` key
-## Local game mode
+
+### Local game mode
 
 You can run the game in local mode and not depend on any server by running this command:
 ```sh
@@ -107,9 +110,10 @@ But due to the higher accuracy, the load on the processor can incrases.
 Control:
   - Left mouse button - move camera
   - Mouse wheel or `+`/`-` - zoom in/out
+  - `N` - Enable/disable auto-selection (if enabled, you will automatically return to select mode after using direction, point or line mode)
   - `A` - switch to *spawn mode*; the right mouse button creates new boids;
     you can define the mode of action of new boids using the keys `1`, `2`, and `3` and their team using the keys `Q`, `W`, `E`, and `R`
-  - `S` - switch to *selec modet*; the right mouse button (you can use it with the `Shift` key) highlights the boids;
+  - `S` - switch to *select modet*; the right mouse button (you can use it with the `Shift` key) highlights the boids;
     you can select only the boids of a specific team using the keys `Q`, `W`, `E`, and `R`;
     pressing the `X` key removes the boids, and `Z` removes all orders for the movement of the boids (which are set in the following modes)
   - `D` - switch to *direction mode*; the right mouse button draws an arrow in the direction in which the selected boids will move
@@ -119,6 +123,13 @@ Control:
 
 > [!TIP]
 > If the game is lagging, you can try to run it with the -c flag with the chunk size value less than the default 1050 (for example: `./client local -c 300`)
+
+### GUI
+
+You can launch the game without any command-line arguments, and then it will open in the main menu.
+From the main menu you can navigate to other menus that replicate the functionality os CLI.
+
+I hope that interface is simple enough to understand without additional documentation, so I won't describe it here.
 
 ## Server side
 

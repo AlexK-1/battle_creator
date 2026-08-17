@@ -493,7 +493,7 @@ void *room_thread_fn(void *args) {
         }
     }
 
-    free(grid.chunks);
+    free_grid(&grid);
 
     pthread_mutex_destroy(&room->boids_mtx);
     pthread_mutex_destroy(&room->players_mtx);

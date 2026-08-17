@@ -46,7 +46,6 @@
 #define BOID_FIGHTING_RADIUS_SQ (BOID_FIGHTING_RADIUS * BOID_FIGHTING_RADIUS)
 #define BOID_STOP_RADIUS_SQ (BOID_STOP_RADIUS * BOID_STOP_RADIUS)
 
-#define CHUNK_SIZE_BOIDS 1024
 #define CHUNK_SIZE_PIXELS 1050
 #define DEFAULT_SERVER_CHUNK_SIZE_PIXELS 1050
 #define DEFAULT_CLIENT_CHUNK_SIZE_PIXELS 300
@@ -66,6 +65,7 @@ typedef enum {
     TEAM_YELLOW
 } BoidTeam;
 #define TEAMS_COUNT 4
+#define TEAMS_LIST "Red;Blue;Green;Yellow"
 
 typedef enum {
     ACT_STOP,
@@ -166,13 +166,14 @@ typedef enum {
 typedef uint16_t ChunkSize;
 
 typedef struct {
-    BoidIndex boids[CHUNK_SIZE_BOIDS]; // Array of boids
+    BoidIndex *boids; // Array of boids
     ChunkSize count; // Number of boids in the chunk
+    ChunkSize capacity;
 } Chunk;
 
 typedef struct {
     Chunk *chunks;
-    int screen_width, screen_height, chunk_size_pixels;
+    int width_pixels, height_pixels, chunk_size_pixels;
     uint16_t rows, cols; // Number of chunks by width/height
     uint32_t chunks_count;
 } Grid;
@@ -184,6 +185,7 @@ void update_base_boid(void *boids, Grid *grid, BoidIndex boid_index, size_t boid
 
 void clear_grid(Grid *grid); // Clear all chunks (set counts to zero)
 void perform_boid_in_fill_grid(Grid *grid, BaseBoid *boid, BoidIndex i); // One iteration of fill_grid cycle
+void free_grid(Grid *grid); // Free all allocated data in grid
 
 // Fill chunks with boids
 #define FILL_GRID(grid, boids, boids_count)                                    \
@@ -196,8 +198,8 @@ void perform_boid_in_fill_grid(Grid *grid, BaseBoid *boid, BoidIndex i); // One 
 // Initialize grid and fully rebuild chunks (delete and recreate all chunks)
 #define INIT_GRID(grid, boids, boids_count, width, height, chunk_size_pizels)  \
     do {                                                                       \
-        (grid)->screen_width = (width);                                        \
-        (grid)->screen_height = (height);                                      \
+        (grid)->width_pixels = (width);                                        \
+        (grid)->height_pixels = (height);                                      \
         (grid)->cols = (uint16_t)((width)/chunk_size_pizels) + 1;              \
         (grid)->rows = (uint16_t)((height)/chunk_size_pizels) + 1;             \
         (grid)->chunks_count = (grid)->rows * (grid)->cols;                    \

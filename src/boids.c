@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #define RAYMATH_STATIC_INLINE
 #include <raymath.h>
@@ -9,10 +10,24 @@
 
 // <============================================ GRID AND CHUNKS ===========================================>
 
+#define MIN_CHUNK_CAPACITY 64
+#define CHUNK_CAPACITY_CHANGING 2
+
 // Clear all chunks (set counts to zero)
 void clear_grid(Grid *grid) {
     for (uint32_t i = 0; i < grid->chunks_count; i++) {
-        grid->chunks[i].count = 0;
+        Chunk *chunk = &grid->chunks[i];
+
+        /*if (chunk->boids != NULL && chunk->capacity > 0 && chunk->count == 0) {
+            free(chunk->boids);
+            chunk->capacity = 0;
+            chunk->boids = NULL;
+        } else */
+        if (chunk->boids != NULL && chunk->capacity > MIN_CHUNK_CAPACITY && (chunk->count == 0 || chunk->capacity/chunk->count >= (int)(CHUNK_CAPACITY_CHANGING*1.5))) {
+            chunk->capacity /= CHUNK_CAPACITY_CHANGING;
+            chunk->boids = realloc(chunk->boids, chunk->capacity * sizeof(*chunk->boids));
+        }
+        chunk->count = 0;
     }
 }
 
@@ -24,9 +39,9 @@ void perform_boid_in_fill_grid(Grid *grid, BaseBoid *boid, BoidIndex i) {
     float y = boid->pos.y;
 
     if (x < 0) x = 0;
-    else if (x > grid->screen_width) x = grid->screen_width;
+    else if (x > grid->width_pixels) x = grid->width_pixels;
     if (y < 0) y = 0;
-    else if (y > grid->screen_height) y = grid->screen_height;
+    else if (y > grid->height_pixels) y = grid->height_pixels;
     
     uint16_t chunk_x = x / grid->chunk_size_pixels;
     uint16_t chunk_y = y / grid->chunk_size_pixels;
@@ -34,8 +49,25 @@ void perform_boid_in_fill_grid(Grid *grid, BaseBoid *boid, BoidIndex i) {
 
     Chunk *chunk = &grid->chunks[chunk_index];
 
-    if (chunk->count < CHUNK_SIZE_BOIDS)
-        chunk->boids[chunk->count++] = i;
+    if (chunk->capacity == 0) {
+        chunk->capacity = MIN_CHUNK_CAPACITY;
+        chunk->boids = malloc(chunk->capacity * sizeof(*chunk->boids));
+    } else if (chunk->count >= chunk->capacity) {
+        chunk->capacity *= CHUNK_CAPACITY_CHANGING;
+        chunk->boids = realloc(chunk->boids, chunk->capacity * sizeof(*chunk->boids));
+    }
+    chunk->boids[chunk->count++] = i;
+}
+
+// Free all allocated data in grid
+void free_grid(Grid *grid) {
+    for (uint32_t i = 0; i < grid->chunks_count; i++) {
+        Chunk *chunk = &grid->chunks[i];
+        if (chunk->capacity > 0 && chunk->boids != NULL)
+            free(chunk->boids);
+    }
+    free(grid->chunks);
+    grid->chunks = NULL;
 }
 
 // <================================================= BOIDS ================================================>
@@ -110,9 +142,9 @@ void update_base_boid(void *boids, Grid *grid, BoidIndex boid_index, size_t boid
     // Clamp position within bounds
     Vector2 pos = boid->pos;
     if (pos.x < 0) pos.x = 0;
-    else if (pos.x > grid->screen_width) pos.x = grid->screen_width;
+    else if (pos.x > grid->width_pixels) pos.x = grid->width_pixels;
     if (pos.y < 0) pos.y = 0;
-    else if (pos.y > grid->screen_height) pos.y = grid->screen_height;
+    else if (pos.y > grid->height_pixels) pos.y = grid->height_pixels;
 
     // Get boid's chunk
     int32_t chunk_x = pos.x / grid->chunk_size_pixels;

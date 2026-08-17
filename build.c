@@ -35,14 +35,14 @@
     #define RAYLIB_LINK ""
 #endif
 
-#define CFLAGS_COMMON "-std=c99 -Wall "
+#define CFLAGS_COMMON "-std=c99 -Wall -Iraylib "
 #ifdef DEBUG
     #define CFLAGS CFLAGS_COMMON "-Wextra -pedantic -g -fsanitize=address -DDEBUG "
 #else
     #define CFLAGS CFLAGS_COMMON "-O2 "
 #endif
-#define CFLAGS_SERVER CFLAGS "-Iraylib"
-#define CFLAGS_CLIENT CFLAGS RAYLIB_INCLUDE
+#define CFLAGS_SERVER CFLAGS
+#define CFLAGS_CLIENT CFLAGS RAYLIB_INCLUDE "-Wno-unused-function -Wno-unused-parameter "
 
 #if defined(_WIN32)
     #ifdef DEBUG
@@ -50,7 +50,7 @@
     #else
         #define LDFLAGS "-static -static-libgcc -s "
     #endif
-    #define LDFLAGS_CLIENT LDFLAGS RAYLIB_LINK "-lraylib -lopengl32 -lgdi32 -lwinmm -lkernel32 -luser32 -lshell32 -lws2_32 "
+    #define LDFLAGS_CLIENT LDFLAGS RAYLIB_LINK "-lraylib -lpthread -lopengl32 -lgdi32 -lwinmm -lkernel32 -luser32 -lshell32 -lws2_32 "
     #define LDFLAGS_SERVER LDFLAGS
 #elif defined(__linux__)
     #define LDFLAGS "-lm -lpthread "

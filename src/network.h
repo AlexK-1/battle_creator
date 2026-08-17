@@ -126,6 +126,7 @@ typedef struct {
 } CPJoin;
 
 typedef enum {
+    STAGE_NULL = 0,
     STAGE_AREAS,
     STAGE_PLACING,
     STAGE_GAME
