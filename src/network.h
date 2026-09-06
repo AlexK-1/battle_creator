@@ -56,7 +56,8 @@ typedef enum {
     SP_PLAYER_READY, // A message, that the player is ready to start the game
     SP_START_GAME, // When all players have placed their boids
     SP_BOIDS_SYNC, // Boids sync server->clients
-    SP_ROOM_CLOSED, // Room is closed
+    SP_INVALID_PACKET, // Client sent an invalid packet
+    SP_DISCONNECT_PLAYER, // Server terminated connection with client
     SP_PLAYER_KICKED, // Room's admin kicked player
     SP_CHANGE_TEAM, // Admin changed player's team
     SP_SWAP_TEAMS, // Swap teams of two players
@@ -82,16 +83,6 @@ typedef enum {
 
 typedef struct {
     uint32_t id;
-    char username[USERNAME_LEN];
-} SPApprove;
-
-typedef struct {
-    uint32_t id;
-    int8_t team;
-} CPApprove;
-
-typedef struct {
-    uint32_t id;
     int8_t team;
     uint8_t ready;
     char name[USERNAME_LEN];
@@ -101,36 +92,51 @@ typedef enum {
     JOIN_OK,
     JOIN_FAILED,
     JOIN_REJECTED,
+    JOIN_STATUSES_COUNT
 } RoomJoiningStatus;
 
-typedef struct {
-    uint32_t room_id, player_id;
-    int32_t player_tcp_fd;
-    uint8_t players_number, joined_players, player_team, server_target_tps;
-    Point world_size;
-    ClientPlayer players[TEAMS_COUNT];
-    BoidIndex teams[TEAMS_COUNT];
-    uint8_t status, room_stage;
-} SPJoined;
-
-typedef struct {
-    uint8_t players_number, player_team, hide_areas;
-    Point world_size;
-    BoidIndex boids_number[TEAMS_COUNT];
-    char creator[USERNAME_LEN];
-} CPNew;
-
-typedef struct {
-    uint32_t room_id;
-    char username[USERNAME_LEN];
-} CPJoin;
+typedef enum {
+    DISCONNECT_KICKED,
+    DISCONNECT_ADMIN_CLOSED_ROOM,
+    DISCONNECT_PLAYER_EXITED,
+    DISCONNECT_ADMIN_EXITED,
+    DISCONNECT_PACKET_VIOLATIONS,
+    DISCONNECT_SERVER_ERROR,
+    DISCONNECT_SERVER_DOWN
+} DisconnectionReason;
 
 typedef enum {
     STAGE_NULL = 0,
     STAGE_AREAS,
     STAGE_PLACING,
-    STAGE_GAME
+    STAGE_GAME,
+    STAGE_COUNT
 } RoomStage;
+
+#define PUSH_DATA(pointer, type, data) (*(type*)(pointer) = (type)(data), (pointer) += sizeof(type))
+#define PUSH_MEM(pointer, data, len)                                                                 \
+    do {                                                                                             \
+        memcpy((pointer), (data), (len));                                                            \
+        (pointer) += (len);                                                                          \
+    } while (0)
+#define PUSH_STRING(pointer, string)                                                                 \
+    do {                                                                                             \
+        char *s = string;                                                                            \
+        while (*s) *((pointer)++) = *(s++);                                                          \
+    } while (0)
+
+#define POP_DATA(pointer, type) ((pointer) += sizeof(type), *(type*)((pointer) - sizeof(type)))
+#define POP_MEM(pointer, data, len)                                                                  \
+    do {                                                                                             \
+        memcpy((data), (pointer), (len));                                                            \
+        (pointer) += (len);                                                                          \
+    } while (0)
+#define POP_STRING(pointer, string, max_len)                                                         \
+    do {                                                                                             \
+        char *s = string;                                                                            \
+        int len = 0;                                                                                 \
+        while (*(pointer) && (len++) < (max_len)) *((pointer)++) = *(s++);                           \
+    } while (0)
 
 int send_all(int fd, void *buf, size_t n, int flags); // Send n bytes from buf
 int send_packet(int fd, uint8_t packet_type, void *buf, uint32_t len, int flags); // Send packet_type + len + buf

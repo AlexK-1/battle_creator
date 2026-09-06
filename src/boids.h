@@ -73,7 +73,8 @@ typedef enum {
     ACT_RETREAT,
     ACT_SURRENDER,
     ACT_FALL,
-    ACT_DELETE
+    ACT_DELETE,
+    ACT_COUNT
 } BoidAction;
 
 typedef enum {
@@ -115,31 +116,10 @@ typedef struct {
 } BaseBoid; // Default boid
 
 typedef struct {
-    uint16_t x, y;
-    uint8_t vel, xp;
-    int8_t health, angle, action;
-} NetBoid; // Boids sync (server -> clients) every N seconds
-
-typedef struct {
-    uint16_t count;
-    int8_t team;
-} ClientStartNetBoids; // First placement of boids on the map (client -> server)
-
-typedef struct {
-    uint16_t x, y;
-    uint8_t speed, xp, team, max_health;
-} ServerStartNetBoid; // First placement of boids on the map (server -> clients)
-
-typedef struct {
     Vector2 order_vector;
     uint16_t order_timer;
     bool direction_order, point_order;
 } OrderBoidPart; // Order fields for boids
-
-typedef struct {
-    BaseBoid b;
-    OrderBoidPart o;
-} ServerBoid; // Boid on server (default boid + order fields)
 
 typedef struct {
     Vector2 direction, target_pos;
@@ -150,8 +130,18 @@ typedef struct {
 
 typedef struct {
     BaseBoid b;
+    OrderBoidPart o;
+} ServerBoid; // Boid on server (default boid + order fields)
+
+typedef struct {
+    BaseBoid b;
     VisualizationBoidsPart v;
 } ClientBoid; // Boid on client (default boid + fields for visualization and selecting)
+
+typedef struct {
+    uint16_t count;
+    int8_t team;
+} StartBoids; // First placement of boids on the map
 
 typedef enum {
     ORDER_CLEAR,

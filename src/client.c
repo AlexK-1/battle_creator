@@ -47,27 +47,27 @@
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 
-#define ERR(str)                                                                   \
-    do {                                                                           \
-        fprintf(stderr, "%s: " str, prog);                                         \
-        exit(EXIT_FAILURE);                                                        \
+#define ERR(str)                                                                                     \
+    do {                                                                                             \
+        fprintf(stderr, "%s: " str, prog);                                                           \
+        exit(EXIT_FAILURE);                                                                          \
     } while (0)
 
-#define ERRF(format, ...)                                                          \
-    do {                                                                           \
-        fprintf(stderr, "%s: " format, prog, __VA_ARGS__);                         \
-        exit(EXIT_FAILURE);                                                        \
+#define ERRF(format, ...)                                                                            \
+    do {                                                                                             \
+        fprintf(stderr, "%s: " format, prog, __VA_ARGS__);                                           \
+        exit(EXIT_FAILURE);                                                                          \
     } while (0)
 
-#define STYLE_START(control, property, value)                                      \
-    do {                                                                           \
-        int __old_gui_value = GuiGetStyle(control, property);                      \
-        int __gui_style_control = control;                                         \
-        int __gui_style_property = property;                                       \
+#define STYLE_START(control, property, value)                                                        \
+    do {                                                                                             \
+        int __old_gui_value = GuiGetStyle(control, property);                                        \
+        int __gui_style_control = control;                                                           \
+        int __gui_style_property = property;                                                         \
         GuiSetStyle(control, property, value)
 
-#define STYLE_END()                                                                \
-        GuiSetStyle(__gui_style_control, __gui_style_property, __old_gui_value);   \
+#define STYLE_END()                                                                                  \
+        GuiSetStyle(__gui_style_control, __gui_style_property, __old_gui_value);                     \
     } while (0)
 
 /* <===================================================== LOGGING ====================================================> */
@@ -208,7 +208,7 @@ typedef struct {
     bool udp_opened;
 
     // Global game
-    bool running, game_initialized, net_thread_running, local_game, run_game;
+    bool running, game_initialized, net_thread_running, local_game, run_game, reset_game;
     BoidIndex boids_number[TEAMS_COUNT], total_boids_number;
     int screen_width, screen_height;
     struct {
@@ -303,26 +303,66 @@ pthread_mutex_t next_menu_mtx;
 pthread_mutex_t input_mtx;
 pthread_mutex_t players_mtx;
 
-#define CHECK_LEAST_SIZE(size)                                                                                          \
-    if (packet_size < (size)) {                                                                                         \
-        log_message(&ctx.log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n", \
-                  packet_type, (uint32_t)(size), packet_size);                                                          \
-        return 1;                                                                                                       \
-    }
+#define CHECK_LEAST_SIZE(size)                                                                                              \
+    do {                                                                                                                    \
+        if (packet_size < (uint32_t)(size)) {                                                                               \
+            log_message(&ctx.log, L_ERROR, "invalid SP#%d packet length (expected at least %u bytes, %u bytes received)\n", \
+                        packet_type, (uint32_t)(size), packet_size);                                                        \
+            return 1;                                                                                                       \
+        }                                                                                                                   \
+    } while (0)
 
-#define CHECK_SIZE(size)                                                                                                \
-    if (packet_size != (size)) {                                                                                        \
-        log_message(&ctx.log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",          \
-                  packet_type, (uint32_t)(size), packet_size);                                                          \
-        return 1;                                                                                                       \
-    }
+#define CHECK_SIZE(size)                                                                                                    \
+    do {                                                                                                                    \
+        if (packet_size != (uint32_t)(size)) {                                                                              \
+            log_message(&ctx.log, L_ERROR, "invalid SP#%d packet length (expected %u bytes, %u bytes received)\n",          \
+                        packet_type, (uint32_t)(size), packet_size);                                                        \
+            return 1;                                                                                                       \
+        }                                                                                                                   \
+    } while (0)
+
+#define CHECK_FIELD(expr)                                                                                                   \
+    do {                                                                                                                    \
+        if (!(expr)) {                                                                                                      \
+            log_message(&ctx.log, L_ERROR, "invalid SP#%d packet: field check failed\n", packet_type);                      \
+            pthread_mutex_unlock(&areas_mtx);                                                                               \
+            pthread_mutex_unlock(&boids_mtx);                                                                               \
+            pthread_mutex_unlock(&running_mtx);                                                                             \
+            pthread_mutex_unlock(&next_menu_mtx);                                                                           \
+            pthread_mutex_unlock(&input_mtx);                                                                               \
+            pthread_mutex_unlock(&players_mtx);                                                                             \
+            return 1;                                                                                                       \
+        }                                                                                                                   \
+    } while (0)
 
 int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
+    char *d = packet_data;
+    
     switch (packet_type) {
     case SP_JOIN_PLAYER: { // This player has joined (or not) to the room
-        SPJoined *recv_data = (SPJoined*)packet_data;
+        /* SP_JOIN_PLAYER PACKET FORMAT
+        (uint8 status)
+        (
+          if status == JOIN_OK {
+            (uint32 room_id) (uint32 player_id) (int32 player_tcp_fd) (uint8 players_number) (uint8 joined_players) (uint8 player_team)
+            (uint8 server_target_tps) (uint8 room_stage) (uint16 world_size_x) (uint16 world_size_y) (uint16[TEAMS_COUNT] teams)
+            ({
+              (uint32 id) (uint8 team) (uint8 ready) (uint8[USERNAME_LEN] username)
+            }[joined_players] players)
+          }
+        )
+        */
+
+        CHECK_LEAST_SIZE( 1 );
+        
+        uint8_t join_status = POP_DATA(d, uint8_t);
+        CHECK_FIELD(join_status < JOIN_STATUSES_COUNT);
+       
+        if (join_status == JOIN_OK)
+            CHECK_LEAST_SIZE( 1 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 2 + 2 + 2*TEAMS_COUNT + (4 + 1 + 1 + USERNAME_LEN)*1 );
+        
         if (ctx.new_room) {
-            if (recv_data->status != JOIN_OK) {
+            if (join_status != JOIN_OK) {
                 write_log(L_INFO, "unable to create a room\n");
 
                 pthread_mutex_lock(&next_menu_mtx);
@@ -331,10 +371,20 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
                 ctx.change_menu = true;
                 pthread_mutex_unlock(&next_menu_mtx);
                 
-                break;
+                return 1;
             }
         } else {
-            if (recv_data->status == JOIN_FAILED) {
+            if (join_status == JOIN_REJECTED) {
+                write_log(L_INFO, "admin has rejected your joining\n");
+
+                pthread_mutex_lock(&next_menu_mtx);
+                set_menu_message(MESSAGE_INFO, true, "Admin has rejected your joining");
+                ctx.next_menu = MENU_MAIN;
+                ctx.change_menu = true;
+                pthread_mutex_unlock(&next_menu_mtx);
+
+                return 1;
+            } else if (join_status != JOIN_OK) {
                 write_log(L_INFO, "unable to join to the room\n");
 
                 pthread_mutex_lock(&next_menu_mtx);
@@ -342,62 +392,84 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
                 ctx.next_menu = MENU_MAIN;
                 ctx.change_menu = true;
                 pthread_mutex_unlock(&next_menu_mtx);
-                break;
+
+                return 1;
             }
-
-            if (recv_data->status == JOIN_REJECTED) {
-                write_log(L_INFO, "admin has rejected your joining\n");
-
-                pthread_mutex_lock(&next_menu_mtx);
-                set_menu_message(MESSAGE_ERROR, true, "Admin has rejected your joining");
-                ctx.next_menu = MENU_MAIN;
-                ctx.change_menu = true;
-                pthread_mutex_unlock(&next_menu_mtx);
-                break;
-            }
-
-            ctx.player_team = recv_data->player_team;
         }
 
         pthread_mutex_lock(&players_mtx);
 
-        ctx.room_id = ntohl(recv_data->room_id);
-        ctx.players_number = recv_data->players_number;
-        ctx.joined_players = recv_data->joined_players;
-        ctx.world_size.x = ntohs(recv_data->world_size.x);
-        ctx.world_size.y = ntohs(recv_data->world_size.y);
-        ctx.server_target_tps = recv_data->server_target_tps;
-    
-        ctx.stage = recv_data->room_stage;
+        ctx.room_id = ntohl(POP_DATA(d, uint32_t));
+        
+        ctx.player_id = ntohl(POP_DATA(d, uint32_t));
+        CHECK_FIELD(ctx.player_id > 0);
+
+        int32_t server_tcp_fd = ntohl(POP_DATA(d, int32_t));
+        CHECK_FIELD(server_tcp_fd > 0);
+
+        ctx.players_number = POP_DATA(d, uint8_t);
+        CHECK_FIELD(ctx.players_number <= TEAMS_COUNT);
+
+        ctx.joined_players = POP_DATA(d, uint8_t);
+        CHECK_FIELD(ctx.joined_players <= TEAMS_COUNT);
+
+        ctx.player_team = POP_DATA(d, uint8_t);
+        CHECK_FIELD(ctx.player_team < TEAMS_COUNT);
+
+        ctx.server_target_tps = POP_DATA(d, uint8_t);
+        
+        ctx.stage = POP_DATA(d, uint8_t);
+        CHECK_FIELD(ctx.stage < STAGE_COUNT);
+        
+        CHECK_SIZE( 1 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 2 + 2 + 2*TEAMS_COUNT + (4 + 1 + 1 + USERNAME_LEN)*ctx.joined_players );
+        
         if (ctx.stage == STAGE_AREAS)
             ctx.mode = ctx.new_room ? MODE_AREAS : MODE_WAIT;
         else
             ctx.mode = MODE_SPAWN;
-    
-        memcpy(&ctx.players, &recv_data->players, sizeof(ctx.players));
-        for (int i = 0; i < ctx.joined_players; i++) {
-            if (ctx.players[i].id == recv_data->player_id)
-                strncpy(ctx.username, ctx.players[i].name, sizeof(ctx.username)-1);
-            ctx.players[i].id = ntohl(ctx.players[i].id);
-        }
-        ctx.player_id = ntohl(recv_data->player_id);
+
+        ctx.world_size.x = ntohs(POP_DATA(d, uint16_t));
+        CHECK_FIELD(ctx.world_size.x > 0);
+        ctx.world_size.y = ntohs(POP_DATA(d, uint16_t));
+        CHECK_FIELD(ctx.world_size.y > 0);
 
         ctx.total_boids_number = 0;
         for (int i = 0; i < TEAMS_COUNT; i++) {
-            BoidIndex boids = htons(recv_data->teams[i]);
+            BoidIndex boids = htons(POP_DATA(d, uint16_t));
+            CHECK_FIELD(boids <= MAX_BOIDS_COUNT);
             ctx.boids_number[i] = boids;
             ctx.total_boids_number += boids;
 
             ctx.teams_used[i] = boids > 0;
         }
 
+        for (int i = 0; i < ctx.joined_players; i++) {
+            ClientPlayer *op = &ctx.players[i];
+
+            op->id = ntohl(POP_DATA(d, uint32_t));
+            CHECK_FIELD(op->id > 0);
+
+            op->team = POP_DATA(d, uint8_t);
+            CHECK_FIELD(op->team < TEAMS_COUNT);
+
+            op->ready = POP_DATA(d, uint8_t);
+
+            POP_MEM(d, op->name, USERNAME_LEN);
+            op->name[USERNAME_LEN-1] = '\0';
+            
+            if (op->id == ctx.player_id)
+                memcpy(ctx.username, op->name, USERNAME_LEN);
+        }
+
         if (ctx.udp_opened) {
-            /* PACKET FORMAT
-            [uint32 player_id] [int32_t player_tcp_fd]
+            /* CP_UDP_HELLO PACKET FORMAT
+            (uint32 player_id) (int32_t player_tcp_fd)
             */
+            
             char buf[sizeof(uint32_t) + sizeof(int32_t)];
-            *(uint32_t*)(buf) = recv_data->player_id;
-            *(int32_t*)(buf+sizeof(uint32_t)) = recv_data->player_tcp_fd;
+            char *b = buf;
+            PUSH_DATA(b, uint32_t, htonl(ctx.player_id));
+            PUSH_DATA(b, int32_t, htonl(server_tcp_fd));
 
             sendto_packet(ctx.udp_fd, CP_UDP_HELLO, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
         }
@@ -412,39 +484,51 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         break;
     }
     case SP_APPROVE_PLAYER: { // Approve/reject new player
-        /* PACKET FORMAT
-        [SPApprove player]
+        /* SP_APPROVE_PLAYER PACKET FORMAT
+        (uint32 player_id) (int8[USERNAME_LEN] username)
         */
 
-        CHECK_SIZE( sizeof(SPApprove) );
-        
-        SPApprove *other_player = (SPApprove*)packet_data;
+        CHECK_SIZE( /*id*/ sizeof(uint32_t) + /*username*/ USERNAME_LEN );
 
-        ctx.approved_player_id = ntohl(other_player->id);
-        strcpy(ctx.approved_player_username, other_player->username);
+        ctx.approved_player_id = ntohl(POP_DATA(d, uint32_t));
+        CHECK_FIELD(ctx.approved_player_id > 0);
+
+        POP_MEM(d, ctx.approved_player_username, USERNAME_LEN);
+        ctx.approved_player_username[USERNAME_LEN-1] = '\0';
 
         pthread_mutex_lock(&input_mtx);
         ctx.get_input = true;
         pthread_mutex_unlock(&input_mtx);
 
-        log_message(&ctx.log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", other_player->username);
+        log_message(&ctx.log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", ctx.approved_player_username);
 
         break;   
         }
     case SP_NEW_JOIN: {
-        /* PACKET FORMAT
-        [ClientPlayer new_player]
+        /* SP_NEW_JOIN PACKET FORMAT
+        (uint32 id) (uint8 team) (uint8 ready) (uint8[USERNAME_LEN] username)
         */
     
-        CHECK_SIZE( sizeof(ClientPlayer) );
+        CHECK_SIZE( 4 + 1 + 1 + USERNAME_LEN );
         
-        ClientPlayer *new_player = (ClientPlayer*)packet_data;
-        new_player->id = ntohl(new_player->id);
+        ClientPlayer new_player;
+        
+        new_player.id = ntohl(POP_DATA(d, uint32_t));
+        CHECK_FIELD(new_player.id > 0);
+        
+        new_player.team = POP_DATA(d, uint8_t);
+        CHECK_FIELD(new_player.team < TEAMS_COUNT);
+        
+        d += 1; // skip ready field
+        new_player.ready = false;
 
+        POP_MEM(d, new_player.name, USERNAME_LEN);
+        new_player.name[USERNAME_LEN-1] = '\0';
+        
         pthread_mutex_lock(&players_mtx);
-        ctx.players[ctx.joined_players++] = *new_player;
+        ctx.players[ctx.joined_players++] = new_player;
         pthread_mutex_unlock(&players_mtx);
-        log_message(&ctx.log, L_JOIN, "new player '%s' - %s\n", new_player->name, get_team_name(new_player->team));
+        log_message(&ctx.log, L_JOIN, "new player '%s' - %s\n", new_player.name, get_team_name(new_player.team));
 
         if (ctx.new_room && ctx.players_number == ctx.joined_players && ctx.stage == STAGE_AREAS) {
             log_message(&ctx.log, L_INFO, "press ENTER to start placing boids\n");
@@ -454,8 +538,8 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         break;
         }
     case SP_PLAYER_EXIT: {
-        /* PACKET FORMAT
-        [uin32_t player_id]
+        /* SP_PLAYER_EXIT PACKET FORMAT
+        (uin32_t player_id)
         */
     
         CHECK_SIZE( sizeof(uint32_t) );
@@ -492,26 +576,28 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         }
     case SP_START_PLACING:
     case SP_SEND_AREAS: {
-        /* PACKET FORMAT
-        [uint16 areas_count] [Area[areas_count] areas]
+        /* SP_START_PLACING|SP_SEND_AREAS PACKET FORMAT
+        (uint16 areas_count) ( { (uint16 x1) (uint16 y1) (uint16 x2) (uint16 y2) (uint8 team) }[areas_count] areas)
         */
 
         CHECK_LEAST_SIZE( /*areas_count*/ sizeof(int16_t) );
         
-        uint16_t new_areas_count = ntohs(*(int16_t*)packet_data);
-        CHECK_SIZE( sizeof(new_areas_count) + new_areas_count*sizeof(Area) );
+        uint16_t new_areas_count = ntohs(POP_DATA(d, uint16_t));
+        CHECK_FIELD(new_areas_count < MAX_AREAS_COUNT);
+        
+        CHECK_SIZE( 2 + (2 + 2 + 2 + 2 + 1)*new_areas_count );
         
         if (!ctx.new_room) {
             pthread_mutex_lock(&areas_mtx);
             ctx.areas_count = new_areas_count;
-            Area *a = (Area*)(packet_data + sizeof(new_areas_count));
             for (int i = 0; i < ctx.areas_count; i++) {
-                ctx.areas[i].team = a->team;
-                ctx.areas[i].rec.x1 = ntohs(a->rec.x1);
-                ctx.areas[i].rec.x2 = ntohs(a->rec.x2);
-                ctx.areas[i].rec.y1 = ntohs(a->rec.y1);
-                ctx.areas[i].rec.y2 = ntohs(a->rec.y2);
-                a++;
+                Area *a = &ctx.areas[i];
+                a->rec.x1 = ntohs(POP_DATA(d, uint16_t));
+                a->rec.y1 = ntohs(POP_DATA(d, uint16_t));
+                a->rec.x2 = ntohs(POP_DATA(d, uint16_t));
+                a->rec.y2 = ntohs(POP_DATA(d, uint16_t));
+                a->team = POP_DATA(d, uint8_t);
+                CHECK_FIELD(a->team < TEAMS_COUNT);
             }
             pthread_mutex_unlock(&areas_mtx);
         }
@@ -527,47 +613,61 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         break;
         }
     case SP_PLAYER_READY: {
-        /* PACKET FORMAT
-        [uint32 player_id]
+        /* SP_PLAYER_READY PACKET FORMAT
+        (uint32 player_id)
         */
 
         CHECK_SIZE( sizeof(uint32_t) );
 
         pthread_mutex_lock(&players_mtx);
+        
         uint32_t id = ntohl(*(uint32_t*)packet_data);
+        CHECK_FIELD(id > 0);
+        
         int idx = get_player_idx(ctx.players, id);
         ctx.players[ctx.players[idx].team].ready = true;
         log_message(&ctx.log, L_INFO, "player '%s' is ready\n", ctx.players[idx].name);
+
         pthread_mutex_unlock(&players_mtx);
     
         break;
         }
     case SP_START_GAME: {
-        /* PACKET FORMAT
-        [uint16 boids_count] [ServerStartNetBoid[boids_count] boids]
+        /* SP_START_GAME PACKET FORMAT
+        (uint16 boids_count) ( { (uint16 x) (uint16 y) (uint8 speed) (uint8 xp) (uint8 team) (uint8 max_health) }[boids_count] boids)
         */
 
         CHECK_LEAST_SIZE( /*boids_count*/ sizeof(uint16_t) );
     
-        uint16_t recv_boids_count = ntohs(*(uint16_t*)packet_data);
-        CHECK_SIZE( sizeof(recv_boids_count) + recv_boids_count*sizeof(ServerStartNetBoid) );
-        
-        if (recv_boids_count != ctx.total_boids_number) {
-            log_message(&ctx.log, L_ERROR, "invalid number of boids in SP#%d packet (expected %d boids, %d boids received)\n",
-                      packet_type, ctx.total_boids_number, recv_boids_count);
-            return 1;
-        }
+        uint16_t recv_boids_count = ntohs(POP_DATA(d, uint16_t));
+        CHECK_FIELD(recv_boids_count == ctx.total_boids_number);
 
-        ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(packet_data + sizeof(recv_boids_count));
+        CHECK_SIZE( 2 + (2 + 2 + 1 + 1 + 1 + 1)*recv_boids_count );
+        
+        // ServerStartNetBoid *recv_boids = (ServerStartNetBoid*)(packet_data + sizeof(recv_boids_count));
 
         pthread_mutex_lock(&boids_mtx);
         for (int i = 0; i < recv_boids_count; i++) {
-            ServerStartNetBoid recv_boid = recv_boids[i];
-            ClientBoid new_boid = {.b = {.pos = {ntohs(recv_boid.x), ntohs(recv_boid.y)}, .speed = recv_boid.speed/100.0f,
-                                         .health = recv_boid.max_health, .max_health = recv_boid.max_health, .xp = recv_boid.xp,
-                                         .team = recv_boid.team, .action = ACT_STOP, .boid_idx = i},
-                                   .v = {.direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}}};
-            ctx.boids[i] = new_boid;
+            ClientBoid boid = {.b = {.action = ACT_STOP, .boid_idx = i},
+                               .v = {.direction = (Vector2){GetRandomValue(-10, 10)/10.0, GetRandomValue(-10, 10)/10.0}}};
+            
+            boid.b.pos.x = ntohs(POP_DATA(d, uint16_t));
+            CHECK_FIELD(boid.b.pos.x <= ctx.world_size.x);
+            
+            boid.b.pos.y = ntohs(POP_DATA(d, uint16_t));
+            CHECK_FIELD(boid.b.pos.y <= ctx.world_size.y);
+            
+            boid.b.speed = POP_DATA(d, uint8_t) / 100.0f;
+
+            boid.b.xp = POP_DATA(d, uint8_t);
+            boid.b.xp = MIN(boid.b.xp, BOID_MAX_XP);
+            
+            boid.b.team = POP_DATA(d, uint8_t);
+            CHECK_FIELD(boid.b.team < TEAMS_COUNT);
+            
+            boid.b.max_health = boid.b.health = POP_DATA(d, uint8_t);
+
+            ctx.boids[i] = boid;
         }
         ctx.boids_count = recv_boids_count;
 
@@ -586,40 +686,57 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         break;
         }
     case SP_BOIDS_SYNC: {
-        /* PACKET FORMAT
-        [uint8 current_server_tps] [uint16 boids_count] [uint16 first_boid_index] [NetBoid[boids_count] boids]
+        /* SP_BOIDS_SYNC PACKET FORMAT
+        (uint8 current_server_tps) (uint16 boids_count) (uint16 first_boid_index)
+        ({
+          (uint16 x) (uint16 y) (int8 health) (uint8 xp) (int8 action) (uint8 angle) (int8 vel)
+         }[boids_count] boids)
         */
 
         CHECK_LEAST_SIZE( /*current_server_tps*/ 1 + /*boids_count*/ sizeof(BoidIndex) + /*first_boid_index*/ sizeof(BoidIndex) );
 
-        BoidIndex recv_boids_count = ntohs(*(BoidIndex*)(packet_data+1));
-        CHECK_SIZE( 1 + sizeof(BoidIndex) + sizeof(BoidIndex) + recv_boids_count*sizeof(NetBoid) );
+        uint8_t server_tps = POP_DATA(d, uint8_t);
         
-        ctx.server_tps = *(uint8_t*)packet_data;
-        BoidIndex boids_first_index = ntohs(*(BoidIndex*)(packet_data+1+sizeof(BoidIndex)));
-
-        NetBoid *recv_boids = (NetBoid*)(packet_data + 1 + sizeof(recv_boids_count)*2);
+        BoidIndex recv_boids_count = ntohs(POP_DATA(d, BoidIndex));
+        
+        CHECK_SIZE( 1 + 2 + 2 + (2 + 2 + 1 + 1 + 1 + 1 + 1)*recv_boids_count );
+        
+        ctx.server_tps = server_tps;
+        BoidIndex boids_first_index = ntohs(POP_DATA(d, BoidIndex));
+        CHECK_FIELD(boids_first_index + recv_boids_count <= ctx.total_boids_number);
 
         pthread_mutex_lock(&boids_mtx);
         for (int i = 0; i < recv_boids_count; i++) {
-            NetBoid *recv_boid = &recv_boids[i];
             ClientBoid *boid = &ctx.boids[boids_first_index + i];
-            boid->b.health = recv_boid->health;
-            boid->b.xp = recv_boid->xp;
-            if (recv_boid->action == ACT_FALL || recv_boid->action == ACT_SURRENDER) {
+
+            uint16_t x = ntohs(POP_DATA(d, uint16_t));
+            uint16_t y = ntohs(POP_DATA(d, uint16_t));
+            boid->b.health = POP_DATA(d, int8_t);
+            boid->b.xp = POP_DATA(d, uint8_t);
+            boid->b.xp = MIN(boid->b.xp, BOID_MAX_XP);
+
+            int8_t action = POP_DATA(d, int8_t);
+            CHECK_FIELD(action >= 0 && action < ACT_COUNT);
+            if (action == ACT_FALL || action == ACT_SURRENDER) {
                 boid->v.is_selected = false;
-                if ((recv_boid->action == ACT_FALL && boid->b.action != ACT_FALL) ||
-                    (recv_boid->action == ACT_SURRENDER && boid->b.action != ACT_SURRENDER))
+                if ((action == ACT_FALL && boid->b.action != ACT_FALL) ||
+                    (action == ACT_SURRENDER && boid->b.action != ACT_SURRENDER))
                     boid->v.sprite_timer = 0;
-                boid->b.action = recv_boid->action;
+                d += 2; // skip angle and vel properties
+                boid->b.action = action;
                 continue;
             }
-            boid->b.action = recv_boid->action;
-            boid->v.target_pos = (Vector2){ntohs(recv_boid->x), ntohs(recv_boid->y)};
-            boid->b.velocity.x = recv_boid->vel/255.0*BOID_MAX_SPEED * cos(recv_boid->angle/127.0*PI);
-            boid->b.velocity.y = recv_boid->vel/255.0*BOID_MAX_SPEED * sin(recv_boid->angle/127.0*PI);
-            // if (recv_boid->vel > 0 && !boid->b.is_fighting)
-            //     boid->v.direction = boid->b.velocity;
+            boid->b.action = action;
+
+            boid->v.target_pos.x = x;
+            boid->v.target_pos.y = y;
+            
+            uint8_t angle = POP_DATA(d, uint8_t);
+            int8_t vel = POP_DATA(d, int8_t);
+
+            boid->b.velocity.x = vel/255.0*BOID_MAX_SPEED * cos(angle/127.0*PI);
+            boid->b.velocity.y = vel/255.0*BOID_MAX_SPEED * sin(angle/127.0*PI);
+            
             boid->v.go_target = true;
         }
 
@@ -631,35 +748,102 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
 
         break;
         }
-    case SP_ROOM_CLOSED: {
-        /* PACKET FORMAT
-        [uint8 auto_close]
+    case SP_INVALID_PACKET: {
+        write_log(L_INFO, "the server received an invalid packet; check the compatibillity of the server and client verions\n");
+        
+        break;
+        }
+    case SP_DISCONNECT_PLAYER: {
+        /* SP_DISCONNECT_PLAYER PACKET FORMAT
+        (uint8 reason)
         */
 
         CHECK_SIZE( 1 );
 
-        uint8_t auto_close = *(uint8_t*)packet_data;
-        if (auto_close) // room is closed by server
-            log_message(&ctx.log, L_INFO, "room closed\n");
-        else // room is closed player (admin)
-            log_message(&ctx.log, L_INFO, "room closed by player '%s'\n", ctx.players[0].name);
-    
-        break;
+        DisconnectionReason reason = POP_DATA(d, uint8_t);
+
+        switch (reason) {
+            case DISCONNECT_KICKED:
+                write_log(L_INFO, "admin kicked you out of the room\n");
+
+                pthread_mutex_lock(&next_menu_mtx);
+                set_menu_message(MESSAGE_INFO, true, "Admin kicked you out of the room");
+                ctx.next_menu = MENU_MAIN;
+                ctx.change_menu = true;
+                pthread_mutex_unlock(&next_menu_mtx);
+
+                break;
+            case DISCONNECT_ADMIN_CLOSED_ROOM:
+                write_log(L_INFO, "admin closed the room\n");
+
+                pthread_mutex_lock(&next_menu_mtx);
+                set_menu_message(MESSAGE_INFO, true, "Admin closed the room");
+                ctx.next_menu = MENU_MAIN;
+                ctx.change_menu = true;
+                pthread_mutex_unlock(&next_menu_mtx);
+
+                break;
+            case DISCONNECT_ADMIN_EXITED:
+                write_log(L_INFO, "admin left the room\n");
+
+                pthread_mutex_lock(&next_menu_mtx);
+                set_menu_message(MESSAGE_INFO, true, "Admin left the room");
+                ctx.next_menu = MENU_MAIN;
+                ctx.change_menu = true;
+                pthread_mutex_unlock(&next_menu_mtx);
+
+                break;
+            case DISCONNECT_PACKET_VIOLATIONS:
+                write_log(L_ERROR, "you were kicked out room because of a violations of packet transmission\n");
+
+                pthread_mutex_lock(&next_menu_mtx);
+                set_menu_message(MESSAGE_ERROR, true, "You were kicked out because of a violations of packet transmission");
+                ctx.next_menu = MENU_MAIN;
+                ctx.change_menu = true;
+                pthread_mutex_unlock(&next_menu_mtx);
+
+                break;
+            case DISCONNECT_SERVER_ERROR:
+                write_log(L_ERROR, "an error has occurred on the server\n");
+
+                pthread_mutex_lock(&next_menu_mtx);
+                set_menu_message(MESSAGE_ERROR, true, "An error has occurred on the server");
+                ctx.next_menu = MENU_MAIN;
+                ctx.change_menu = true;
+                pthread_mutex_unlock(&next_menu_mtx);
+
+                break;
+            case DISCONNECT_SERVER_DOWN:
+                write_log(L_ERROR, "the server crashed\n");
+
+                pthread_mutex_lock(&next_menu_mtx);
+                set_menu_message(MESSAGE_ERROR, true, "The server crashed :)");
+                ctx.next_menu = MENU_MAIN;
+                ctx.change_menu = true;
+                pthread_mutex_unlock(&next_menu_mtx);
+
+                break;
+            default:
+                break;
+        }
+
+        return 1;
         }
     case SP_PLAYER_KICKED: {
-        /* PACKET FORMAT
-        [uint32 player_id]
+        /* SP_PLAYER_KICKED PACKET FORMAT
+        (uint32 player_id)
         */
 
         CHECK_SIZE( sizeof(uint32_t) );
 
         uint32_t kicked_player = ntohl(*(uint32_t*)packet_data);
+        CHECK_FIELD(kicked_player > 0);
 
         pthread_mutex_lock(&players_mtx);
         int player_idx = get_player_idx(ctx.players, kicked_player);
         if (player_idx < 0 || player_idx >= ctx.joined_players) {
             pthread_mutex_unlock(&players_mtx);
-            break;
+            return 1;
         }
         
         log_message(&ctx.log, L_DISCONNECT, "player '%s' was kicked out of the room by player '%s'\n", ctx.players[player_idx].name, ctx.players[0].name);
@@ -673,26 +857,21 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         break;
         }
     case SP_CHANGE_TEAM: {
-        /* PACKET FORMAT
-        [uint32 player1_id] [uint32 player2_id]
+        /* SP_CHANGE_TEAM PACKET FORMAT
+        (uint32 player1_id) (uint8 new_team)
         */
 
         CHECK_SIZE( sizeof(uint32_t) + 1 );
 
-        uint32_t pid = ntohl(*(uint32_t*)(packet_data)); // player ID
+        uint32_t pid = ntohl(POP_DATA(d, uint32_t)); // player ID
+        CHECK_FIELD(pid > 0);
 
         pthread_mutex_lock(&players_mtx);
         int pidx = get_player_idx(ctx.players, pid); // player idx
-        if (pidx < 0 || pidx >= ctx.joined_players) {
-            pthread_mutex_unlock(&players_mtx);
-            break;
-        }
+        CHECK_FIELD(pidx >= 0 && pidx < ctx.joined_players);
 
-        int8_t team = *(int8_t*)(packet_data+sizeof(uint32_t));
-        if (team < 0 || team >= TEAMS_COUNT) {
-            pthread_mutex_unlock(&players_mtx);
-            break;
-        }
+        uint8_t team = POP_DATA(d, uint8_t);
+        CHECK_FIELD(team < TEAMS_COUNT);
         
         ctx.players[pidx].team = team;
         ctx.player_team = ctx.players[get_player_idx(ctx.players, ctx.player_id)].team;
@@ -704,14 +883,16 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         break;
         }
     case SP_SWAP_TEAMS: {
-        /* PACKET FORMAT
-        [uint32 player1_id] [uint32 player2_id]
+        /* SP_SWAP_TEAMS PACKET FORMAT
+        (uint32 player1_id) (uint32 player2_id)
         */
 
         CHECK_SIZE( sizeof(uint32_t)*2 );
         
-        uint32_t pid1 = ntohl(*(uint32_t*)(packet_data));
-        uint32_t pid2 = ntohl(*(uint32_t*)(packet_data+sizeof(uint32_t)));
+        uint32_t pid1 = ntohl(POP_DATA(d, uint32_t));
+        CHECK_FIELD(pid1 > 0);
+        uint32_t pid2 = ntohl(POP_DATA(d, uint32_t));
+        CHECK_FIELD(pid2 > 0);
         
         pthread_mutex_lock(&players_mtx);
 
@@ -739,14 +920,15 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         break;
         }
     case SP_CHAT_MSG: {
-        /* PACKET FORMAT
-        [uint32 sender_id] [uint16 msg_len] [uint8[msg_len] msg]
+        /* SP_CHAT_MSG PACKET FORMAT
+        (uint32 sender_id) (uint16 msg_len) (uint8[msg_len] msg)
         */
 
         CHECK_LEAST_SIZE( sizeof(uint32_t) + sizeof(uint16_t) );
 
-        uint32_t sender_id = ntohl(*(uint32_t*)(packet_data));
-        uint32_t msg_len = ntohs(*(uint16_t*)(packet_data+sizeof(uint32_t)));
+        uint32_t sender_id = ntohl(POP_DATA(d, uint32_t));
+        CHECK_FIELD(sender_id > 0);
+        uint32_t msg_len = ntohs(POP_DATA(d, uint16_t));
         
         CHECK_SIZE( sizeof(uint32_t) + sizeof(uint16_t) + msg_len );
 
@@ -754,12 +936,15 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         if (sender_idx < 0)
             break;
         
-        char *msg = packet_data+sizeof(uint32_t)+sizeof(uint16_t);
+        char *msg = d;
 
         log_message(&ctx.log, L_CHAT, "@%s: %.*s", ctx.players[sender_idx].name, msg_len, msg);;
         
         break;
         }
+    default:
+        log_message(&ctx.log, L_ERROR, "unknown package type SP#%d\n", packet_type);
+        return 1;
     }
 
     return 0;
@@ -767,6 +952,7 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
 
 #undef CHECK_LEAST_SIZE
 #undef CHECK_SIZE
+#undef CHECK_FIELD
 
 void *net_thread_fn() {
     ctx.approved_player_id = 0;
@@ -830,8 +1016,18 @@ void *net_thread_fn() {
                 }
                 
                 if (ok) {
-                    CPApprove send_data = {.id = htonl(ctx.approved_player_id), .team = team};
-                    send_packet(ctx.tcp_fd, CP_APPROVE_PLAYER, &send_data, sizeof(send_data), 0);
+                    /* CP_APPROVE_PLAYER PACKET FORMAT
+                    (uint32 player_id) (int8 team)
+                    */
+
+                    const uint32_t packet_size = 4 + 1;
+                    char data[packet_size];
+                    char *d = data;
+
+                    PUSH_DATA(d, uint32_t, htonl(ctx.approved_player_id));
+                    PUSH_DATA(d, int8_t, team);
+                    
+                    send_packet(ctx.tcp_fd, CP_APPROVE_PLAYER, data, packet_size, 0);
                 }
             }
             
@@ -846,6 +1042,8 @@ void *net_thread_fn() {
 
         timeout.tv_sec = 0;
         timeout.tv_usec = 100*1000; // 100 ms
+
+        clear_menu_message();
 
         const int max_fd = ctx.udp_opened? MAX(ctx.tcp_fd, ctx.udp_fd) : ctx.tcp_fd;
         int ready = select(max_fd+1, &read_fds, NULL, NULL, &timeout);
@@ -940,9 +1138,11 @@ void *net_thread_fn() {
     }
 
     pthread_mutex_lock(&next_menu_mtx);
-    set_menu_message(MESSAGE_INFO, true, "Connection closed");
-    ctx.next_menu = MENU_MAIN;
-    ctx.change_menu = true;
+    if (ctx.message_text == NULL) {
+        set_menu_message(MESSAGE_INFO, true, "Connection closed");
+        ctx.next_menu = MENU_MAIN;
+        ctx.change_menu = true;
+    }
     pthread_mutex_unlock(&next_menu_mtx);
     
     pthread_mutex_lock(&running_mtx);
@@ -1211,6 +1411,10 @@ int process_command(char *command) {
             GET_USERNAME(username, argv[1]);
             GET_PLAYER_ID(pid, username);
             
+            /* CP_KICK_PLAYER PACKET FORMAT
+            (uint32 player_id)
+            */
+
             pid = htonl(pid);
             send_packet(ctx.tcp_fd, CP_KICK_PLAYER, &pid, sizeof(pid), 0);
             
@@ -1241,11 +1445,21 @@ int process_command(char *command) {
                     return 1;
                 }
             }
+
+            /* CP_CHANGE_TEAM PACKET FORMAT
+            (uint32 player_id) (int8 new_team)
+            */
             
-            char ct_buf[sizeof(pid) + sizeof(team)];
-            *(uint32_t*)(ct_buf) = htonl(pid);
-            *(int8_t*)(ct_buf+sizeof(pid)) = team;
-            send_packet(ctx.tcp_fd, CP_CHANGE_TEAM, ct_buf, sizeof(ct_buf), 0);
+            const uint32_t ct_packet_size = 4 + 1;
+            // char ct_buf[ct_packet_size]; // error: switch jumps into scope of identifier with variably modified type
+            char *ct_buf = malloc(ct_packet_size);
+            char *ct_d = ct_buf;
+            
+            PUSH_DATA(ct_d, uint32_t, htonl(pid));
+            PUSH_DATA(ct_d, int8_t, team);
+            
+            send_packet(ctx.tcp_fd, CP_CHANGE_TEAM, ct_buf, ct_packet_size, 0);
+            free(ct_buf);
 
             break;
         case CMD_SWAP_TEAMS:
@@ -1266,10 +1480,20 @@ int process_command(char *command) {
             GET_USERNAME(username2, argv[2]);
             GET_PLAYER_ID(pid2, username2);
 
-            char st_buf[sizeof(pid)*2];
-            *(uint32_t*)(st_buf) = htonl(pid1);
-            *(uint32_t*)(st_buf+sizeof(pid)) = htonl(pid2);
-            send_packet(ctx.tcp_fd, CP_SWAP_TEAMS, st_buf, sizeof(st_buf), 0);
+            /* CP_SWAP_TEAMS PACKET FORMAT
+            (uint32 player1_id) (uint32 player2_id)
+            */
+
+            const uint32_t st_packet_size = 4 + 4;
+            // char st_buf[st_packet_size]; // error: switch jumps into scope of identifier with variably modified type
+            char *st_buf = malloc(st_packet_size);
+            char *st_d = st_buf;
+
+            PUSH_DATA(st_d, uint32_t, htonl(pid1));
+            PUSH_DATA(st_d, uint32_t, htonl(pid2));
+
+            send_packet(ctx.tcp_fd, CP_SWAP_TEAMS, st_buf, st_packet_size, 0);
+            free(st_buf);
 
             break;
         default:
@@ -1279,6 +1503,12 @@ int process_command(char *command) {
 
     return 0;
 }
+
+#undef CHECK_ARGS
+#undef CHECK_ADMIN
+#undef GET_TEAM
+#undef GET_USERNAME
+#undef GET_PLAYER_ID
 
 
 /* <================================================== INPUT SYSTEM ==================================================> */
@@ -1327,6 +1557,7 @@ typedef enum {
     IE_ACTION,
     IE_ACTION_START,
     IE_ACTION_END,
+
     IE_COUNT // Number of events
 } InputEvent;
 
@@ -1366,7 +1597,7 @@ typedef struct {
     uint8_t mb_mod; // or'ed mouse modifier keys
     float mwf; // mouse weel factor
     // Game status
-    RoomStage gstage; // game stage
+    RoomStage gstage1, gstage2; // game stage
     GameMode gmode; // game mode
     bool gomul; // multiplayer game only
     bool goloc; // local game only
@@ -1376,36 +1607,36 @@ typedef struct {
 InputBinding bindings[] = {
     [IE_SHOW_LOG]               = {.kb1 = KEY_L},
     [IE_SHOW_GRID]              = {.kb1 = KEY_K},
-    [IE_CHANGE_TPS_DISPLAY]     = {.kb1 = KEY_M, .gstage = STAGE_GAME, .gomul = true},
-    [IE_CHANGE_AUTOSELECT_MODE] = {.kb1 = KEY_N, .gstage = STAGE_GAME},
-    [IE_SHOW_HEALTH]            = {.kb1 = KEY_H, .gstage = STAGE_GAME},
-    [IE_CLEAR_ORDERS]           = {.kb1 = KEY_Z, .gstage = STAGE_GAME},
-    [IE_DELETE_SELECTED_BOIDS]  = {.kb1 = KEY_X, .goloc = true},
+    [IE_CHANGE_TPS_DISPLAY]     = {.kb1 = KEY_M, .gstage1 = STAGE_GAME, .gomul = true},
+    [IE_CHANGE_AUTOSELECT_MODE] = {.kb1 = KEY_N, .gstage1 = STAGE_GAME},
+    [IE_SHOW_HEALTH]            = {.kb1 = KEY_H, .gstage1 = STAGE_GAME},
+    [IE_CLEAR_ORDERS]           = {.kb1 = KEY_Z, .gstage1 = STAGE_GAME},
+    [IE_DELETE_SELECTED_BOIDS]  = {.kb1 = KEY_X, .gstage1 = STAGE_PLACING, .gmode = MODE_SELECT, .gloc = true},
     [IE_PAUSE]                  = {.kb1 = KEY_SPACE, .goloc = true},
     [IE_CHANGE_GUI_DISPLAY]     = {.kb1 = KEY_I},
     [IE_EXIT_GAME]              = {.kb1 = KEY_Q, .kb_mod = IMOD_CTRL},
     [IE_CHAT_MSG]               = {.kb1 = KEY_SPACE, .gomul = true},
     [IE_INPUT_START]            = {.kb1 = KEY_SPACE, .gomul = true},
     [IE_COMMAND]                = {.kb1 = KEY_SLASH, .kb2 = KEY_KP_DIVIDE, .gomul = true},
-    [IE_START_PLACING]          = {.kb1 = KEY_ENTER, .gstage = STAGE_AREAS},
-    [IE_READY]                  = {.kb1 = KEY_ENTER, .gstage = STAGE_PLACING},
+    [IE_START_PLACING]          = {.kb1 = KEY_ENTER, .gstage1 = STAGE_AREAS},
+    [IE_READY]                  = {.kb1 = KEY_ENTER, .gstage1 = STAGE_PLACING},
     [IE_BRUSH_INCRASE]          = {.kb1 = KEY_P, .kb_type = KTYPE_REPEATE, .mb_mod = IMOD_CTRL, .mwf = 1.0f, .gomul = true},
-    [IE_BRUSH_REDUCE]         = {.kb1 = KEY_O, .kb_type = KTYPE_REPEATE, .mb_mod = IMOD_CTRL, .mwf = -1.0f, .gomul = true},
+    [IE_BRUSH_REDUCE]           = {.kb1 = KEY_O, .kb_type = KTYPE_REPEATE, .mb_mod = IMOD_CTRL, .mwf = -1.0f, .gomul = true},
     [IE_TEAM_RED]               = {.kb1 = KEY_Q, .gmode = MODE_AREAS, .gloc = true},
     [IE_TEAM_BLUE]              = {.kb1 = KEY_W, .gmode = MODE_AREAS, .gloc = true},
     [IE_TEAM_GREEN]             = {.kb1 = KEY_E, .gmode = MODE_AREAS, .gloc = true},
     [IE_TEAM_YELLOW]            = {.kb1 = KEY_R, .gmode = MODE_AREAS, .gloc = true},
     [IE_ERASE_AREAS]            = {.kb1 = KEY_Z, .gmode = MODE_AREAS},
-    [IE_MODE_SPAWN]             = {.kb1 = KEY_A, .gstage = STAGE_PLACING, .gloc = true},
-    [IE_MODE_SELECT]            = {.kb1 = KEY_S, .gstage = STAGE_GAME},
-    [IE_MODE_DELETE]            = {.kb1 = KEY_D, .gstage = STAGE_PLACING, .gomul = true},
-    [IE_MODE_DIRECTION]         = {.kb1 = KEY_D, .gstage = STAGE_GAME},
-    [IE_MODE_POINT]             = {.kb1 = KEY_F, .gstage = STAGE_GAME},
-    [IE_MODE_LINE]              = {.kb1 = KEY_G, .gstage = STAGE_GAME},
-    [IE_APPLY_LINE]             = {.kb1 = KEY_G, .gstage = STAGE_GAME, .gmode = MODE_LINE},
-    [IE_BOID_ACT_STOP]          = {.kb1 = KEY_ONE, .gstage = STAGE_GAME},
-    [IE_BOID_ACT_ATTACK]        = {.kb1 = KEY_TWO, .gstage = STAGE_GAME},
-    [IE_BOID_ACT_RETREAT]       = {.kb1 = KEY_THREE, .gstage = STAGE_GAME},
+    [IE_MODE_SPAWN]             = {.kb1 = KEY_A, .gstage1 = STAGE_PLACING, .gloc = true},
+    [IE_MODE_SELECT]            = {.kb1 = KEY_S, .gstage1 = STAGE_GAME, .gstage2 = STAGE_PLACING},
+    [IE_MODE_DELETE]            = {.kb1 = KEY_D, .gstage1 = STAGE_PLACING, .gomul = true},
+    [IE_MODE_DIRECTION]         = {.kb1 = KEY_D, .gstage1 = STAGE_GAME},
+    [IE_MODE_POINT]             = {.kb1 = KEY_F, .gstage1 = STAGE_GAME},
+    [IE_MODE_LINE]              = {.kb1 = KEY_G, .gstage1 = STAGE_GAME},
+    [IE_APPLY_LINE]             = {.kb1 = KEY_G, .gstage1 = STAGE_GAME, .gmode = MODE_LINE},
+    [IE_BOID_ACT_STOP]          = {.kb1 = KEY_ONE, .gstage1 = STAGE_GAME},
+    [IE_BOID_ACT_ATTACK]        = {.kb1 = KEY_TWO, .gstage1 = STAGE_GAME},
+    [IE_BOID_ACT_RETREAT]       = {.kb1 = KEY_THREE, .gstage1 = STAGE_GAME},
     [IE_CAMERA_MOVE]            = {.mb = MOUSE_BUTTON_LEFT, .use_mb = true},
     [IE_CAMERA_ZOOM_IN]         = {.kb1 = KEY_EQUAL, .kb2 = KEY_KP_ADD,      .kb_type = KTYPE_REPEATE, .mwf = 1.0f},
     [IE_CAMERA_ZOOM_OUT]        = {.kb1 = KEY_MINUS, .kb2 = KEY_KP_SUBTRACT, .kb_type = KTYPE_REPEATE, .mwf = -1.0f},
@@ -1420,8 +1651,8 @@ InputBinding bindings[] = {
 #define CLEAR_EVENTS() ctx.events = 0
 #define SET_EVENT(e) ctx.events |= (1ull << (e))
 #define GET_EVENT(e) (ctx.events & (1ull << (e)))
-#define CLEAR_EVENT(e)                          \
-    do {                                        \
+#define CLEAR_EVENT(e)                           \
+    do {                                         \
         ctx.events &= ~(1ull << (e));            \
         cleared_events |= (1ull << (e));         \
     } while (0)
@@ -1447,6 +1678,12 @@ void handle_input() {
     CLEAR_EVENTS();
     unsigned long long cleared_events = 0;
 
+    static int typing_timer = 0;
+    if (typing_timer > 0)
+        typing_timer--;
+    if (ctx.typing_keyboard_input)
+        typing_timer = 5;
+    
     for (int event = 0; event < IE_COUNT; event++) {
         InputBinding b = bindings[event];
         
@@ -1468,7 +1705,7 @@ void handle_input() {
         }
 
         if (!(cleared_events & (1ull << event)) &&
-            (b.gstage == STAGE_NULL || b.gstage == ctx.stage || b.gloc) &&
+            (b.gstage1 == STAGE_NULL || b.gstage1 == ctx.stage || b.gstage2 == ctx.stage || b.gloc) &&
             (b.gmode == MODE_NULL || b.gmode == ctx.mode || b.gloc) &&
             (!b.gomul || !ctx.local_game) &&
             (!b.goloc || ctx.local_game) &&
@@ -1507,6 +1744,14 @@ void handle_input() {
                 textBoxCursorIndex = 1;
                 pthread_mutex_unlock(&input_mtx);
                 break;
+            case IE_START_PLACING:
+                if (typing_timer > 0)
+                    CLEAR_EVENT(IE_START_PLACING);
+                break;
+            case IE_READY:
+                if (typing_timer > 0)
+                    CLEAR_EVENT(IE_READY);
+                break;
             case IE_INPUT_END:
                 pthread_mutex_lock(&input_mtx);
                 ctx.typing_keyboard_input = false;
@@ -1519,13 +1764,18 @@ void handle_input() {
                     log_message(&ctx.log, L_INPUT, "%s", ctx.input_string);
                     process_command(ctx.input_string);
                 } else { // message for chat
+                    /* CP_CHAT_MSG PACKET FORMAT
+                    (uint16 msg_len) (uint8[msg_len] msg)
+                    */
+                    
                     const int len = strlen(ctx.input_string);
-                    uint32_t packet_size = sizeof(uint16_t) + len+1;
-                    uint8_t *buf = malloc(packet_size);
+                    uint32_t packet_size = 2 + len+1;
+                    char *buf = malloc(packet_size);
+                    char *d = buf;
 
-                    *(uint16_t*)buf = htons(len+1);
-                    memcpy(buf+sizeof(uint16_t), ctx.input_string, len+1);
-            
+                    PUSH_DATA(d, uint16_t, htons(len+1));
+                    PUSH_MEM(d, ctx.input_string, len+1);
+                    
                     send_packet(ctx.tcp_fd, CP_CHAT_MSG, buf, packet_size, 0);
                     free(buf);
                 }
@@ -1678,7 +1928,7 @@ Texture2D generate_boids_texture(Image image, Color clothes_tint) {
     return result_tex;
 }
 
-GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]);
+GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset);
 GameMenu main_menu(void);
 GameMenu new_menu(void);
 GameMenu join_menu(void);
@@ -1912,6 +2162,32 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (ctx.new_room) {
+        int teams_number = 0;
+        for (int i = 0; i < TEAMS_COUNT; i++) {
+            if (ctx.boids_number[i] > 0) {
+                teams_number++;
+                ctx.total_boids_number += ctx.boids_number[i];
+            }
+        }
+
+        if (teams_number < ctx.players_number) {
+            ERR("you have not set the number of boids for all players\n");
+        } else if (teams_number > ctx.players_number) {
+            ERRF("the number of players (%d) is not equal to the number of teams (%d)\n", ctx.players_number, teams_number);
+        }
+        
+        if (ctx.total_boids_number > (ctx.world_size.x/BOID_SIZE)*(ctx.world_size.y/BOID_SIZE))
+            ERRF("you won't be able to place %d boids in a %dx%d world\n", ctx.total_boids_number, ctx.world_size.x, ctx.world_size.y);
+        if (ctx.total_boids_number > MAX_BOIDS_COUNT) {
+            ERRF("the number of boids (%u) is greater than max boids count (%u)\n", ctx.total_boids_number, MAX_BOIDS_COUNT);
+        }
+
+        if (ctx.boids_number[ctx.player_team] == 0) {
+            ERR("select valid team\n");
+        }
+    }
+
     if (print_help) {
         if (!ctx.run_game) { // ./client
             printf(
@@ -2061,11 +2337,15 @@ int main(int argc, char **argv) {
             if (create_sockets())
                 return 1;
         prepare_context(ctx.local_game, ctx.new_room);
-        if (!ctx.local_game) {
+        
+        if (ctx.local_game) {
+            init_game();
+        } else {
             start_net_thread();
             if (ctx.new_room) send_request_new();
             else send_request_join();
         }
+        
         ctx.menu = ctx.local_game ? MENU_GAME : MENU_LOADING;
     } else {
         ctx.menu = MENU_MAIN;
@@ -2127,11 +2407,13 @@ int main(int argc, char **argv) {
             case MENU_JOIN: next_menu = join_menu(); break;
             case MENU_LOCAL: next_menu = local_menu(); break;
             case MENU_LOADING: next_menu = loading_menu(); break;
-            case MENU_GAME: next_menu = game_loop(texture, boids_textures); break;
+            case MENU_GAME: next_menu = game_loop(texture, boids_textures, ctx.reset_game); ctx.reset_game = false; break;
             default: break;
         }
 
         pthread_mutex_lock(&next_menu_mtx);
+        
+        // Change menu
         
         if (ctx.change_menu) {
             next_menu = ctx.next_menu;
@@ -2399,7 +2681,7 @@ void prepare_context(bool local, bool new_room) {
 
     ctx.game_initialized = false;
     ctx.net_thread_running = false;
-    
+    ctx.reset_game = true;
 }
 
 // Start a thread to receive messages from the server
@@ -2472,22 +2754,41 @@ void init_game(void) {
 void send_request_new(void) {
     ctx.chunk_size = ctx.chunk_size_multiplayer;
 
-    CPNew data = {.players_number = ctx.players_number, .player_team = ctx.player_team,
-                  .world_size = {htons(ctx.world_size.x), htons(ctx.world_size.y)}, .hide_areas = ctx.hide_areas};
-    for (int i = 0; i < TEAMS_COUNT; i++)
-        data.boids_number[i] = htons(ctx.boids_number[i]);
-    strncpy(data.creator, ctx.username, USERNAME_LEN);
-    data.creator[USERNAME_LEN-1] = '\0';
+    /* CP_NEW_ROOM
+        (uint8 player_team) (uint8 players_number) (uint8 hide_areas) (uint16 world_size_x) (uint16 world_size_y)
+    (uint16[TEAMS_COUNT] boids_number) (uint8[USERNALE_LEN] creator)
+    */
 
-    send_packet(ctx.tcp_fd, CP_NEW_ROOM, &data, sizeof(data), 0);
+    const uint32_t packet_size = 1 + 1 + 1 + 2 + 2 + 2*TEAMS_COUNT + USERNAME_LEN;
+    char data[packet_size];
+    char *d = data;
+
+    PUSH_DATA(d, uint8_t, ctx.player_team);
+    PUSH_DATA(d, uint8_t, ctx.players_number);
+    PUSH_DATA(d, uint8_t, ctx.hide_areas);
+    PUSH_DATA(d, uint16_t, htons(ctx.world_size.x));
+    PUSH_DATA(d, uint16_t, htons(ctx.world_size.y));
+    for (int i = 0; i < TEAMS_COUNT; i++) {
+        PUSH_DATA(d, uint16_t, htons(ctx.boids_number[i]));
+    }
+    PUSH_MEM(d, ctx.username, USERNAME_LEN);
+
+    send_packet(ctx.tcp_fd, CP_NEW_ROOM, data, packet_size, 0);
 }
 
 void send_request_join(void) {
-    CPJoin data = {.room_id = htonl(ctx.room_id)};
-    strncpy(data.username, ctx.username, USERNAME_LEN);
-    data.username[USERNAME_LEN-1] = '\0';
+    /* CP_JOIN_ROOM PACKET FORMAT
+    (uint32 room_id) (uint8[USERNAME_LEN] username)
+    */
 
-    send_packet(ctx.tcp_fd, CP_JOIN_ROOM, &data, sizeof(data), 0);
+    const uint32_t packet_size = 4 + USERNAME_LEN;
+    char data[packet_size];
+    char *d = data;
+
+    PUSH_DATA(d, uint32_t, htonl(ctx.room_id));
+    PUSH_MEM(d, ctx.username, USERNAME_LEN);
+
+    send_packet(ctx.tcp_fd, CP_JOIN_ROOM, data, packet_size, 0);
 }
 
 void exit_game(void) {
@@ -3039,6 +3340,9 @@ GameMenu loading_menu(void) {
 #undef LABEL_SPACING
 #undef CHECKBOX_OFFSET
 
+
+/* <====================================================== GAME ======================================================> */
+
 void update_boid_sprite(ClientBoid *boids, BoidIndex boid_index) {
     ClientBoid *boid = &boids[boid_index];
     
@@ -3126,10 +3430,14 @@ typedef struct {
 } Confetti;
 
 #define MAX_CONFETTI_COUNT 500
-void draw_confetti() {
+void draw_confetti(bool reset) {
     static Confetti confetti[MAX_CONFETTI_COUNT];
     static int confetti_count;
     static bool confetti_initialized = false;
+
+    if (reset) {
+        confetti_initialized = false;
+    }
 
     int screen_width = GetScreenWidth();
     int screen_height = GetScreenHeight();
@@ -3231,23 +3539,27 @@ void cleanup_areas(Area *areas, uint16_t *areas_count) {
 }
 
 int send_areas(int fd, uint8_t package_type, Area *areas, uint16_t areas_count) {
-    uint32_t buf_size = areas_count * sizeof(*areas) + sizeof(areas_count);
-    char *buf = malloc(buf_size);
+    /* CP_START_PLACING|CP_SEND_AREAS PACKET FORMAT
+    (uint16 areas_count) ( { (uint16 x1) (uint16 y1) (uint16 x2) (uint16 y2) (uint8 team) }[areas_count] areas)
+    */
 
-    *(uint16_t*)buf = htons(areas_count);
-    Area *a = (Area*)(buf + sizeof(areas_count));
+    const uint32_t packet_size = 2 + (2 + 2 + 2 + 2 + 1)*areas_count;
+    char *data = malloc(packet_size);
+    char *d = data;
+
+    PUSH_DATA(d, uint16_t, htons(areas_count));
     for (int i = 0; i < areas_count; i++) {
-        *a = areas[i];
-        a->rec.x1 = htons(a->rec.x1);
-        a->rec.x2 = htons(a->rec.x2);
-        a->rec.y1 = htons(a->rec.y1);
-        a->rec.y2 = htons(a->rec.y2);
-        a++;
+        Area *a = &areas[i];
+        PUSH_DATA(d, uint16_t, htons(a->rec.x1));
+        PUSH_DATA(d, uint16_t, htons(a->rec.y1));
+        PUSH_DATA(d, uint16_t, htons(a->rec.x2));
+        PUSH_DATA(d, uint16_t, htons(a->rec.y2));
+        PUSH_DATA(d, uint8_t, a->team);
     }
 
-    int r = send_packet(fd, package_type, buf, buf_size, 0);
+    int r = send_packet(fd, package_type, data, packet_size, 0);
 
-    free(buf);
+    free(data);
     return r;
 }
 
@@ -3291,9 +3603,6 @@ void set_button_tooltip(InputEvent event, const char *format, ...) {
     GuiSetTooltip(tooltip);
 }
 
-
-/* <====================================================== GAME ======================================================> */
-
 #define BUTTON_SIZE 60
 #define SMALL_BUTTON_SIZE 40
 #define BUTTON_DISTANCE 5
@@ -3301,8 +3610,8 @@ void set_button_tooltip(InputEvent event, const char *format, ...) {
 #define BUTTON_MARGIN 5
 #define TEXT_MARGIN 10
 
-GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
-    static Vector2 prev_mouse_position = {0};
+GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
+    static Vector2 prev_mouse_position = {NAN, NAN};
     
     // Areas selecting
     static Point area_start_selecting = { 0 }, area_end_selecting = { 0 };
@@ -3316,6 +3625,14 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
     static int line_points_count = 0;
     static float line_len = 0.0f;
 
+    if (reset) {
+        prev_mouse_position = (Vector2){NAN, NAN};
+        for (int i = 0; i < TEAMS_COUNT; i++)
+            areas_size[i] = 0;
+        line_points_count = 0;
+        line_len = 0.0f;
+    }
+    
     GameMenu next_menu = 0;
     
     // Areas mode
@@ -3597,7 +3914,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
             // Send boids and a message that the player is ready to start the game
             if (GET_EVENT(IE_READY) && !ctx.local_game) {
                 if (ctx.boids_count == ctx.boids_number[ctx.player_team]) {
-                    ClientStartNetBoids *data = calloc((ctx.boids_count + 1)*2, sizeof(*data));
+                    StartBoids *data = calloc((ctx.boids_count + 1)*2, sizeof(*data));
                     data[0].team = -1;
                     int index = 0;
 
@@ -3622,28 +3939,31 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
                             if (find == (data[index].team >= 0))
                                 data[index].count++;
                             else
-                                data[++index] = (ClientStartNetBoids){.team = find ? (signed)ctx.player_team : -1, .count = 1};
+                                data[++index] = (StartBoids){.team = find ? (signed)ctx.player_team : -1, .count = 1};
                         }
                     }
 
                     uint16_t count = index + 1;
-
-                    for (int i = 0; i < count; i++) {
-                        data[i].count = htons(data[i].count);
-                    }
                 
-                    uint32_t bufsize = sizeof(count) + count * sizeof(*data);
-                    char *buf = malloc(bufsize);
+                    /* CP_SEND_BOIDS PACKET FORMAT
+                    (uint16 count) ({ (uint16 boids_count) (int8 team) }[count] boids)
+                    */
 
-                    uint16_t ncount = htons(count);
-                    memcpy(buf, &ncount, sizeof(count));
-                    memcpy(buf+sizeof(count), data, count * sizeof(*data));
+                    uint32_t packet_size = 2 + (2 + 1)*count;
+                    char *packet_data = malloc(packet_size);
+                    char *d = packet_data;
 
-                    send_packet(ctx.tcp_fd, CP_SEND_BOIDS, buf, bufsize, 0);
+                    PUSH_DATA(d, uint16_t, htons(count));
+                    for (int i = 0; i < count; i++) {
+                        PUSH_DATA(d, uint16_t, htons(data[i].count));
+                        PUSH_DATA(d, int8_t, data[i].team);
+                    }
+                    
+                    send_packet(ctx.tcp_fd, CP_SEND_BOIDS, packet_data, packet_size, 0);
                     log_message(&ctx.log, L_INFO, "wait until other players are ready to start the game\n");
 
                     free(data);
-                    free(buf);
+                    free(packet_data);
                 } else {
                     log_message(&ctx.log, L_WARNING, "place all your boids before you start the game\n");
                 }
@@ -3868,6 +4188,8 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
         pthread_mutex_unlock(&boids_mtx);
     }
 
+    bool change_boids_direction = ctx.change_boids_direction;
+    
     // Send new boids action and orders
     if (ctx.stage == STAGE_GAME && !ctx.local_game && (ctx.change_boids_action || ctx.change_boids_direction || ctx.clear_order)) {
         BoidIndex selected_boids[MAX_BOIDS_COUNT] = { 0 };
@@ -3878,39 +4200,39 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
                 selected_boids[selected_boids_count++] = htons(i);
         }
 
-        /* PACKET FORMAT
-        ORDER_CLEAR - [int8 order_type] [uint16 boids_count] [uint16[boids_count] boids]
-        ORDER_ACTION - [int8 order_type] [int8 new_action] [uint16 boids_count] [uint16[boids_count] boids]
-        ORDER_DIRECTION - [int8 order_type] [int32 vector.x*65535] [int32 vector.y*65535] [uint16 boids_count] [uint16[boids_count] boids]
-        ORDER_POINT - [int8 order_type] [uint16 point.x] [uint16 point.y] [uint16 boids_count] [uint16[boids_count] boids]
-        ORDER_LINE - [int8 order_type] [uint8 points_count] [{uint16 x, y}[points_count] points] [uint16 boids_count] [uint16[boids_count] boids]
+        /* CP_ORDER PACKET FORMAT
+        ORDER_CLEAR - (int8 order_type) (uint16 boids_count) (uint16[boids_count] boids)
+        ORDER_ACTION - (int8 order_type) (int8 new_action) (uint16 boids_count) (uint16[boids_count] boids)
+        ORDER_DIRECTION - (int8 order_type) (int32 vector.x*65535) (int32 vector.y*65535) (uint16 boids_count) (uint16[boids_count] boids)
+        ORDER_POINT - (int8 order_type) (uint16 point.x) (uint16 point.y) (uint16 boids_count) (uint16[boids_count] boids)
+        ORDER_LINE - (int8 order_type) (uint8 points_count) ({ (uint16 x) (uint16 y) }[points_count] points) (uint16 boids_count) (uint16[boids_count] boids)
         */
 
         uint32_t base_packet_size = 1 + sizeof(BoidIndex) + sizeof(BoidIndex)*selected_boids_count; // order_type + boids_count + boids
         uint32_t packet_size = base_packet_size;
-        char *data = NULL;
+        char *data = NULL, *d = NULL;
 
         if (ctx.clear_order) { // ORDER_CLEAR
             packet_size += 0;
-            data = malloc(packet_size);
+            data = malloc(packet_size); d = data;
 
-            *(int8_t*)(data) = ORDER_CLEAR;
+            PUSH_DATA(d, int8_t, ORDER_CLEAR);
         } else if (ctx.change_boids_action) { // ORDER_ACTION
             packet_size += 1;
-            data = malloc(packet_size);
+            data = malloc(packet_size); d = data;
 
-            *(int8_t*)(data) = ORDER_ACTION;
-            *(int8_t*)(data+1) = ctx.action;
+            PUSH_DATA(d, int8_t, ORDER_ACTION);
+            PUSH_DATA(d, int8_t, ctx.action);
         } else if (ctx.mode == MODE_DIRECTION) { // ORDER_DIRECTION
             packet_size += 4 + 4;
-            data = malloc(packet_size);
+            data = malloc(packet_size); d = data;
 
-            *(int8_t*)(data) = ORDER_DIRECTION;
-            *(int32_t*)(data+1) = htonl(arrow_vector_norm.x*65535);
-            *(int32_t*)(data+1+4) = htonl(arrow_vector_norm.y*65535);
+            PUSH_DATA(d, int8_t, ORDER_DIRECTION);
+            PUSH_DATA(d, int32_t, htonl(arrow_vector_norm.x*65535));
+            PUSH_DATA(d, int32_t, htonl(arrow_vector_norm.y*65535));
         } else if (ctx.mode == MODE_POINT) { // ORDER_POINT
             packet_size += 2 + 2;
-            data = malloc(packet_size);
+            data = malloc(packet_size); d = data;
 
             int x = ctx.mouse_position.x;
             if (x < 0) x = 0;
@@ -3920,26 +4242,25 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
             if (y < 0) y = 0;
             else if (y > ctx.world_size.y) y = ctx.world_size.y;
 
-            *(int8_t*)(data) = ORDER_POINT;
-            *(uint16_t*)(data+1) = htons(x);
-            *(uint16_t*)(data+1+2) = htons(y);
+            PUSH_DATA(d, int8_t, ORDER_POINT);
+            PUSH_DATA(d, uint16_t, htons(x));
+            PUSH_DATA(d, uint16_t, htons(y));
         } else if (ctx.mode == MODE_LINE) { // ORDER_LINE
-            packet_size += 1 + sizeof(Point)*line_points_count;
-            data = malloc(packet_size);
+            packet_size += 1 + (2 + 2)*line_points_count;
+            data = malloc(packet_size); d = data;
 
-            *(int8_t*)(data) = ORDER_LINE;
-            *(uint8_t*)(data+1) = line_points_count;
+            PUSH_DATA(d, int8_t, ORDER_LINE);
+            PUSH_DATA(d, uint8_t, line_points_count);
 
-            Point *points = (Point*)(data+1+1);
             for (int i = 0; i < line_points_count; i++) {
-                points[i].x = htons(line_points[i].x);
-                points[i].y = htons(line_points[i].y);
+                PUSH_DATA(d, uint16_t, htons(line_points[i].x));
+                PUSH_DATA(d, uint16_t, htons(line_points[i].y));
             }
         }
 
         if (data != NULL) {
-            *(BoidIndex*)(data + (packet_size - base_packet_size + 1)) = htons(selected_boids_count);
-            memcpy(data + (packet_size - base_packet_size + 1 + sizeof(BoidIndex)), selected_boids, sizeof(BoidIndex)*selected_boids_count);
+            PUSH_DATA(d, uint16_t, htons(selected_boids_count));
+            PUSH_MEM(d, selected_boids, sizeof(BoidIndex)*selected_boids_count);
 
             send_packet(ctx.tcp_fd, CP_ORDER, data, packet_size, 0);
             free(data);
@@ -4019,7 +4340,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
     }
 
     if (ctx.select_mode) {
-        if (ctx.change_boids_direction && ctx.autoselect_mode)
+        if (change_boids_direction && ctx.autoselect_mode)
             ctx.mode = MODE_SELECT;
         if (ctx.local_game) {
             ctx.change_boids_action = false;
@@ -4087,8 +4408,6 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
         ClientBoid *boid = &ctx.boids[i];
         if ((boid->v.sprite != SPRITE_FALL) && (boid->v.is_selected)) {
             draw_selection(boid, texture, 1.2, ORANGE);
-            // if (boid->v.pointOrder)
-                // DrawCircle(boid->v.orderVector.x, boid->v.orderVector.y, 20, (Color){0, 0, 0, 50});
         }
     }
     
@@ -4118,13 +4437,13 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
     }
 
     // Drawing boids selection box
-    if (ctx.mode == MODE_SELECT  && ctx.selecting) {
+    if (ctx.mode == MODE_SELECT && ctx.selecting) {
         float rectangleX = fmin(ctx.selection_start.x, ctx.mouse_position.x);
         float rectangleY = fmin(ctx.selection_start.y, ctx.mouse_position.y);
         DrawText(TextFormat("%d", selected_boids_count), rectangleX, rectangleY-(20/ctx.camera.zoom), 20/ctx.camera.zoom, BLACK);
         DrawRectangleLinesEx((Rectangle){rectangleX, rectangleY,
                              fabs(ctx.mouse_position.x - ctx.selection_start.x), fabs(ctx.mouse_position.y - ctx.selection_start.y)},
-                         thick, BLACK);
+                             thick, BLACK);
     }
 
     // Draw arrow (in direction mode)
@@ -4330,7 +4649,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
 
         int btn_y = ctx.screen_height / 2;
 
-        if (ctx.mode == MODE_SPAWN) {
+        if (ctx.mode == MODE_SPAWN && !ctx.local_game) {
             GuiSetState(STATE_NORMAL);
             set_button_tooltip(IE_BRUSH_REDUCE, "Reduce brush size");
             if (GuiButton((Rectangle){ctx.screen_width - BUTTON_MARGIN - SMALL_BUTTON_SIZE, btn_y, SMALL_BUTTON_SIZE, SMALL_BUTTON_SIZE}, GuiIconText(ICON_BOX_MINUS_FILL, ""))) GUI_EVENT(IE_BRUSH_REDUCE);
@@ -4584,7 +4903,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[]) {
             static int confetti_timer = 0;
             if (confetti_timer < 60*60) {
                 confetti_timer++;
-                draw_confetti();
+                draw_confetti(reset);
             }
         }
     }
