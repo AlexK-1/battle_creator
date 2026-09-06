@@ -2162,32 +2162,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (ctx.new_room) {
-        int teams_number = 0;
-        for (int i = 0; i < TEAMS_COUNT; i++) {
-            if (ctx.boids_number[i] > 0) {
-                teams_number++;
-                ctx.total_boids_number += ctx.boids_number[i];
-            }
-        }
-
-        if (teams_number < ctx.players_number) {
-            ERR("you have not set the number of boids for all players\n");
-        } else if (teams_number > ctx.players_number) {
-            ERRF("the number of players (%d) is not equal to the number of teams (%d)\n", ctx.players_number, teams_number);
-        }
-        
-        if (ctx.total_boids_number > (ctx.world_size.x/BOID_SIZE)*(ctx.world_size.y/BOID_SIZE))
-            ERRF("you won't be able to place %d boids in a %dx%d world\n", ctx.total_boids_number, ctx.world_size.x, ctx.world_size.y);
-        if (ctx.total_boids_number > MAX_BOIDS_COUNT) {
-            ERRF("the number of boids (%u) is greater than max boids count (%u)\n", ctx.total_boids_number, MAX_BOIDS_COUNT);
-        }
-
-        if (ctx.boids_number[ctx.player_team] == 0) {
-            ERR("select valid team\n");
-        }
-    }
-
     if (print_help) {
         if (!ctx.run_game) { // ./client
             printf(
@@ -2311,6 +2285,32 @@ int main(int argc, char **argv) {
         }
 
         return 0;
+    }
+
+    if (ctx.new_room) {
+        int teams_number = 0;
+        for (int i = 0; i < TEAMS_COUNT; i++) {
+            if (ctx.boids_number[i] > 0) {
+                teams_number++;
+                ctx.total_boids_number += ctx.boids_number[i];
+            }
+        }
+
+        if (teams_number < ctx.players_number) {
+            ERR("you have not set the number of boids for all players\n");
+        } else if (teams_number > ctx.players_number) {
+            ERRF("the number of players (%d) is not equal to the number of teams (%d)\n", ctx.players_number, teams_number);
+        }
+        
+        if (ctx.total_boids_number > (ctx.world_size.x/BOID_SIZE)*(ctx.world_size.y/BOID_SIZE))
+            ERRF("you won't be able to place %d boids in a %dx%d world\n", ctx.total_boids_number, ctx.world_size.x, ctx.world_size.y);
+        if (ctx.total_boids_number > MAX_BOIDS_COUNT) {
+            ERRF("the number of boids (%u) is greater than max boids count (%u)\n", ctx.total_boids_number, MAX_BOIDS_COUNT);
+        }
+
+        if (ctx.boids_number[ctx.player_team] == 0) {
+            ERR("select valid team\n");
+        }
     }
     
     #ifdef DEBUG
