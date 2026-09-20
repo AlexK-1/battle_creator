@@ -17,9 +17,6 @@
 #define USERNAME_LEN 32
 
 /*
-CPSomething - client packet "Something"
-SPSomething - server packet "Something"
-PSomething - client & server packet "something"
 ClientSomething - client structure "Something"
 ServerSomething - server structure "Something"
 */

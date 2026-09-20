@@ -30,6 +30,7 @@
 #include "kdtree.h"
 #include "network.h"
 #include "logging.h"
+#include "conf.h"
 #include "queue.h"
 
 #undef ORANGE
@@ -43,6 +44,8 @@
 #define DEFAULT_WORLD_SIZE_X 10050
 #define DEFAULT_WORLD_SIZE_Y 10050
 #define DEFAULT_USERNAME "noname"
+#define DEFAULT_SETTINGS_FILE "settings.cfg"
+#define SERVERNAME_LEN 32
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
@@ -182,6 +185,7 @@ typedef enum {
     MENU_NEW,
     MENU_JOIN,
     MENU_LOCAL,
+    MENU_SETTINGS,
     MENU_LOADING,
     MENU_GAME
 } GameMenu;
@@ -208,7 +212,7 @@ typedef struct {
     bool udp_opened;
 
     // Global game
-    bool running, game_initialized, net_thread_running, local_game, run_game, reset_game;
+    bool running, game_initialized, net_thread_running, local_game, cli_run, reset_game;
     BoidIndex boids_number[TEAMS_COUNT], total_boids_number;
     int screen_width, screen_height;
     struct {
@@ -250,6 +254,16 @@ typedef struct {
     unsigned long long events, gui_events;
     unsigned short modifiers;
     bool show_line;
+
+    // Settings
+    ConfigTable *settings;
+    bool settings_hide_gui, settings_autoselect;
+    ConfigArray *settings_servers;
+    ConfigTable *settings_custom_server;
+    struct {
+        char *str;
+        int len, capacity;
+    } settings_servers_names;
     
     // Changes from the second (network) thread
     GameMenu next_menu;
@@ -954,9 +968,36 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
 #undef CHECK_SIZE
 #undef CHECK_FIELD
 
-void *net_thread_fn() {
+void prepare_context(bool local, bool new_room, bool cli_run);
+void start_net_thread(bool create_sockets);
+void init_game(void);
+int create_sockets(void);
+void send_request_new(void);
+void send_request_join(void);
+void exit_game(void);
+
+void *net_thread_fn(void *arg) {
     ctx.approved_player_id = 0;
     ctx.approved_player_username[0] = '\0';
+
+    // Create sockets and send request, if true
+    // arg must be allocated in heap
+    if (*(bool*)arg) {
+        // Create sockets
+        if (create_sockets()) {
+            set_menu_message(MESSAGE_ERROR, true, "Failed to connect to the server");
+            ctx.next_menu = MENU_MAIN;
+            ctx.change_menu = true;
+            goto net_thread_exit;
+        }
+
+        // Send request to the server
+        if (ctx.new_room)
+            send_request_new();
+        else
+            send_request_join();
+    }
+    free(arg);
     
     enum {
         SYNC_PROTO_NONE = 0,
@@ -1137,6 +1178,8 @@ void *net_thread_fn() {
         }
     }
 
+    net_thread_exit:
+    
     pthread_mutex_lock(&next_menu_mtx);
     if (ctx.message_text == NULL) {
         set_menu_message(MESSAGE_INFO, true, "Connection closed");
@@ -1933,38 +1976,32 @@ GameMenu main_menu(void);
 GameMenu new_menu(void);
 GameMenu join_menu(void);
 GameMenu local_menu(void);
+GameMenu settings_menu(void);
 GameMenu loading_menu(void);
-
-void prepare_context(bool local, bool new_room);
-void start_net_thread(void);
-void init_game(void);
-int create_sockets(void);
-void send_request_new(void);
-void send_request_join(void);
-void exit_game(void);
 
 int main(int argc, char **argv) {
     // room/player settings, argparse
     bool print_help = false;
     char *prog = argv[0];
+    char *settings_file_name = DEFAULT_SETTINGS_FILE;
 
     if (argc > 1 && (strcmp(argv[1], "new") == 0 || strcmp(argv[1], "n") == 0)) {
         ctx.new_room = true;
-        ctx.run_game = true;
+        ctx.cli_run = true;
     } else if (argc > 1 && (strcmp(argv[1], "join") == 0 || strcmp(argv[1], "j") == 0)) {
         ctx.new_room = false;
-        ctx.run_game = true;
+        ctx.cli_run = true;
     } else if (argc > 1 && (strcmp(argv[1], "local") == 0 || strcmp(argv[1], "l") == 0)) {
         ctx.local_game = true;
-        ctx.run_game = true;
+        ctx.cli_run = true;
     } else
-        ctx.run_game = false;
+        ctx.cli_run = false;
 
-    if (ctx.run_game) {
+    if (ctx.cli_run) {
         argv++; argc--;
     }
 
-    if (ctx.run_game)
+    if (ctx.cli_run)
         ctx.chunk_size = ctx.local_game ? ctx.chunk_size_local : ctx.chunk_size_multiplayer;
 
     while (--argc) {
@@ -1980,46 +2017,16 @@ int main(int argc, char **argv) {
                     print_help = true;
                     ext = true;
                     break;
+                } else if (strcmp(arg, "--settings") == 0 || strcmp(arg, "-e") == 0) {
+                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
+
+                    settings_file_name = *(++argv);
+                    argc--;
                 }
 
-                // Flags for non- ./client local
-                else if (!ctx.local_game && (strcmp(arg, "--server") == 0 || strcmp(arg, "-s") == 0)) {
-                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
-
-                    strcpy(ctx.server, *(++argv));
-                    argc--;
-                } else if (!ctx.local_game && (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0)) {
-                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
-
-                    char *value_str = *(++argv);
-                    argc--;
-
-                    char *endp;
-                    ctx.tcp_port = strtoul(value_str, &endp, 10);
-                    if (*endp != '\0') {
-                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
-                    }
-                } else if (!ctx.local_game && (strcmp(arg, "--udp-port") == 0 || strcmp(arg, "-U") == 0)) {
-                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
-
-                    char *value_str = *(++argv);
-                    argc--;
-
-                    char *endp;
-                    ctx.udp_port = strtoul(value_str, &endp, 10);
-                    if (*endp != '\0') {
-                        ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
-                    }
-                } else if (!ctx.local_game && (strcmp(arg, "--name") == 0 || strcmp(arg, "-n") == 0)) {
-                    if (argc == 1) ERRF("no value for option '%s'\n", arg);
-
-                    strcpy(ctx.username, *(++argv));
-                    argc--;
-                }                    
-
                 // Flags for ./client new|join|local
-                else if (ctx.run_game) {
-                    
+                else if (ctx.cli_run) {
+
                     if (strcmp(arg, "--chunk") == 0 || strcmp(arg, "-c") == 0) {
                         if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
@@ -2045,64 +2052,102 @@ int main(int argc, char **argv) {
                         ctx.show_gui = false;
                     }
 
-                    // Local game flags
+                    // Flags for ./client local
                     else if (ctx.local_game) {
                         ERRF("unexpected argument '%s'\n", arg);
                     }
+                    
+                    // Flags for ./client new|join
+                    else {
+                        if (strcmp(arg, "--server") == 0 || strcmp(arg, "-s") == 0) {
+                            if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
-                    // Flags fow ./client new
-                    else if (ctx.new_room) {
-                        if (strcmp(arg, "--players") == 0 || strcmp(arg, "-p") == 0 || (arg[1] == 'p' && isdigit(arg[2]))) {
-                            if (argc == 1 && !isdigit(arg[2])) ERRF("no value for option '%s'\n", arg);
+                            strcpy(ctx.server, *(++argv));
+                            argc--;
+                        } else if (strcmp(arg, "--tcp-port") == 0 || strcmp(arg, "-T") == 0) {
+                            if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
-                            char *value_str;
-                            if (arg[1] == 'p' && strlen(arg) >= 3) {
-                                value_str = arg+2;
-                                arg += 1;
-                            } else {
-                                value_str = *(++argv);
-                                argc--;
-                            }
+                            char *value_str = *(++argv);
+                            argc--;
 
                             char *endp;
-                            ctx.players_number = strtoul(value_str, &endp, 10);
+                            ctx.tcp_port = strtoul(value_str, &endp, 10);
                             if (*endp != '\0') {
                                 ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                             }
-                            if (ctx.players_number == 0 || ctx.players_number > 4) {
-                                ERR("number of players must be from 1 to 4\n");
-                            }
-                        } else if (strcmp(arg, "--team") == 0 || strcmp(arg, "-t") == 0) {
+                        } else if (strcmp(arg, "--udp-port") == 0 || strcmp(arg, "-U") == 0) {
                             if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
                             char *value_str = *(++argv);
                             argc--;
 
-                            int team = get_team_id(value_str);
-                            if (team == -1) {
+                            char *endp;
+                            ctx.udp_port = strtoul(value_str, &endp, 10);
+                            if (*endp != '\0') {
                                 ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
                             }
-                            ctx.player_team = team;
-                        } else if (strcmp(arg, "--world") == 0 || strcmp(arg, "-w") == 0) {
+                        } else if (strcmp(arg, "--name") == 0 || strcmp(arg, "-n") == 0) {
                             if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
-                            char *value_str = *(++argv);
+                            strncpy(ctx.username, *(++argv), USERNAME_LEN);
+                            ctx.username[USERNAME_LEN-1] = '\0';
                             argc--;
-                            if (sscanf(value_str, "%dx%d", &ctx.world_size.x, &ctx.world_size.y) < 2) {
-                                ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                        }
+
+                        // Flags fow ./client new
+                        else if (ctx.new_room) {
+                            if (strcmp(arg, "--players") == 0 || strcmp(arg, "-p") == 0 || (arg[1] == 'p' && isdigit(arg[2]))) {
+                                if (argc == 1 && !isdigit(arg[2])) ERRF("no value for option '%s'\n", arg);
+
+                                char *value_str;
+                                if (arg[1] == 'p' && strlen(arg) >= 3) {
+                                    value_str = arg+2;
+                                    arg += 1;
+                                } else {
+                                    value_str = *(++argv);
+                                    argc--;
+                                }
+
+                                char *endp;
+                                ctx.players_number = strtoul(value_str, &endp, 10);
+                                if (*endp != '\0') {
+                                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                                }
+                                if (ctx.players_number == 0 || ctx.players_number > 4) {
+                                    ERR("number of players must be from 1 to 4\n");
+                                }
+                            } else if (strcmp(arg, "--team") == 0 || strcmp(arg, "-t") == 0) {
+                                if (argc == 1) ERRF("no value for option '%s'\n", arg);
+
+                                char *value_str = *(++argv);
+                                argc--;
+
+                                int team = get_team_id(value_str);
+                                if (team == -1) {
+                                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                                }
+                                ctx.player_team = team;
+                            } else if (strcmp(arg, "--world") == 0 || strcmp(arg, "-w") == 0) {
+                                if (argc == 1) ERRF("no value for option '%s'\n", arg);
+
+                                char *value_str = *(++argv);
+                                argc--;
+                                if (sscanf(value_str, "%dx%d", &ctx.world_size.x, &ctx.world_size.y) < 2) {
+                                    ERRF("illegal value '%s' for option '%s'\n", value_str, arg);
+                                }
+                                ctx.world_size.x = ceilf((float)ctx.world_size.x / BOID_SIZE) * BOID_SIZE;
+                                ctx.world_size.y = ceilf((float)ctx.world_size.y / BOID_SIZE) * BOID_SIZE;
+                            } else if (strcmp(arg, "--hide-areas") == 0 || strncmp(arg, "-a", 2) == 0) {
+                                ctx.hide_areas = true;
+                            } else {
+                                ERRF("unexpected argument '%s'\n", arg);
                             }
-                            ctx.world_size.x = ceilf((float)ctx.world_size.x / BOID_SIZE) * BOID_SIZE;
-                            ctx.world_size.y = ceilf((float)ctx.world_size.y / BOID_SIZE) * BOID_SIZE;
-                        } else if (strcmp(arg, "--hide-areas") == 0 || strncmp(arg, "-a", 2) == 0) {
-                            ctx.hide_areas = true;
-                        } else {
+                        }
+
+                        // Flags fow ./client join
+                        else {
                             ERRF("unexpected argument '%s'\n", arg);
                         }
-                    }
-
-                    // Flags fow ./client join
-                    else {
-                        ERRF("unexpected argument '%s'\n", arg);
                     }
                 } else {
                     ERRF("unexpected argument '%s'\n", arg);
@@ -2163,7 +2208,7 @@ int main(int argc, char **argv) {
     }
 
     if (print_help) {
-        if (!ctx.run_game) { // ./client
+        if (!ctx.cli_run) { // ./client
             printf(
                 "Usage: %s [COMMAND] [OPTIONS]\n"
                 "\n"
@@ -2177,17 +2222,11 @@ int main(int argc, char **argv) {
                 "Options:\n"
                 "  -h, --help\n"
                 "    Show this message and exit\n"
-                "  -s, --server <IP>\n"
-                "    Server's IP address (default: %s)\n"
-                "  -T, --tcp-port <NUM>\n"
-                "    TCP port of the game server (default: %d)\n"
-                "  -U, --udp-port <NUM>\n"
-                "    UDP port of the game server (default: %d)\n"
-                "  -n, --name <STR>\n"
-                "    Username (default: %s)\n"
+                "  -e, --settings <PATH>\n"
+                "    Use a specific settings file\n"
                 "\n"
                 "Run '%s COMMAND --help' for command-specific help.\n",
-                prog, DEFAULT_SERVER, TCP_PORT, UDP_PORT, DEFAULT_USERNAME, prog
+                prog, prog
             );
         } else if (ctx.local_game) { // ./client local
             printf(
@@ -2198,6 +2237,8 @@ int main(int argc, char **argv) {
                 "Options:\n"
                 "  -h, --help\n"
                 "    Show this message and exit\n"
+                "  -e, --settings <PATH>\n"
+                "    Use a specific settings file\n"
                 "  -c, --chunk <NUM>\n"
                 "    Size of chunk in pixels, rounded down to the nearest multiple of %d\n"
                 "    (default: %d)\n"
@@ -2220,6 +2261,8 @@ int main(int argc, char **argv) {
                 "Options:\n"
                 "  -h, --help\n"
                 "    Show this message and exit\n"
+                "  -e, --settings <PATH>\n"
+                "    Use a specific settings file\n"
                 "  -s, --server <IP>\n"
                 "    Server's IP address (default: %s)\n"
                 "  -T, --tcp-port <NUM>\n"
@@ -2263,6 +2306,8 @@ int main(int argc, char **argv) {
                 "Options:\n"
                 "  -h, --help\n"
                 "    Show this message and exit\n"
+                "  -e, --settings <PATH>\n"
+                "    Use a specific settings file\n"
                 "  -s, --server <IP>\n"
                 "    Server's IP address (default: %s)\n"
                 "  -T, --tcp-port <NUM>\n"
@@ -2312,7 +2357,7 @@ int main(int argc, char **argv) {
             ERR("select valid team\n");
         }
     }
-    
+
     #ifdef DEBUG
         set_log_config(NULL, /*print_time=*/ false, /*stdout*/ L_DEBUG, /*file*/ L_DEBUG);
     #else
@@ -2331,17 +2376,156 @@ int main(int argc, char **argv) {
     // Init log
     init_cstack(ctx.log, MAX_LOG_LEN);
 
+    // Open settings file for reading
+    FILE *settings_file = fopen(settings_file_name, "r");
+    bool save_settings = true;
+    
+    if (settings_file == NULL) {
+        // If file does not exists, init empty table
+        ctx.settings = config_table_init();
+
+        log_message(&ctx.log, L_WARNING, "failed to open '%s' settings file for reading\n", settings_file_name);
+        set_menu_message(MESSAGE_INFO, false, "Settings file not found");
+    } else {
+        // Parse settings file
+        
+        ConfigFailData fail;
+        ctx.settings = config_parse_file(settings_file, &fail);
+        if (fail.fail) {
+            log_message(&ctx.log, L_WARNING, "error in '%s' settings file at %d:%d", settings_file_name, fail.pos.line, fail.pos.col);
+            set_menu_message(MESSAGE_WARNING, false, TextFormat("Error in '%s' settings file at %d:%d", settings_file_name, fail.pos.line, fail.pos.col));
+
+            // Free table
+            config_table_free(ctx.settings);
+            ctx.settings = NULL;
+
+            // Init empty table
+            ctx.settings = config_table_init();
+            save_settings = false;
+        }
+
+        fclose(settings_file);
+    }
+
+    if (ctx.settings != NULL) {
+        if (!ctx.cli_run) {
+            // Username
+            ConfigValue *username_value = config_table_get(ctx.settings, "username");
+            if (username_value != NULL && username_value->type == CONF_STRING) {
+                strncpy(ctx.username, username_value->v.s.p, USERNAME_LEN);
+                ctx.username[USERNAME_LEN-1] = '\0';
+            }
+
+            // Hide areas
+            ConfigValue *hide_areas_value = config_table_get(ctx.settings, "hide_areas");
+            if (hide_areas_value != NULL && (hide_areas_value->type == CONF_BOOL || hide_areas_value->type == CONF_INT)) {
+                ctx.hide_areas = hide_areas_value->v.b;
+            }
+
+            // Hide GUI
+            ConfigValue *hide_gui_value = config_table_get(ctx.settings, "hide_gui");
+            if (hide_gui_value != NULL && (hide_gui_value->type == CONF_BOOL || hide_gui_value->type == CONF_INT)) {
+                ctx.settings_hide_gui = hide_gui_value->v.b;
+            }
+        }
+
+        // Autoselect mode
+        ConfigValue *autoselect_value = config_table_get(ctx.settings, "autoselect");
+        ctx.settings_autoselect = (autoselect_value != NULL && (autoselect_value->type == CONF_BOOL || autoselect_value->type == CONF_INT)) ? autoselect_value->v.b : true;
+        
+        // Servers list
+        ConfigValue *servers_value = config_table_get(ctx.settings, "servers");
+        
+        // Remove invalid value
+        if (servers_value != NULL && servers_value->type != CONF_ARRAY) {
+            config_table_remove(ctx.settings, "servers");
+            servers_value = NULL;
+        }
+
+        // Add empty array
+        if (servers_value == NULL) {
+            ConfigValue v = config_array();
+            config_table_insert(ctx.settings, "servers", v);
+            servers_value = config_table_get(ctx.settings, "servers");
+        }
+
+        ctx.settings_servers = servers_value->v.a;
+        
+        // Add "custom" server
+        ConfigValue new_v = config_table();
+        ConfigTable *new_t = new_v.v.t;
+        config_table_insert(new_t, "name", config_string("--custom--"));
+        if (ctx.cli_run) {
+            config_table_insert(new_t, "ip", config_string(ctx.server));
+            config_table_insert(new_t, "tcp_port", config_int(ctx.tcp_port));
+            config_table_insert(new_t, "udp_port", config_int(ctx.udp_port));
+        } else {
+            config_table_insert(new_t, "ip", config_string(DEFAULT_SERVER));
+        }
+        config_array_append(ctx.settings_servers, new_v);
+        ctx.settings_custom_server = new_t;
+        
+        for (int i = 0; i < config_array_len(ctx.settings_servers); i++) {
+            bool valid = true;
+            
+            ConfigValue *v = config_array_get(ctx.settings_servers, i);
+            ConfigTable *t = NULL;
+            if (v->type != CONF_TABLE) {
+                valid = false;
+                goto invalid_server;
+            }
+            t = v->v.t;
+
+            // Server name
+            ConfigValue *name_value = config_table_get(t, "name");
+            if (name_value == NULL || name_value->type != CONF_STRING) {
+                valid = false;
+                goto invalid_server;
+            }
+            name_value->v.s.p = realloc(name_value->v.s.p, SERVERNAME_LEN);
+
+            // Server IP
+            ConfigValue *ip_value = config_table_get(t, "ip");
+            if (name_value == NULL || ip_value->type != CONF_STRING) {
+                valid = false;
+                goto invalid_server;
+            }
+            ip_value->v.s.p = realloc(ip_value->v.s.p, INET_ADDRSTRLEN);
+
+            // TCP port
+            ConfigValue *tcp_value = config_table_get(t, "tcp_port");
+            if (tcp_value != NULL && tcp_value->type != CONF_INT) // Remove invalid value
+                config_table_remove(t, "tcp_port");
+            if (tcp_value == NULL || tcp_value->type != CONF_INT) // Insert default value
+                config_table_insert(t, "tcp_port", config_int(TCP_PORT));
+
+            // UDP port
+            ConfigValue *udp_value = config_table_get(t, "udp_port");
+            if (udp_value != NULL && udp_value->type != CONF_INT) // Remove invalid value
+                config_table_remove(t, "udp_port");
+            if (udp_value == NULL || udp_value->type != CONF_INT) // Insert default value
+                config_table_insert(t, "udp_port", config_int(UDP_PORT));
+            
+            invalid_server:
+            if (t != NULL) {
+                ConfigValue valid_value = config_bool(valid);
+                valid_value.displayed = false;
+                config_table_insert(t, "valid", valid_value);
+            }
+        }
+    }
+
     // Run game for ./client new|join|local
-    if (ctx.run_game) {
+    if (ctx.cli_run) {
         if (!ctx.local_game)
             if (create_sockets())
                 return 1;
-        prepare_context(ctx.local_game, ctx.new_room);
+        prepare_context(ctx.local_game, ctx.new_room, /*cli_run=*/ true);
         
         if (ctx.local_game) {
             init_game();
         } else {
-            start_net_thread();
+            start_net_thread(false);
             if (ctx.new_room) send_request_new();
             else send_request_join();
         }
@@ -2406,6 +2590,7 @@ int main(int argc, char **argv) {
             case MENU_NEW: next_menu = new_menu(); break;
             case MENU_JOIN: next_menu = join_menu(); break;
             case MENU_LOCAL: next_menu = local_menu(); break;
+            case MENU_SETTINGS: next_menu = settings_menu(); break;
             case MENU_LOADING: next_menu = loading_menu(); break;
             case MENU_GAME: next_menu = game_loop(texture, boids_textures, ctx.reset_game); ctx.reset_game = false; break;
             default: break;
@@ -2497,7 +2682,63 @@ int main(int argc, char **argv) {
 
     free(ctx.log.items);
     ctx.log.items = NULL;
+
+    if (ctx.settings_servers_names.str != NULL)
+        free(ctx.settings_servers_names.str);
     
+    // Save settings
+    if (ctx.settings != NULL && !ctx.cli_run && save_settings) {
+        // Open settings file for writing
+        settings_file = fopen(settings_file_name, "w");
+        if (settings_file == NULL) {
+            log_message(&ctx.log, L_WARNING, "failed to save '%s' settings file\n", settings_file_name);
+        } else {
+            // Update values
+            
+            ConfigValue *username_value = config_table_get(ctx.settings, "username");
+            if (username_value == NULL)
+                config_table_insert(ctx.settings, "username", config_string(ctx.username));
+            else
+                config_value_set(username_value, config_string(ctx.username));
+
+            ConfigValue *hide_areas_value = config_table_get(ctx.settings, "hide_areas");
+            if (hide_areas_value == NULL)
+                config_table_insert(ctx.settings, "hide_areas", config_bool(ctx.hide_areas));
+            else
+                config_value_set(hide_areas_value, config_bool(ctx.hide_areas));
+
+            ConfigValue *hide_gui_value = config_table_get(ctx.settings, "hide_gui");
+            if (hide_gui_value == NULL)
+                config_table_insert(ctx.settings, "hide_gui", config_bool(ctx.settings_hide_gui));
+            else
+                config_value_set(hide_gui_value, config_bool(ctx.settings_hide_gui));
+
+            ConfigValue *autoselect_value = config_table_get(ctx.settings, "autoselect");
+            if (autoselect_value == NULL)
+                config_table_insert(ctx.settings, "autoselect", config_bool(ctx.settings_autoselect));
+            else
+                config_value_set(autoselect_value, config_bool(ctx.settings_autoselect));
+
+            // Remove "--custom--" server from config
+            if (ctx.settings_servers != NULL) {
+                for (int i = 0; i < config_array_len(ctx.settings_servers); i++) {
+                    ConfigTable *t = config_array_get(ctx.settings_servers, i)->v.t;
+                    if (!config_table_get(t, "valid"))
+                        continue;
+                    char *server_name = config_table_get(t, "name")->v.s.p;
+                    if (strcmp(server_name, "--custom--") == 0)
+                        config_array_remove(ctx.settings_servers, i);
+                }
+            }
+            
+            // Save config file
+            config_write_table(ctx.settings, settings_file);
+            fclose(settings_file);
+        }
+        
+        config_table_free(ctx.settings);
+    }
+
     // Close Raylib
     UnloadTexture(texture);
     for (int team = 0; team < TEAMS_COUNT; team++)
@@ -2626,7 +2867,7 @@ int create_sockets(void) {
 }
 
 // Prepare the context for the game
-void prepare_context(bool local, bool new_room) {
+void prepare_context(bool local, bool new_room, bool cli_run) {
     if (ctx.game_initialized)
         return;
     
@@ -2650,15 +2891,21 @@ void prepare_context(bool local, bool new_room) {
     ctx.show_health = false;
     ctx.game_paused = false;
     ctx.show_arrow = false;
-    ctx.autoselect_mode = true;
     
     ctx.get_input = false;
     ctx.input_received = false;
     ctx.typing_keyboard_input = false;
-    
+
     ctx.local_game = local;
     ctx.new_room = new_room;
-    
+    ctx.cli_run = cli_run;
+    if (ctx.settings != NULL) {
+        if (!cli_run) {
+            ctx.show_gui = !ctx.settings_hide_gui;
+        }
+        ctx.autoselect_mode = ctx.settings_autoselect;
+    }
+
     if (ctx.local_game) {
         ctx.stage = STAGE_GAME;
         ctx.mode = MODE_SPAWN;
@@ -2685,7 +2932,7 @@ void prepare_context(bool local, bool new_room) {
 }
 
 // Start a thread to receive messages from the server
-void start_net_thread(void) {
+void start_net_thread(bool create_sockets) {
     if (ctx.local_game || ctx.net_thread_running)
         return;
 
@@ -2695,7 +2942,10 @@ void start_net_thread(void) {
     pthread_mutex_init(&next_menu_mtx, NULL);
     pthread_mutex_init(&input_mtx, NULL);
     pthread_mutex_init(&players_mtx, NULL);
-    pthread_create(&net_thread, NULL, net_thread_fn, NULL);
+
+    bool *arg = malloc(1);
+    *(bool*)arg = create_sockets;
+    pthread_create(&net_thread, NULL, net_thread_fn, arg);
     ctx.net_thread_running = true;
 }
 
@@ -2841,30 +3091,6 @@ void exit_game(void) {
 #define CHECKBOX_SIZE 20
 #define CHECKBOX_OFFSET -10
 
-GameMenu main_menu(void) {
-    const int items_number = 3;
-    int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
-
-    GameMenu next_menu = 0;
-
-    STYLE_START(DEFAULT, TEXT_SIZE, 20);
-    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
-    
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "New room")) next_menu = MENU_NEW;
-    y += ITEM_HEIGHT + ITEM_SPACING;
-
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "Join room")) next_menu = MENU_JOIN;
-    y += ITEM_HEIGHT + ITEM_SPACING;
-
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "Local game")) next_menu = MENU_LOCAL;
-    y += ITEM_HEIGHT + ITEM_SPACING;
-    
-    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
-    STYLE_END(); // TEXT_SIZE
-    
-    return next_menu;
-}
-
 #define ITEM_X ctx.screen_width/2.0f - ITEM_WIDTH/2.0f + __label_width + LABEL_SPACING + __margin
 #define ITEM_W (ITEM_WIDTH - __label_width - LABEL_SPACING - __margin)
 #define ITEM(n, x, y, ...)                                                                                               \
@@ -2874,10 +3100,13 @@ GameMenu main_menu(void) {
         STYLE_START(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);                                                           \
         GuiLabel((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f + __margin, (y), ITEM_WIDTH, ITEM_HEIGHT}, n ": "); \
         STYLE_END();                                                                                                     \
+        if (!active_gui) GuiLock(); \
         __VA_ARGS__                                                                                                      \
+        GuiUnlock(); \
     } while (0)
 
 #define INFOBOX_WIDTH 30
+
 // Draw an "info" box with tooltip
 void draw_info(int x, int y, const char *text) {
     Rectangle info_rec = {x, y, INFOBOX_WIDTH, ITEM_HEIGHT};
@@ -2901,18 +3130,142 @@ void draw_info(int x, int y, const char *text) {
     GuiSetState(STATE_NORMAL);
 }
 
+void generate_servers_names() {
+    if (ctx.settings_servers_names.capacity == 0) {
+        ctx.settings_servers_names.capacity = 1024;
+        ctx.settings_servers_names.str = malloc(ctx.settings_servers_names.capacity);
+    }
+
+    char *p = ctx.settings_servers_names.str;
+    int servers_number = config_array_len(ctx.settings_servers);
+    for (int i = 0; i < servers_number; i++) {
+        ConfigTable *t = config_array_get(ctx.settings_servers, i)->v.t;
+        if (config_table_get(t, "valid")->v.b) {
+            ConfigValue *name = config_table_get(t, "name");
+            if (name != NULL) {
+                // Expand string
+                if (ctx.settings_servers_names.len + name->v.s.l + 1 >= ctx.settings_servers_names.capacity) {
+                    ctx.settings_servers_names.capacity *= 2;
+                    ctx.settings_servers_names.str = realloc(ctx.settings_servers_names.str, ctx.settings_servers_names.capacity);
+                }
+                
+                // Copy name
+                strcpy(p, name->v.s.p);
+                p += name->v.s.l;
+
+                // Add separator
+                *(p++) = ';';
+            }
+        }
+    }
+
+    // Remove last separator
+    if (p > ctx.settings_servers_names.str)
+        p--;
+    *p = '\0';
+}
+
+GameMenu main_menu(void) {
+    const int items_number = 4;
+    int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
+
+    GameMenu next_menu = 0;
+
+    STYLE_START(DEFAULT, TEXT_SIZE, 20);
+    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
+    
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "New room")) {
+        generate_servers_names();
+        next_menu = MENU_NEW;
+    }
+    y += ITEM_HEIGHT + ITEM_SPACING;
+
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "Join room")) {
+        generate_servers_names();
+        next_menu = MENU_JOIN;
+    }
+    y += ITEM_HEIGHT + ITEM_SPACING;
+
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "Local game")) next_menu = MENU_LOCAL;
+    y += ITEM_HEIGHT + ITEM_SPACING;
+
+    y += ITEM_SPACING;
+
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "Settings")) next_menu = MENU_SETTINGS;
+    y += ITEM_HEIGHT + ITEM_SPACING;
+    
+    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+    STYLE_END(); // TEXT_SIZE
+    
+    return next_menu;
+}
+
+void paste_server(const char *server_str, ConfigTable **selected_server, int *selected_server_idx) {
+    ConfigFailData fail;
+    ConfigTable *server = config_parse(server_str, strlen(server_str)+1, &fail);
+    if (!fail.fail) {
+        ConfigValue *name_value = config_table_get(server, "name");
+        char *name = (name_value == NULL) ? "Server" : name_value->v.s.p;
+
+        ConfigValue *ip_value = config_table_get(server, "ip");
+        char *ip = (ip_value == NULL) ? DEFAULT_SERVER : ip_value->v.s.p;
+
+        ConfigValue *tcp_value = config_table_get(server, "tcp_port");
+        int tcp_port = (tcp_value == NULL) ? TCP_PORT : tcp_value->v.i;
+
+        ConfigValue *udp_value = config_table_get(server, "udp_port");
+        int udp_port = (udp_value == NULL) ? UDP_PORT : udp_value->v.i;
+
+        ConfigValue new_server = config_table();
+        config_table_insert(new_server.v.t, "name", config_string(name));
+        config_table_insert(new_server.v.t, "ip", config_string(ip));
+        config_table_insert(new_server.v.t, "tcp_port", config_int(tcp_port));
+        config_table_insert(new_server.v.t, "udp_port", config_int(udp_port));
+        
+        ConfigValue valid_value = config_bool(true);
+        valid_value.displayed = false;
+        config_table_insert(new_server.v.t, "valid", valid_value);
+
+        // Insert new server before "--custom--"
+        int new_server_idx = config_array_len(ctx.settings_servers) - 1;
+        config_array_insert(ctx.settings_servers, new_server, new_server_idx);
+        *selected_server_idx = new_server_idx;
+        *selected_server = config_array_get(ctx.settings_servers, *selected_server_idx)->v.t;
+    }
+    config_table_free(server);
+}
+
 GameMenu new_menu(void) {
-    const int items_number = 10;
+    static bool hide_server_data = true;
+    const int items_number = 11 - hide_server_data*4;
     int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
 
     bool active_dropdown = false;  // true if at least one GuiDropdownBox is active
-
     static bool active_gui = true; // false if active_dropdown is true;
                                    // All items that may be under GuiDropdownBox should be locked using GuiLock() function
                                    // when active_gui is false
 
+    static ConfigTable *selected_server = NULL;
+    static int selected_server_idx = 0;
+
+    static bool selected_server_set = false;
+    if (!selected_server_set) {
+        selected_server = ctx.settings_custom_server;
+
+        int servers_number = config_array_len(ctx.settings_servers);
+        for (int i = 0; i < servers_number; i++) {
+            ConfigTable *t = config_array_get(ctx.settings_servers, i)->v.t;
+            if (config_table_get(t, "valid")->v.b && strcmp(config_table_get(t, "name")->v.s.p, "--custom--") == 0) {
+                selected_server_idx = i;
+                break;
+            }
+        }
+        
+        selected_server_set = true;
+    }
+    
     STYLE_START(DEFAULT, TEXT_SIZE, 20);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
@@ -2928,37 +3281,97 @@ GameMenu new_menu(void) {
         
         y += ITEM_HEIGHT + ITEM_SPACING;
     });
-    
-    ITEM("Server IP", 0, y, {
-        static bool server_textbox_mode = false;
-        
-        STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-        if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, ctx.server, INET_ADDRSTRLEN, server_textbox_mode))
-            server_textbox_mode = !server_textbox_mode;
-        STYLE_END();
 
-        y += ITEM_HEIGHT + ITEM_INNER_SPACING;
-    });
-
-    const int port_textbox_width = 70;
-    
-    ITEM("TCP port", 50, y, {
-        static bool tcp_valuebox_mode = false;
-        
-        if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &ctx.tcp_port, 0, 65535, tcp_valuebox_mode))
-            tcp_valuebox_mode = !tcp_valuebox_mode;
-        
-        y += ITEM_HEIGHT + ITEM_INNER_SPACING;
-    });
-
-    ITEM("UDP port", 50, y, {
-        static bool udp_valuebox_mode = false;
-
-        if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &ctx.udp_port, 0, 65535, udp_valuebox_mode))
-            udp_valuebox_mode = !udp_valuebox_mode;
-
+    // Reserve place for "Server" item
+    int server_dropdown_y = y;
+    if (ctx.settings_servers != NULL)
         y += ITEM_HEIGHT + ITEM_SPACING;
-    });
+    
+    // Server data
+    if (!hide_server_data && ctx.settings_servers != NULL && selected_server != NULL) {
+        // Server name
+        ITEM("Name", 50, y, {
+            static bool server_textbox_mode = false;
+
+            char *servername = config_table_get(selected_server, "name")->v.s.p;
+            int *servername_len = &config_table_get(selected_server, "name")->v.s.l;
+            bool custom_server = strcmp(servername, "--custom--") == 0;
+        
+            STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
+            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, servername, SERVERNAME_LEN, server_textbox_mode)) {
+                server_textbox_mode = !server_textbox_mode;
+                if (server_textbox_mode == false) {
+                    *servername_len = strlen(servername);
+                    generate_servers_names();
+                }
+            }
+            STYLE_END();
+
+            if (custom_server && strcmp(servername, "--custom--") != 0) {
+                // Add new "--custom--" server
+                ConfigValue new_v = config_table();
+                ConfigTable *new_t = new_v.v.t;
+                
+                ConfigValue name_value = config_string("--custom--");
+                name_value.v.s.p = realloc(name_value.v.s.p, SERVERNAME_LEN);
+                config_table_insert(new_t, "name", name_value);
+
+                ConfigValue ip_value = config_string(DEFAULT_SERVER);
+                ip_value.v.s.p = realloc(ip_value.v.s.p, INET6_ADDRSTRLEN);
+                config_table_insert(new_t, "ip", ip_value);
+                
+                config_table_insert(new_t, "tcp_port", config_int(TCP_PORT));
+                config_table_insert(new_t, "udp_port", config_int(UDP_PORT));
+                
+                ConfigValue valid_value = config_bool(true);
+                valid_value.displayed = false;
+                config_table_insert(new_t, "valid", valid_value);
+                
+                config_array_append(ctx.settings_servers, new_v);
+
+                generate_servers_names();
+            }
+
+            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+         });
+
+        ITEM("Server IP", 50, y, {
+            static bool server_textbox_mode = false;
+        
+            STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
+            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, config_table_get(selected_server, "ip")->v.s.p, INET_ADDRSTRLEN, server_textbox_mode))
+                server_textbox_mode = !server_textbox_mode;
+            STYLE_END();
+
+            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+        });
+
+        const int port_textbox_width = 70;
+            
+        ITEM("TCP port", 50, y, {
+            static bool tcp_valuebox_mode = false;
+        
+            long *settings_tcp_port = &config_table_get(selected_server, "tcp_port")->v.i;
+            int tcp_port = *settings_tcp_port;
+            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &tcp_port, 0, 65535, tcp_valuebox_mode))
+                tcp_valuebox_mode = !tcp_valuebox_mode;
+            *settings_tcp_port = tcp_port;
+        
+            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+        });
+
+        ITEM("UDP port", 50, y, {
+            static bool udp_valuebox_mode = false;
+
+            long *settings_udp_port = &config_table_get(selected_server, "udp_port")->v.i;
+            int udp_port = *settings_udp_port;
+            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &udp_port, 0, 65535, udp_valuebox_mode))
+                udp_valuebox_mode = !udp_valuebox_mode;
+            *settings_udp_port = udp_port;
+
+            y += ITEM_HEIGHT + ITEM_SPACING;
+        });
+    }
 
     ITEM("Chunk size", 0, y, {
         static bool chunk_spinner_mode = false;
@@ -3008,10 +3421,8 @@ GameMenu new_menu(void) {
     y += ITEM_HEIGHT + ITEM_SPACING;
     
     ITEM("Hide areas", 0, y, {
-        if (!active_gui) GuiLock(); // Lock this item when any GuiDropdownBox is active
         GuiCheckBox((Rectangle){ITEM_X + CHECKBOX_OFFSET, y + ITEM_HEIGHT/2.0f - CHECKBOX_SIZE/2.0f, CHECKBOX_SIZE, CHECKBOX_SIZE}, NULL, &ctx.hide_areas);
         draw_info(ITEM_X + CHECKBOX_OFFSET + CHECKBOX_SIZE + ITEM_INNER_SPACING, y, "Do not show areas to otrher players while admin player draws them");
-        GuiUnlock();
 
         y += ITEM_HEIGHT + ITEM_SPACING;
     });
@@ -3035,8 +3446,8 @@ GameMenu new_menu(void) {
     set_menu_message(MESSAGE_WARNING, false, warning_text);
     
     // "Back" and "Create" buttons
-    const int back_btn_width = ITEM_HEIGHT; // Square button
     if (!active_gui) GuiLock(); // Lock items when any GuiDropdownBox is active
+    const int back_btn_width = ITEM_HEIGHT; // Square button
     if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, back_btn_width, ITEM_HEIGHT}, GuiIconText(ICON_EXIT, "")))
         next_menu = MENU_MAIN;
     GuiSetState((warning_text == NULL) ? STATE_NORMAL : STATE_DISABLED);
@@ -3047,6 +3458,83 @@ GameMenu new_menu(void) {
     GuiUnlock();
     
     // GuiDropdownBox must draw after any other control that can be covered on unfolding
+
+    if (ctx.settings_servers != NULL) {
+        y = server_dropdown_y;
+        ITEM("Server", 0, y, {
+            // Servers dropdown
+            static bool server_dropdown_mode = false;
+
+            if (!active_gui && !server_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
+
+            if (GuiDropdownBox((Rectangle){ITEM_X, y, ITEM_W - ITEM_INNER_SPACING*4 - ITEM_HEIGHT*4, ITEM_HEIGHT},
+                               ctx.settings_servers_names.str, &selected_server_idx, server_dropdown_mode)) {
+                server_dropdown_mode = !server_dropdown_mode;
+            }
+            selected_server = config_array_get(ctx.settings_servers, selected_server_idx)->v.t;
+
+            if (server_dropdown_mode) active_dropdown = true;
+
+            STYLE_START(DEFAULT, TEXT_SIZE, 10);
+            
+            // Hide/show server data button
+            GuiEnableTooltip();
+            GuiSetTooltip("Hide/show server data");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*3 - ITEM_HEIGHT*4, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(hide_server_data ? ICON_ARROW_DOWN : ICON_ARROW_UP, ""))) {
+                hide_server_data = !hide_server_data;
+                generate_servers_names();
+            }
+
+            // Copy to clipboard button
+            GuiSetTooltip("Copy server to clipboard");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*2 - ITEM_HEIGHT*3, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(ICON_LAYERS, ""))) {
+                char format[] = "name=\"%s\";ip=\"%s\";tcp_port=%d;udp_port=%d;";
+                const int buf_len = sizeof(format) + SERVERNAME_LEN + INET_ADDRSTRLEN + /*tcp_port*/5 + /*udp_port*/5;
+                char *buf = malloc(buf_len);
+                snprintf(buf, buf_len, format,
+                         config_table_get(selected_server, "name")->v.s.p,
+                         config_table_get(selected_server, "ip")->v.s.p,
+                         (int)config_table_get(selected_server, "tcp_port")->v.i,
+                         (int)config_table_get(selected_server, "udp_port")->v.i);
+                SetClipboardText(buf);
+                free(buf);
+            }
+
+            // Paste from clipboard button
+            GuiSetTooltip("Paste server from clipboard");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING - ITEM_HEIGHT*2, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(ICON_FILE_OPEN, ""))) {
+                paste_server(GetClipboardText(), &selected_server, &selected_server_idx);
+                generate_servers_names();
+            }
+
+            // Delete server button
+            GuiSetTooltip("Delete server");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_HEIGHT, y, ITEM_HEIGHT, ITEM_HEIGHT}, GuiIconText(ICON_BIN, ""))) {
+                char *server_name = config_table_get(selected_server, "name")->v.s.p;
+                if (strcmp(server_name, "--custom--") == 0) {
+                    // Set "--custom--" server to default
+                    strcpy(config_table_get(selected_server, "ip")->v.s.p, DEFAULT_SERVER);
+                    config_value_set(config_table_get(selected_server, "tcp_port"), config_int(TCP_PORT));
+                    config_value_set(config_table_get(selected_server, "udp_port"), config_int(UDP_PORT));
+                } else {
+                    // Remove server
+                    config_array_remove(ctx.settings_servers, selected_server_idx);
+                    selected_server = config_array_get(ctx.settings_servers, selected_server_idx)->v.t;
+                    generate_servers_names();
+                }
+            }
+
+            GuiDisableTooltip();
+
+            STYLE_END(); // TEXT_SIZE
+            
+            GuiUnlock();
+        });
+    }
+    
     y = team_dropdown_y;
     ITEM("Team", 0, y, {
         const int dropdown_width = 100;
@@ -3076,13 +3564,11 @@ GameMenu new_menu(void) {
         } teams[TEAMS_COUNT] = { 0 };
 
         // [+] button
-        if (!active_gui) GuiLock();
         bool add_new = false;
         y += ITEM_HEIGHT*teams_count + ITEM_INNER_SPACING*teams_count;
         GuiSetState((teams_count < TEAMS_COUNT) ? STATE_NORMAL : STATE_DISABLED);
         if (GuiButton((Rectangle){ITEM_X, y, btn_width, ITEM_HEIGHT}, "+"))
             add_new = true;
-        GuiUnlock();
         y -= ITEM_HEIGHT + ITEM_INNER_SPACING;
         
         // Draw in reverse order
@@ -3140,25 +3626,50 @@ GameMenu new_menu(void) {
 
     active_gui = !active_dropdown;
 
+    // Create network thread, crete sockets, send request
     if (next_menu == MENU_LOADING) {
-        if (create_sockets()) {
-            set_menu_message(MESSAGE_ERROR, true, "Failed to connect to the server");
-            return MENU_MAIN;
-        }
-        prepare_context(/*local=*/ false, /*new_room=*/ true);
-        start_net_thread();
-        send_request_new();
+        strcpy(ctx.server, config_table_get(selected_server, "ip")->v.s.p);
+        ctx.tcp_port = config_table_get(selected_server, "tcp_port")->v.i;
+        ctx.udp_port = config_table_get(selected_server, "udp_port")->v.i;
+
+        prepare_context(/*local=*/ false, /*new_room=*/ true, /*cli_run=*/ false);
+        start_net_thread(true);
     }
     
     return next_menu;
 }
 
 GameMenu join_menu(void) {
-    const int items_number = 7;
+    static bool hide_server_data = true;
+    const int items_number = 8 - hide_server_data*4;
     int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
 
+    bool active_dropdown = false;  // true if at least one GuiDropdownBox is active
+    static bool active_gui = true; // false if active_dropdown is true;
+                                   // All items that may be under GuiDropdownBox should be locked using GuiLock() function
+                                   // when active_gui is false
+
+    static ConfigTable *selected_server = NULL;
+    static int selected_server_idx = 0;
+
+    static bool selected_server_set = false;
+    if (!selected_server_set) {
+        selected_server = ctx.settings_custom_server;
+
+        int servers_number = config_array_len(ctx.settings_servers);
+        for (int i = 0; i < servers_number; i++) {
+            ConfigTable *t = config_array_get(ctx.settings_servers, i)->v.t;
+            if (config_table_get(t, "valid")->v.b && strcmp(config_table_get(t, "name")->v.s.p, "--custom--") == 0) {
+                selected_server_idx = i;
+                break;
+            }
+        }
+        
+        selected_server_set = true;
+    }
+    
     STYLE_START(DEFAULT, TEXT_SIZE, 20);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
@@ -3177,36 +3688,96 @@ GameMenu join_menu(void) {
         y += ITEM_HEIGHT + ITEM_SPACING;
     });
     
-    ITEM("Server IP", 0, y, {
-        static bool server_textbox_mode = false;
-        
-        STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-        if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, ctx.server, INET_ADDRSTRLEN, server_textbox_mode))
-            server_textbox_mode = !server_textbox_mode;
-        STYLE_END();
-
-        y += ITEM_HEIGHT + ITEM_INNER_SPACING;
-    });
-
-    const int port_textbox_width = 70;
-
-    ITEM("TCP port", 50, y, {
-        static bool tcp_valuebox_mode = false;
-        
-        if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &ctx.tcp_port, 0, 65535, tcp_valuebox_mode))
-            tcp_valuebox_mode = !tcp_valuebox_mode;
-        
-        y += ITEM_HEIGHT + ITEM_INNER_SPACING;
-    });
-
-    ITEM("UDP port", 50, y, {
-        static bool udp_valuebox_mode = false;
-
-        if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &ctx.udp_port, 0, 65535, udp_valuebox_mode))
-            udp_valuebox_mode = !udp_valuebox_mode;
-
+    // Reserve place for "Server" item
+    int server_dropdown_y = y;
+    if (ctx.settings_servers != NULL)
         y += ITEM_HEIGHT + ITEM_SPACING;
-    });
+    
+    // Server data
+    if (!hide_server_data && ctx.settings_servers != NULL && selected_server != NULL) {
+        // Server name
+        ITEM("Name", 50, y, {
+            static bool server_textbox_mode = false;
+
+            char *servername = config_table_get(selected_server, "name")->v.s.p;
+            int *servername_len = &config_table_get(selected_server, "name")->v.s.l;
+            bool custom_server = strcmp(servername, "--custom--") == 0;
+        
+            STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
+            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, servername, SERVERNAME_LEN, server_textbox_mode)) {
+                server_textbox_mode = !server_textbox_mode;
+                if (server_textbox_mode == false) {
+                    *servername_len = strlen(servername);
+                    generate_servers_names();
+                }
+            }
+            STYLE_END();
+
+            if (custom_server && strcmp(servername, "--custom--") != 0) {
+                // Add new "--custom--" server
+                ConfigValue new_v = config_table();
+                ConfigTable *new_t = new_v.v.t;
+                
+                ConfigValue name_value = config_string("--custom--");
+                name_value.v.s.p = realloc(name_value.v.s.p, SERVERNAME_LEN);
+                config_table_insert(new_t, "name", name_value);
+
+                ConfigValue ip_value = config_string(DEFAULT_SERVER);
+                ip_value.v.s.p = realloc(ip_value.v.s.p, INET6_ADDRSTRLEN);
+                config_table_insert(new_t, "ip", ip_value);
+                
+                config_table_insert(new_t, "tcp_port", config_int(TCP_PORT));
+                config_table_insert(new_t, "udp_port", config_int(UDP_PORT));
+                
+                ConfigValue valid_value = config_bool(true);
+                valid_value.displayed = false;
+                config_table_insert(new_t, "valid", valid_value);
+                
+                config_array_append(ctx.settings_servers, new_v);
+
+                generate_servers_names();
+            }
+
+            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+         });
+
+        ITEM("Server IP", 50, y, {
+            static bool server_textbox_mode = false;
+        
+            STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
+            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, config_table_get(selected_server, "ip")->v.s.p, INET_ADDRSTRLEN, server_textbox_mode))
+                server_textbox_mode = !server_textbox_mode;
+            STYLE_END();
+
+            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+        });
+
+        const int port_textbox_width = 70;
+            
+        ITEM("TCP port", 50, y, {
+            static bool tcp_valuebox_mode = false;
+        
+            long *settings_tcp_port = &config_table_get(selected_server, "tcp_port")->v.i;
+            int tcp_port = *settings_tcp_port;
+            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &tcp_port, 0, 65535, tcp_valuebox_mode))
+                tcp_valuebox_mode = !tcp_valuebox_mode;
+            *settings_tcp_port = tcp_port;
+        
+            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+        });
+
+        ITEM("UDP port", 50, y, {
+            static bool udp_valuebox_mode = false;
+
+            long *settings_udp_port = &config_table_get(selected_server, "udp_port")->v.i;
+            int udp_port = *settings_udp_port;
+            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &udp_port, 0, 65535, udp_valuebox_mode))
+                udp_valuebox_mode = !udp_valuebox_mode;
+            *settings_udp_port = udp_port;
+
+            y += ITEM_HEIGHT + ITEM_SPACING;
+        });
+    }
     
     ITEM("Chunk size", 0, y, {
         static bool chunk_spinner_mode = false;
@@ -3240,6 +3811,7 @@ GameMenu join_menu(void) {
     set_menu_message(MESSAGE_WARNING, false, warning_text);
     
     // "Back" and "Join" buttons
+    if (!active_gui) GuiLock(); // Lock items when any GuiDropdownBox is active
     const int back_btn_width = ITEM_HEIGHT; // Square button
     if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, back_btn_width, ITEM_HEIGHT}, GuiIconText(ICON_EXIT, "")))
         next_menu = MENU_MAIN;
@@ -3248,18 +3820,99 @@ GameMenu join_menu(void) {
         next_menu = MENU_LOADING;
     y += ITEM_HEIGHT + ITEM_SPACING;
     GuiSetState(STATE_NORMAL);
+    GuiUnlock();
+    
+    // GuiDropdownBox must draw after any other control that can be covered on unfolding
+
+    if (ctx.settings_servers != NULL) {
+        y = server_dropdown_y;
+        ITEM("Server", 0, y, {
+            // Servers dropdown
+            static bool server_dropdown_mode = false;
+
+            if (!active_gui && !server_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
+
+            if (GuiDropdownBox((Rectangle){ITEM_X, y, ITEM_W - ITEM_INNER_SPACING*4 - ITEM_HEIGHT*4, ITEM_HEIGHT},
+                               ctx.settings_servers_names.str, &selected_server_idx, server_dropdown_mode)) {
+                server_dropdown_mode = !server_dropdown_mode;
+            }
+            selected_server = config_array_get(ctx.settings_servers, selected_server_idx)->v.t;
+
+            if (server_dropdown_mode) active_dropdown = true;
+
+            STYLE_START(DEFAULT, TEXT_SIZE, 10);
+            
+            // Hide/show server data button
+            GuiEnableTooltip();
+            GuiSetTooltip("Hide/show server data");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*3 - ITEM_HEIGHT*4, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(hide_server_data ? ICON_ARROW_DOWN : ICON_ARROW_UP, ""))) {
+                hide_server_data = !hide_server_data;
+                generate_servers_names();
+            }
+
+            // Copy to clipboard button
+            GuiSetTooltip("Copy server to clipboard");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*2 - ITEM_HEIGHT*3, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(ICON_LAYERS, ""))) {
+                char format[] = "name=\"%s\";ip=\"%s\";tcp_port=%d;udp_port=%d;";
+                const int buf_len = sizeof(format) + SERVERNAME_LEN + INET_ADDRSTRLEN + /*tcp_port*/5 + /*udp_port*/5;
+                char *buf = malloc(buf_len);
+                snprintf(buf, buf_len, format,
+                         config_table_get(selected_server, "name")->v.s.p,
+                         config_table_get(selected_server, "ip")->v.s.p,
+                         (int)config_table_get(selected_server, "tcp_port")->v.i,
+                         (int)config_table_get(selected_server, "udp_port")->v.i);
+                SetClipboardText(buf);
+                free(buf);
+            }
+
+            // Paste from clipboard button
+            GuiSetTooltip("Paste server from clipboard");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING - ITEM_HEIGHT*2, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(ICON_FILE_OPEN, ""))) {
+                paste_server(GetClipboardText(), &selected_server, &selected_server_idx);
+                generate_servers_names();
+            }
+
+            // Delete server button
+            GuiSetTooltip("Delete server");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_HEIGHT, y, ITEM_HEIGHT, ITEM_HEIGHT}, GuiIconText(ICON_BIN, ""))) {
+                char *server_name = config_table_get(selected_server, "name")->v.s.p;
+                if (strcmp(server_name, "--custom--") == 0) {
+                    // Set "--custom--" server to default
+                    strcpy(config_table_get(selected_server, "ip")->v.s.p, DEFAULT_SERVER);
+                    config_value_set(config_table_get(selected_server, "tcp_port"), config_int(TCP_PORT));
+                    config_value_set(config_table_get(selected_server, "udp_port"), config_int(UDP_PORT));
+                } else {
+                    // Remove server
+                    config_array_remove(ctx.settings_servers, selected_server_idx);
+                    selected_server = config_array_get(ctx.settings_servers, selected_server_idx)->v.t;
+                    generate_servers_names();
+                }
+            }
+
+            GuiDisableTooltip();
+
+            STYLE_END(); // TEXT_SIZE
+            
+            GuiUnlock();
+        });
+    }
     
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
     STYLE_END(); // TEXT_SIZE
     
+    active_gui = !active_dropdown;
+
+    // Create network thread, crete sockets, send request
     if (next_menu == MENU_LOADING) {
-        if (create_sockets()) {
-            set_menu_message(MESSAGE_ERROR, true, "Failed to connect to the server");
-            return MENU_MAIN;
-        }
-        prepare_context(/*local=*/ false, /*new_room=*/ false);
-        start_net_thread();
-        send_request_join();
+        strcpy(ctx.server, config_table_get(selected_server, "ip")->v.s.p);
+        ctx.tcp_port = config_table_get(selected_server, "tcp_port")->v.i;
+        ctx.udp_port = config_table_get(selected_server, "udp_port")->v.i;
+
+        prepare_context(/*local=*/ false, /*new_room=*/ false, /*cli_run=*/ false);
+        start_net_thread(true);
     }
     
     return next_menu;
@@ -3270,6 +3923,8 @@ GameMenu local_menu(void) {
     int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
+
+    static bool active_gui = true;
 
     STYLE_START(DEFAULT, TEXT_SIZE, 20);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
@@ -3299,8 +3954,45 @@ GameMenu local_menu(void) {
     STYLE_END(); // TEXT_SIZE
     
     if (next_menu == MENU_GAME) {
-        prepare_context(/*local=*/ true, /*new_room=*/ false);
+        prepare_context(/*local=*/ true, /*new_room=*/ false, /*cli_run=*/ false);
     }
+    
+    return next_menu;
+}
+
+GameMenu settings_menu(void) {
+    const int items_number = 3;
+    int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
+
+    GameMenu next_menu = 0;
+
+    static bool active_gui = true;
+
+    STYLE_START(DEFAULT, TEXT_SIZE, 20);
+    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
+    
+    GuiLabel((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, ctx.screen_height/4.0f, ITEM_WIDTH, ITEM_HEIGHT}, "Settings");
+
+    ITEM("Hide GUI", 0, y, {
+        GuiCheckBox((Rectangle){ITEM_X + CHECKBOX_OFFSET, y + ITEM_HEIGHT/2.0f - CHECKBOX_SIZE/2.0f, CHECKBOX_SIZE, CHECKBOX_SIZE}, NULL, &ctx.settings_hide_gui);
+        draw_info(ITEM_X + CHECKBOX_OFFSET + CHECKBOX_SIZE + ITEM_INNER_SPACING, y, "Hide the GUI after the game starts");
+
+        y += ITEM_HEIGHT + ITEM_SPACING;
+     });
+
+    ITEM("Autoselect", 0, y, {
+        GuiCheckBox((Rectangle){ITEM_X + CHECKBOX_OFFSET, y + ITEM_HEIGHT/2.0f - CHECKBOX_SIZE/2.0f, CHECKBOX_SIZE, CHECKBOX_SIZE}, NULL, &ctx.settings_autoselect);
+        draw_info(ITEM_X + CHECKBOX_OFFSET + CHECKBOX_SIZE + ITEM_INNER_SPACING, y, "Enable autoselect mode by default");
+
+        y += ITEM_HEIGHT + ITEM_SPACING;
+    });
+    
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, GuiIconText(ICON_EXIT, "Back")))
+        next_menu = MENU_MAIN;
+    y += ITEM_HEIGHT + ITEM_SPACING;
+    
+    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+    STYLE_END(); // TEXT_SIZE
     
     return next_menu;
 }
@@ -4931,6 +5623,9 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     handle_input();
 
     prev_mouse_position = ctx.mouse_position;
+
+    if (next_menu == MENU_MAIN)
+        ctx.cli_run = false;
 
     return next_menu;
 }
