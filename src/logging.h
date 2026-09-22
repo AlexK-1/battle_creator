@@ -1,8 +1,8 @@
-#include <stdio.h>
-#include <stdbool.h>
-
 #ifndef LOGGING_H
 #define LOGGING_H
+
+#include <stdio.h>
+#include <stdbool.h>
 
 typedef enum {
     L_DEBUG = 0,

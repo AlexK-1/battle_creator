@@ -240,7 +240,7 @@ typedef struct {
     bool new_room, hide_areas;
     BoidTeam player_team;
     uint32_t approved_player_id;
-    char approved_player_username[USERNAME_LEN], username[USERNAME_LEN], server[INET_ADDRSTRLEN];
+    char approved_player_username[USERNAME_LEN], username[USERNAME_LEN], orig_username[USERNAME_LEN], server[INET_ADDRSTRLEN];
     int tcp_port, udp_port;
 
     // Game control
@@ -1748,8 +1748,8 @@ void handle_input() {
         }
 
         if (!(cleared_events & (1ull << event)) &&
-            (b.gstage1 == STAGE_NULL || b.gstage1 == ctx.stage || b.gstage2 == ctx.stage || b.gloc) &&
-            (b.gmode == MODE_NULL || b.gmode == ctx.mode || b.gloc) &&
+            (b.gstage1 == STAGE_NULL || b.gstage1 == ctx.stage || b.gstage2 == ctx.stage || (b.gloc && ctx.local_game)) &&
+            (b.gmode == MODE_NULL || b.gmode == ctx.mode || (b.gloc && ctx.local_game)) &&
             (!b.gomul || !ctx.local_game) &&
             (!b.goloc || ctx.local_game) &&
             (!ctx.typing_keyboard_input) &&
@@ -2919,6 +2919,9 @@ void prepare_context(bool local, bool new_room, bool cli_run) {
         ctx.mode = MODE_WAIT;
     }
 
+    // Save the user-defined name, as the server can change it
+    strcpy(ctx.orig_username, ctx.username);
+
     CLEAR_EVENTS();
     CLEAR_GUI_EVENTS();
     CLEAR_MOD();
@@ -3068,6 +3071,9 @@ void exit_game(void) {
     }
     ctx.net_thread_running = false;
 
+    // Restore thr original user-defined name
+    strcpy(ctx.username, ctx.orig_username);
+    
     // Free allocated memory
     
     free_grid(&ctx.grid);
@@ -3459,82 +3465,6 @@ GameMenu new_menu(void) {
     
     // GuiDropdownBox must draw after any other control that can be covered on unfolding
 
-    if (ctx.settings_servers != NULL) {
-        y = server_dropdown_y;
-        ITEM("Server", 0, y, {
-            // Servers dropdown
-            static bool server_dropdown_mode = false;
-
-            if (!active_gui && !server_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
-
-            if (GuiDropdownBox((Rectangle){ITEM_X, y, ITEM_W - ITEM_INNER_SPACING*4 - ITEM_HEIGHT*4, ITEM_HEIGHT},
-                               ctx.settings_servers_names.str, &selected_server_idx, server_dropdown_mode)) {
-                server_dropdown_mode = !server_dropdown_mode;
-            }
-            selected_server = config_array_get(ctx.settings_servers, selected_server_idx)->v.t;
-
-            if (server_dropdown_mode) active_dropdown = true;
-
-            STYLE_START(DEFAULT, TEXT_SIZE, 10);
-            
-            // Hide/show server data button
-            GuiEnableTooltip();
-            GuiSetTooltip("Hide/show server data");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*3 - ITEM_HEIGHT*4, y, ITEM_HEIGHT, ITEM_HEIGHT},
-                          GuiIconText(hide_server_data ? ICON_ARROW_DOWN : ICON_ARROW_UP, ""))) {
-                hide_server_data = !hide_server_data;
-                generate_servers_names();
-            }
-
-            // Copy to clipboard button
-            GuiSetTooltip("Copy server to clipboard");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*2 - ITEM_HEIGHT*3, y, ITEM_HEIGHT, ITEM_HEIGHT},
-                          GuiIconText(ICON_LAYERS, ""))) {
-                char format[] = "name=\"%s\";ip=\"%s\";tcp_port=%d;udp_port=%d;";
-                const int buf_len = sizeof(format) + SERVERNAME_LEN + INET_ADDRSTRLEN + /*tcp_port*/5 + /*udp_port*/5;
-                char *buf = malloc(buf_len);
-                snprintf(buf, buf_len, format,
-                         config_table_get(selected_server, "name")->v.s.p,
-                         config_table_get(selected_server, "ip")->v.s.p,
-                         (int)config_table_get(selected_server, "tcp_port")->v.i,
-                         (int)config_table_get(selected_server, "udp_port")->v.i);
-                SetClipboardText(buf);
-                free(buf);
-            }
-
-            // Paste from clipboard button
-            GuiSetTooltip("Paste server from clipboard");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING - ITEM_HEIGHT*2, y, ITEM_HEIGHT, ITEM_HEIGHT},
-                          GuiIconText(ICON_FILE_OPEN, ""))) {
-                paste_server(GetClipboardText(), &selected_server, &selected_server_idx);
-                generate_servers_names();
-            }
-
-            // Delete server button
-            GuiSetTooltip("Delete server");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_HEIGHT, y, ITEM_HEIGHT, ITEM_HEIGHT}, GuiIconText(ICON_BIN, ""))) {
-                char *server_name = config_table_get(selected_server, "name")->v.s.p;
-                if (strcmp(server_name, "--custom--") == 0) {
-                    // Set "--custom--" server to default
-                    strcpy(config_table_get(selected_server, "ip")->v.s.p, DEFAULT_SERVER);
-                    config_value_set(config_table_get(selected_server, "tcp_port"), config_int(TCP_PORT));
-                    config_value_set(config_table_get(selected_server, "udp_port"), config_int(UDP_PORT));
-                } else {
-                    // Remove server
-                    config_array_remove(ctx.settings_servers, selected_server_idx);
-                    selected_server = config_array_get(ctx.settings_servers, selected_server_idx)->v.t;
-                    generate_servers_names();
-                }
-            }
-
-            GuiDisableTooltip();
-
-            STYLE_END(); // TEXT_SIZE
-            
-            GuiUnlock();
-        });
-    }
-    
     y = team_dropdown_y;
     ITEM("Team", 0, y, {
         const int dropdown_width = 100;
@@ -3620,6 +3550,82 @@ GameMenu new_menu(void) {
         }
         
     });
+
+    if (ctx.settings_servers != NULL) {
+        y = server_dropdown_y;
+        ITEM("Server", 0, y, {
+            // Servers dropdown
+            static bool server_dropdown_mode = false;
+
+            if (!active_gui && !server_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
+
+            if (GuiDropdownBox((Rectangle){ITEM_X, y, ITEM_W - ITEM_INNER_SPACING*4 - ITEM_HEIGHT*4, ITEM_HEIGHT},
+                               ctx.settings_servers_names.str, &selected_server_idx, server_dropdown_mode)) {
+                server_dropdown_mode = !server_dropdown_mode;
+            }
+            selected_server = config_array_get(ctx.settings_servers, selected_server_idx)->v.t;
+
+            if (server_dropdown_mode) active_dropdown = true;
+
+            STYLE_START(DEFAULT, TEXT_SIZE, 10);
+            
+            // Hide/show server data button
+            GuiEnableTooltip();
+            GuiSetTooltip("Hide/show server data");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*3 - ITEM_HEIGHT*4, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(hide_server_data ? ICON_ARROW_DOWN : ICON_ARROW_UP, ""))) {
+                hide_server_data = !hide_server_data;
+                generate_servers_names();
+            }
+
+            // Copy to clipboard button
+            GuiSetTooltip("Copy server to clipboard");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*2 - ITEM_HEIGHT*3, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(ICON_LAYERS, ""))) {
+                char format[] = "name=\"%s\";ip=\"%s\";tcp_port=%d;udp_port=%d;";
+                const int buf_len = sizeof(format) + SERVERNAME_LEN + INET_ADDRSTRLEN + /*tcp_port*/5 + /*udp_port*/5;
+                char *buf = malloc(buf_len);
+                snprintf(buf, buf_len, format,
+                         config_table_get(selected_server, "name")->v.s.p,
+                         config_table_get(selected_server, "ip")->v.s.p,
+                         (int)config_table_get(selected_server, "tcp_port")->v.i,
+                         (int)config_table_get(selected_server, "udp_port")->v.i);
+                SetClipboardText(buf);
+                free(buf);
+            }
+
+            // Paste from clipboard button
+            GuiSetTooltip("Paste server from clipboard");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING - ITEM_HEIGHT*2, y, ITEM_HEIGHT, ITEM_HEIGHT},
+                          GuiIconText(ICON_FILE_OPEN, ""))) {
+                paste_server(GetClipboardText(), &selected_server, &selected_server_idx);
+                generate_servers_names();
+            }
+
+            // Delete server button
+            GuiSetTooltip("Delete server");
+            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_HEIGHT, y, ITEM_HEIGHT, ITEM_HEIGHT}, GuiIconText(ICON_BIN, ""))) {
+                char *server_name = config_table_get(selected_server, "name")->v.s.p;
+                if (strcmp(server_name, "--custom--") == 0) {
+                    // Set "--custom--" server to default
+                    strcpy(config_table_get(selected_server, "ip")->v.s.p, DEFAULT_SERVER);
+                    config_value_set(config_table_get(selected_server, "tcp_port"), config_int(TCP_PORT));
+                    config_value_set(config_table_get(selected_server, "udp_port"), config_int(UDP_PORT));
+                } else {
+                    // Remove server
+                    config_array_remove(ctx.settings_servers, selected_server_idx);
+                    selected_server = config_array_get(ctx.settings_servers, selected_server_idx)->v.t;
+                    generate_servers_names();
+                }
+            }
+
+            GuiDisableTooltip();
+
+            STYLE_END(); // TEXT_SIZE
+            
+            GuiUnlock();
+        });
+    }
     
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
     STYLE_END(); // TEXT_SIZE
@@ -3692,92 +3698,6 @@ GameMenu join_menu(void) {
     int server_dropdown_y = y;
     if (ctx.settings_servers != NULL)
         y += ITEM_HEIGHT + ITEM_SPACING;
-    
-    // Server data
-    if (!hide_server_data && ctx.settings_servers != NULL && selected_server != NULL) {
-        // Server name
-        ITEM("Name", 50, y, {
-            static bool server_textbox_mode = false;
-
-            char *servername = config_table_get(selected_server, "name")->v.s.p;
-            int *servername_len = &config_table_get(selected_server, "name")->v.s.l;
-            bool custom_server = strcmp(servername, "--custom--") == 0;
-        
-            STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, servername, SERVERNAME_LEN, server_textbox_mode)) {
-                server_textbox_mode = !server_textbox_mode;
-                if (server_textbox_mode == false) {
-                    *servername_len = strlen(servername);
-                    generate_servers_names();
-                }
-            }
-            STYLE_END();
-
-            if (custom_server && strcmp(servername, "--custom--") != 0) {
-                // Add new "--custom--" server
-                ConfigValue new_v = config_table();
-                ConfigTable *new_t = new_v.v.t;
-                
-                ConfigValue name_value = config_string("--custom--");
-                name_value.v.s.p = realloc(name_value.v.s.p, SERVERNAME_LEN);
-                config_table_insert(new_t, "name", name_value);
-
-                ConfigValue ip_value = config_string(DEFAULT_SERVER);
-                ip_value.v.s.p = realloc(ip_value.v.s.p, INET6_ADDRSTRLEN);
-                config_table_insert(new_t, "ip", ip_value);
-                
-                config_table_insert(new_t, "tcp_port", config_int(TCP_PORT));
-                config_table_insert(new_t, "udp_port", config_int(UDP_PORT));
-                
-                ConfigValue valid_value = config_bool(true);
-                valid_value.displayed = false;
-                config_table_insert(new_t, "valid", valid_value);
-                
-                config_array_append(ctx.settings_servers, new_v);
-
-                generate_servers_names();
-            }
-
-            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
-         });
-
-        ITEM("Server IP", 50, y, {
-            static bool server_textbox_mode = false;
-        
-            STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, config_table_get(selected_server, "ip")->v.s.p, INET_ADDRSTRLEN, server_textbox_mode))
-                server_textbox_mode = !server_textbox_mode;
-            STYLE_END();
-
-            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
-        });
-
-        const int port_textbox_width = 70;
-            
-        ITEM("TCP port", 50, y, {
-            static bool tcp_valuebox_mode = false;
-        
-            long *settings_tcp_port = &config_table_get(selected_server, "tcp_port")->v.i;
-            int tcp_port = *settings_tcp_port;
-            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &tcp_port, 0, 65535, tcp_valuebox_mode))
-                tcp_valuebox_mode = !tcp_valuebox_mode;
-            *settings_tcp_port = tcp_port;
-        
-            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
-        });
-
-        ITEM("UDP port", 50, y, {
-            static bool udp_valuebox_mode = false;
-
-            long *settings_udp_port = &config_table_get(selected_server, "udp_port")->v.i;
-            int udp_port = *settings_udp_port;
-            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &udp_port, 0, 65535, udp_valuebox_mode))
-                udp_valuebox_mode = !udp_valuebox_mode;
-            *settings_udp_port = udp_port;
-
-            y += ITEM_HEIGHT + ITEM_SPACING;
-        });
-    }
     
     ITEM("Chunk size", 0, y, {
         static bool chunk_spinner_mode = false;
@@ -5065,10 +4985,10 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
 
             Color color = RAYWHITE;
             switch (area.team) {
-                case TEAM_RED: color = ColorAlpha(RED, (ctx.mode == MODE_AREAS)? 0.20f: 0.08f); break;
-                case TEAM_BLUE: color = ColorAlpha(BLUE, (ctx.mode == MODE_AREAS)? 0.20f: 0.08f); break;
-                case TEAM_GREEN: color = ColorAlpha(GREEN, (ctx.mode == MODE_AREAS)? 0.20f: 0.08f); break;
-                case TEAM_YELLOW: color = ColorAlpha(ORANGE, (ctx.mode == MODE_AREAS)? 0.20f: 0.08f); break;
+                case TEAM_RED: color = ColorAlpha(RED, (ctx.mode == MODE_AREAS)? 0.50f: 0.30f); break;
+                case TEAM_BLUE: color = ColorAlpha(BLUE, (ctx.mode == MODE_AREAS)? 0.50f: 0.30f); break;
+                case TEAM_GREEN: color = ColorAlpha(GREEN, (ctx.mode == MODE_AREAS)? 0.50f: 0.30f); break;
+                case TEAM_YELLOW: color = ColorAlpha(ORANGE, (ctx.mode == MODE_AREAS)? 0.50f: 0.30f); break;
             }
             DrawRectangle(area.rec.x1 * BOID_SIZE, area.rec.y1 * BOID_SIZE,
                           (area.rec.x2 - area.rec.x1) * BOID_SIZE, (area.rec.y2 - area.rec.y1) * BOID_SIZE, color);
@@ -5235,10 +5155,20 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
             if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_MODE_SPAWN);
             btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
 
+            GuiSetState(ctx.mode == MODE_SELECT ? STATE_PRESSED : STATE_NORMAL);
+            set_button_tooltip(IE_MODE_SELECT, "Select mode");
+            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BOX_DOTS_BIG, ""))) GUI_EVENT(IE_MODE_SELECT);
+            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            
             GuiSetState(ctx.mode == MODE_DELETE ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_MODE_DELETE, "Delete mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BIN, ""))) GUI_EVENT(IE_MODE_DELETE);
+            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_RUBBER, ""))) GUI_EVENT(IE_MODE_DELETE);
             btn_x += BUTTON_SIZE + GROUP_DISTANCE;
+
+            GuiSetState(GET_EVENT(IE_DELETE_SELECTED_BOIDS) ? STATE_PRESSED : STATE_NORMAL);
+            set_button_tooltip(IE_DELETE_SELECTED_BOIDS, "Delete selected");
+            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BIN, ""))) GUI_EVENT(IE_DELETE_SELECTED_BOIDS);
+            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
         
             GuiSetState((ctx.boids_count == ctx.boids_number[ctx.player_team]) ? STATE_NORMAL : STATE_DISABLED);
             set_button_tooltip(IE_READY, "Ready");
@@ -5341,7 +5271,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
 
         int btn_y = ctx.screen_height / 2;
 
-        if (ctx.mode == MODE_SPAWN && !ctx.local_game) {
+        if ((ctx.mode == MODE_SPAWN || ctx.mode == MODE_DELETE) && !ctx.local_game) {
             GuiSetState(STATE_NORMAL);
             set_button_tooltip(IE_BRUSH_REDUCE, "Reduce brush size");
             if (GuiButton((Rectangle){ctx.screen_width - BUTTON_MARGIN - SMALL_BUTTON_SIZE, btn_y, SMALL_BUTTON_SIZE, SMALL_BUTTON_SIZE}, GuiIconText(ICON_BOX_MINUS_FILL, ""))) GUI_EVENT(IE_BRUSH_REDUCE);
@@ -5556,7 +5486,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
                         str = "- : -";
                 }
             } else if (ctx.stage == STAGE_GAME) {
-                str = TextFormat("%s: %d", ctx.players[player_idx].name, ctx.boids_number[team]);
+                str = TextFormat("%s: %d", player_joined? ctx.players[player_idx].name : "-", ctx.boids_number[team]);
             }
 
             if (str != NULL)

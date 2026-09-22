@@ -1,10 +1,10 @@
+#ifndef KDTREE_H
+#define KDTREE_H
+
 #include <raylib.h>
 #include <stdbool.h>
 
 #include "boids.h"
-
-#ifndef KDTREE_H
-#define KDTREE_H
 
 #define X_AXIS 1
 #define Y_AXIS 0

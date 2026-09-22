@@ -1,11 +1,11 @@
+#ifndef BOIDS_H
+#define BOIDS_H
+
 #define RAYMATH_STATIC_INLINE
 #include <raymath.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
-
-#ifndef BOIDS_H
-#define BOIDS_H
 
 #define MAX_BOIDS_COUNT 6000
 #define BOID_MAX_SPEED 1.5f

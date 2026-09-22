@@ -159,7 +159,7 @@ or
 ```
 
 > [!NOTE]
-> The client requires [**Raylib**](https://www.raylib.com) installed
+> The client requires [**Raylib**](https://www.raylib.com) installed with version **not lower than 6.0**
 
 You can define macros in `build.c` for customizing build process:
   - `CC` - C Compiler (default: `"cc"`)

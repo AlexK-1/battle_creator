@@ -1,3 +1,6 @@
+#ifndef NETWORK_H
+#define NETWORK_H
+
 #ifndef _WIN32
     #include <sys/socket.h>
 #else
@@ -5,10 +8,6 @@
 #endif
 #include <stdint.h>
 #include <stddef.h>
-#include "boids.h"
-
-#ifndef NETWORK_H
-#define NETWORK_H
 
 #define DEFAULT_SERVER "127.0.0.1"
 #define TCP_PORT 3440
