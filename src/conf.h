@@ -90,7 +90,6 @@ Example program:
 #include <stdio.h>
 
 typedef enum {
-    CONF_REMOVED,
     CONF_INT,
     CONF_BOOL,
     CONF_STRING,
@@ -100,6 +99,7 @@ typedef enum {
 
 typedef struct {
     ConfigValueType type;
+    bool removed;
     bool displayed;
     union {
         struct {

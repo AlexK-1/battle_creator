@@ -89,27 +89,22 @@ static void table_insert(ConfigTable *table, char *key, ConfigValue value) {
     new_node->value = value;
     new_node->l = new_node->r = NULL;
 
-    ConfigTreeNode **node = &table->nodes, *parent = NULL;
-    bool left_child = false;
+    ConfigTreeNode **node = &table->nodes;
 
-    while (*node != NULL && (*node)->value.type != CONF_REMOVED) {
+    while (*node != NULL && !(*node)->value.removed) {
         // Replace the value with the same key
         if (hash == (*node)->hash && strcmp(key, (*node)->key) == 0) {
-            (*node)->value.type = CONF_REMOVED;
+            (*node)->value.removed = true;
             break;
         }
 
-        parent = *node;
-        if (hash <= (*node)->hash) {
-            left_child = true;
+        if (hash <= (*node)->hash)
             node = &(*node)->l;
-        } else {
-            left_child = false;
+        else
             node = &(*node)->r;
-        }
     }
 
-    bool old_value_removed = *node != NULL && (*node)->value.type == CONF_REMOVED;
+    bool old_value_removed = *node != NULL && (*node)->value.removed;
     ConfigTreeNode *old_node = *node;
     
     if (old_value_removed) {
@@ -163,7 +158,7 @@ ConfigValue *config_table_get(ConfigTable *table, const char *key) {
         else if (hash > node->hash)
             node = node->r;
         else {
-            if (strcmp(node->key, key) == 0 && node->value.type != CONF_REMOVED)
+            if (strcmp(node->key, key) == 0 && !node->value.removed)
                 break;
             else
                 node = node->l;
@@ -179,7 +174,7 @@ ConfigValue *config_table_get(ConfigTable *table, const char *key) {
 void config_table_remove(ConfigTable *table, const char *key) {
     ConfigValue *value = config_table_get(table, key);
     value_free(value);
-    value->type = CONF_REMOVED;
+    value->removed = true;
 }
 
 static void node_free(ConfigTreeNode *node) {
@@ -641,11 +636,10 @@ static void write_array(char *key, ConfigArray *array, FILE *file);
 static void write_table(char *key, ConfigTable *table, bool array, FILE *file);
 
 static void write_value(char *key, ConfigValue *value, FILE *file) {
-    if (!value->displayed)
+    if (!value->displayed || value->removed)
         return;
     
     switch (value->type) {
-        case CONF_REMOVED: break;
         case CONF_STRING:
             fprintf(file, "%s = \"", key);
             basic_to_escape_string(value->v.s.p, strlen(value->v.s.p), file);
