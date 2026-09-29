@@ -125,17 +125,13 @@ static void table_insert(ConfigTable *table, char *key, ConfigValue value) {
 
     struct config_table_nodes_t *nodes_list = (value.type == CONF_TABLE || value.type == CONF_ARRAY) ? &table->labels : &table->data;
 
-    if (old_value_removed && parent != NULL) {
-        // Replace child-pointer in the parent
-        if (left_child)
-            parent->l = new_node;
-        else
-            parent->r = new_node;
-        
+    if (old_value_removed) {
         // Replace old node-pointer from the nodes list
         for (int i = 0; i < nodes_list->count; i++) {
-            if (nodes_list->nodes[i] == old_node)
+            if (nodes_list->nodes[i] == old_node) {
                 nodes_list->nodes[i] = new_node;
+                break;
+            }
         }
     } else {
         // Add new node to the list

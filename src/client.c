@@ -46,6 +46,17 @@
 #define DEFAULT_USERNAME "noname"
 #define DEFAULT_SETTINGS_FILE "settings.cfg"
 #define SERVERNAME_LEN 32
+#define DEFAULT_HIDE_GUI false
+#define DEFAULT_AUTOSELECT true
+#define DEFAULT_HIDE_AREAS false
+
+#define DEFAULT_GUI_SIZE 20
+#define MIN_GUI_SIZE 5
+#define MAX_GUI_SIZE 100
+
+#define DEFAULT_TEXT_SIZE 20
+#define MIN_TEXT_SIZE 3
+#define MAX_TEXT_SIZE 100
 
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
@@ -64,10 +75,10 @@
 
 #define STYLE_START(control, property, value)                                                        \
     do {                                                                                             \
-        int __old_gui_value = GuiGetStyle(control, property);                                        \
         int __gui_style_control = control;                                                           \
         int __gui_style_property = property;                                                         \
-        GuiSetStyle(control, property, value)
+        int __old_gui_value = GuiGetStyle(__gui_style_control, __gui_style_property);                \
+        GuiSetStyle(__gui_style_control, __gui_style_property, value)
 
 #define STYLE_END()                                                                                  \
         GuiSetStyle(__gui_style_control, __gui_style_property, __old_gui_value);                     \
@@ -162,7 +173,7 @@ ClientPlayer *find_player(ClientPlayer *players, uint32_t id) {
 }
 
 
-/* <================================================= NETWORK THREAD =================================================> */
+/* <=========================================== NETWORK THREAD AND CONTEXT ===========================================> */
 
 #define INPUT_STRING_LEN 1024
 
@@ -195,6 +206,15 @@ typedef enum {
     MESSAGE_WARNING,
     MESSAGE_ERROR
 } MenuMessageType;
+
+typedef enum {
+    FGMENU_NONE = 0,
+    FGMENU_CLOSE_GAME,
+    FGMENU_EXIT_ROOM,
+    FGMENU_PAUSE,
+    FGMENU_CLEAR_DATA,
+    FGMENU_RESET_SETTINGS
+} ForegroundMenuType;
 
 typedef struct {
     // String input
@@ -245,7 +265,7 @@ typedef struct {
 
     // Game control
     bool show_log, show_grid, show_health, game_paused, show_arrow, autoselect_mode, show_gui;
-    bool is_dragging_border, change_boids_direction, exit_game_message;
+    bool is_dragging_border, change_boids_direction;
     int brush_size;
     BoidAction action;
     Camera2D camera;
@@ -254,9 +274,12 @@ typedef struct {
     unsigned long long events, gui_events;
     unsigned short modifiers;
     bool show_line;
+    ForegroundMenuType foreground_menu;
 
     // Settings
     ConfigTable *settings;
+    char *settings_file_name;
+    bool save_settings_file;
     bool settings_hide_gui, settings_autoselect;
     ConfigArray *settings_servers;
     ConfigTable *settings_custom_server;
@@ -264,6 +287,9 @@ typedef struct {
         char *str;
         int len, capacity;
     } settings_servers_names;
+    float settings_gui_scale, settings_text_scale; // 1.0 - default
+    int settings_gui_value, settings_text_value; // 20 - default
+    int text_size, line_height, icon_size;
     
     // Changes from the second (network) thread
     GameMenu next_menu;
@@ -294,7 +320,7 @@ GameContext ctx = {.running = true, .stage = STAGE_AREAS, .mode = MODE_WAIT, .ch
                    .players_number = DEFAULT_PLAYERS_COUNT, .world_size = {DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y},
                    .username = DEFAULT_USERNAME, .server = DEFAULT_SERVER, .tcp_port = TCP_PORT, .udp_port = UDP_PORT,
                    .show_log = true, .autoselect_mode = true, .show_gui = true, .brush_size = 1, .action = ACT_STOP,
-                   .selecting_team = TEAM_RED, .tps_display_type = TPS_NUM};
+                   .settings_file_name = DEFAULT_SETTINGS_FILE, .selecting_team = TEAM_RED, .tps_display_type = TPS_NUM};
 
 // The message will disappear after the first moving to next menu if save_message is not true
 void set_menu_message(MenuMessageType type, bool save_message, const char *msg) {
@@ -335,18 +361,24 @@ pthread_mutex_t players_mtx;
         }                                                                                                                   \
     } while (0)
 
+int _check_field(int condition, uint8_t packet_type) {
+    if (condition)
+        return 0;
+
+    log_message(&ctx.log, L_ERROR, "invalid SP#%d packet: field check failed\n", packet_type);
+    pthread_mutex_unlock(&areas_mtx);
+    pthread_mutex_unlock(&boids_mtx);
+    pthread_mutex_unlock(&running_mtx);
+    pthread_mutex_unlock(&next_menu_mtx);
+    pthread_mutex_unlock(&input_mtx);
+    pthread_mutex_unlock(&players_mtx);
+    return 1;
+}
+
 #define CHECK_FIELD(expr)                                                                                                   \
     do {                                                                                                                    \
-        if (!(expr)) {                                                                                                      \
-            log_message(&ctx.log, L_ERROR, "invalid SP#%d packet: field check failed\n", packet_type);                      \
-            pthread_mutex_unlock(&areas_mtx);                                                                               \
-            pthread_mutex_unlock(&boids_mtx);                                                                               \
-            pthread_mutex_unlock(&running_mtx);                                                                             \
-            pthread_mutex_unlock(&next_menu_mtx);                                                                           \
-            pthread_mutex_unlock(&input_mtx);                                                                               \
-            pthread_mutex_unlock(&players_mtx);                                                                             \
+        if (_check_field(expr, packet_type))                                                                                \
             return 1;                                                                                                       \
-        }                                                                                                                   \
     } while (0)
 
 int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
@@ -1567,7 +1599,7 @@ typedef enum {
     IE_DELETE_SELECTED_BOIDS,
     IE_PAUSE,
     IE_CHANGE_GUI_DISPLAY,
-    IE_EXIT_GAME,
+    IE_EXIT_ROOM,
     IE_CHAT_MSG,
     IE_INPUT_START,
     IE_COMMAND,
@@ -1657,7 +1689,7 @@ InputBinding bindings[] = {
     [IE_DELETE_SELECTED_BOIDS]  = {.kb1 = KEY_X, .gstage1 = STAGE_PLACING, .gmode = MODE_SELECT, .gloc = true},
     [IE_PAUSE]                  = {.kb1 = KEY_SPACE, .goloc = true},
     [IE_CHANGE_GUI_DISPLAY]     = {.kb1 = KEY_I},
-    [IE_EXIT_GAME]              = {.kb1 = KEY_Q, .kb_mod = IMOD_CTRL},
+    [IE_EXIT_ROOM]              = {.kb1 = KEY_Q, .kb_mod = IMOD_CTRL},
     [IE_CHAT_MSG]               = {.kb1 = KEY_SPACE, .gomul = true},
     [IE_INPUT_START]            = {.kb1 = KEY_SPACE, .gomul = true},
     [IE_COMMAND]                = {.kb1 = KEY_SLASH, .kb2 = KEY_KP_DIVIDE, .gomul = true},
@@ -1769,7 +1801,7 @@ void handle_input() {
             case IE_CLEAR_ORDERS: ctx.clear_order = ctx.select_mode; break;
             case IE_PAUSE: ctx.game_paused = !ctx.game_paused; break;
             case IE_CHANGE_GUI_DISPLAY: ctx.show_gui = !ctx.show_gui; break;
-            case IE_EXIT_GAME: ctx.exit_game_message = true; break;
+            case IE_EXIT_ROOM: if (ctx.foreground_menu == FGMENU_NONE) ctx.foreground_menu = FGMENU_EXIT_ROOM; break;
 
             case IE_CHAT_MSG:
             case IE_INPUT_START:
@@ -1971,6 +2003,226 @@ Texture2D generate_boids_texture(Image image, Color clothes_tint) {
     return result_tex;
 }
 
+void open_settings(const char *file_name) {
+    // Open settings file for reading
+    FILE *settings_file = fopen(file_name, "r");
+    ctx.save_settings_file = true;
+    
+    if (settings_file == NULL) {
+        // If file does not exists, init empty table
+        ctx.settings = config_table_init();
+
+        log_message(&ctx.log, L_WARNING, "failed to open '%s' settings file for reading\n", file_name);
+        set_menu_message(MESSAGE_INFO, false, "Settings file not found");
+    } else {
+        // Parse settings file
+        
+        ConfigFailData fail;
+        ctx.settings = config_parse_file(settings_file, &fail);
+        if (fail.fail) {
+            log_message(&ctx.log, L_WARNING, "error in '%s' settings file at %d:%d", file_name, fail.pos.line, fail.pos.col);
+            set_menu_message(MESSAGE_WARNING, false, TextFormat("Error in '%s' settings file at %d:%d", file_name, fail.pos.line, fail.pos.col));
+
+            // Free table
+            config_table_free(ctx.settings);
+            ctx.settings = NULL;
+
+            // Init empty table
+            ctx.settings = config_table_init();
+            ctx.save_settings_file = false;
+        }
+
+        fclose(settings_file);
+    }
+}
+
+void process_settings() {
+    if (ctx.settings == NULL)
+        return;
+
+    if (!ctx.cli_run) {
+        // Username
+        ConfigValue *username_value = config_table_get(ctx.settings, "username");
+        if (username_value != NULL && username_value->type == CONF_STRING) {
+            strncpy(ctx.username, username_value->v.s.p, USERNAME_LEN);
+            ctx.username[USERNAME_LEN-1] = '\0';
+        }
+
+        // Hide areas
+        ConfigValue *hide_areas_value = config_table_get(ctx.settings, "hide_areas");
+        ctx.hide_areas = (hide_areas_value != NULL && (hide_areas_value->type == CONF_BOOL || hide_areas_value->type == CONF_INT)) ? hide_areas_value->v.b : DEFAULT_HIDE_AREAS;
+
+        // Hide GUI
+        ConfigValue *hide_gui_value = config_table_get(ctx.settings, "hide_gui");
+        ctx.settings_hide_gui = (hide_gui_value != NULL && (hide_gui_value->type == CONF_BOOL || hide_gui_value->type == CONF_INT)) ? hide_gui_value->v.b : DEFAULT_HIDE_GUI;
+    }
+
+    // Autoselect mode
+    ConfigValue *autoselect_value = config_table_get(ctx.settings, "autoselect");
+    ctx.settings_autoselect = (autoselect_value != NULL && (autoselect_value->type == CONF_BOOL || autoselect_value->type == CONF_INT)) ? autoselect_value->v.b : DEFAULT_AUTOSELECT;
+    
+    // Interface size
+    ConfigValue *gui_size_value = config_table_get(ctx.settings, "gui_size");
+    ctx.settings_gui_scale = ((gui_size_value != NULL && gui_size_value->type == CONF_INT) ? gui_size_value->v.i : DEFAULT_GUI_SIZE) / 20.0f;
+    if (ctx.settings_gui_scale < MIN_GUI_SIZE / 20.0f)
+        ctx.settings_gui_scale = MIN_GUI_SIZE / 20.0f;
+    else if (ctx.settings_gui_scale > MAX_GUI_SIZE / 20.0f)
+        ctx.settings_gui_scale = MAX_GUI_SIZE / 20.0f;
+    ctx.settings_gui_value = ctx.settings_gui_scale * 20;
+
+    // Text size
+    ConfigValue *text_size_value = config_table_get(ctx.settings, "text_size");
+    ctx.settings_text_scale = ((text_size_value != NULL && text_size_value->type == CONF_INT) ? text_size_value->v.i : DEFAULT_TEXT_SIZE) / 20.0f;
+    if (ctx.settings_text_scale < MIN_TEXT_SIZE / 20.0f)
+        ctx.settings_text_scale = MIN_TEXT_SIZE / 20.0f;
+    else if (ctx.settings_text_scale > MAX_TEXT_SIZE / 20.0f)
+        ctx.settings_text_scale = MAX_TEXT_SIZE / 20.0f;
+    ctx.settings_text_value = ctx.settings_text_scale * 20;
+    
+    // Servers list
+    ConfigValue *servers_value = config_table_get(ctx.settings, "servers");
+    
+    // Remove invalid value
+    if (servers_value != NULL && servers_value->type != CONF_ARRAY) {
+        config_table_remove(ctx.settings, "servers");
+        servers_value = NULL;
+    }
+
+    // Add empty array
+    if (servers_value == NULL) {
+        ConfigValue v = config_array();
+        config_table_insert(ctx.settings, "servers", v);
+        servers_value = config_table_get(ctx.settings, "servers");
+    }
+
+    ctx.settings_servers = servers_value->v.a;
+    
+    // Add "custom" server
+    ConfigValue new_v = config_table();
+    ConfigTable *new_t = new_v.v.t;
+    config_table_insert(new_t, "name", config_string("--custom--"));
+    if (ctx.cli_run) {
+        config_table_insert(new_t, "ip", config_string(ctx.server));
+        config_table_insert(new_t, "tcp_port", config_int(ctx.tcp_port));
+        config_table_insert(new_t, "udp_port", config_int(ctx.udp_port));
+    } else {
+        config_table_insert(new_t, "ip", config_string(DEFAULT_SERVER));
+    }
+    config_array_append(ctx.settings_servers, new_v);
+    ctx.settings_custom_server = new_t;
+    
+    for (int i = 0; i < config_array_len(ctx.settings_servers); i++) {
+        bool valid = true;
+        
+        ConfigValue *v = config_array_get(ctx.settings_servers, i);
+        ConfigTable *t = NULL;
+        if (v->type != CONF_TABLE) {
+            valid = false;
+            goto invalid_server;
+        }
+        t = v->v.t;
+
+        // Server name
+        ConfigValue *name_value = config_table_get(t, "name");
+        if (name_value == NULL || name_value->type != CONF_STRING) {
+            valid = false;
+            goto invalid_server;
+        }
+        name_value->v.s.p = realloc(name_value->v.s.p, SERVERNAME_LEN);
+
+        // Server IP
+        ConfigValue *ip_value = config_table_get(t, "ip");
+        if (name_value == NULL || ip_value->type != CONF_STRING) {
+            valid = false;
+            goto invalid_server;
+        }
+        ip_value->v.s.p = realloc(ip_value->v.s.p, INET_ADDRSTRLEN);
+
+        // TCP port
+        ConfigValue *tcp_value = config_table_get(t, "tcp_port");
+        if (tcp_value != NULL && tcp_value->type != CONF_INT) // Remove invalid value
+            config_table_remove(t, "tcp_port");
+        if (tcp_value == NULL || tcp_value->type != CONF_INT) // Insert default value
+            config_table_insert(t, "tcp_port", config_int(TCP_PORT));
+
+        // UDP port
+        ConfigValue *udp_value = config_table_get(t, "udp_port");
+        if (udp_value != NULL && udp_value->type != CONF_INT) // Remove invalid value
+            config_table_remove(t, "udp_port");
+        if (udp_value == NULL || udp_value->type != CONF_INT) // Insert default value
+            config_table_insert(t, "udp_port", config_int(UDP_PORT));
+        
+        invalid_server:
+        if (t != NULL) {
+            ConfigValue valid_value = config_bool(valid);
+            valid_value.displayed = false;
+            config_table_insert(t, "valid", valid_value);
+        }
+    }
+}
+
+void save_settings() {
+    if (ctx.settings == NULL)
+        return;
+    
+    // Open settings file for writing
+    FILE *settings_file = fopen(ctx.settings_file_name, "w");
+    if (settings_file == NULL) {
+        log_message(&ctx.log, L_WARNING, "failed to save '%s' settings file\n", ctx.settings_file_name);
+    } else {
+        // Update values
+        
+        config_table_insert(ctx.settings, "username", config_string(ctx.username));
+
+        config_table_insert(ctx.settings, "hide_areas", config_bool(ctx.hide_areas));
+
+        config_table_insert(ctx.settings, "hide_gui", config_bool(ctx.settings_hide_gui));
+
+        config_table_insert(ctx.settings, "autoselect", config_bool(ctx.settings_autoselect));
+
+        config_table_insert(ctx.settings, "gui_size", config_int(ctx.settings_gui_value));
+
+        config_table_insert(ctx.settings, "text_size", config_int(ctx.settings_text_value));
+
+        // Remove "--custom--" server from config (it should not be saved to a file)
+        if (ctx.settings_servers != NULL) {
+            for (int i = 0; i < config_array_len(ctx.settings_servers); i++) {
+                ConfigTable *t = config_array_get(ctx.settings_servers, i)->v.t;
+                if (!config_table_get(t, "valid"))
+                    continue;
+                char *server_name = config_table_get(t, "name")->v.s.p;
+                if (strcmp(server_name, "--custom--") == 0)
+                    config_array_remove(ctx.settings_servers, i);
+            }
+        }
+        
+        // Save config file
+        config_write_table(ctx.settings, settings_file);
+        fclose(settings_file);
+    }
+
+    // Restore "--custom--" server
+    ConfigValue custom_v = config_table();
+    ConfigTable *custom_t = custom_v.v.t;
+    
+    ConfigValue name_value = config_string("--custom--");
+    name_value.v.s.p = realloc(name_value.v.s.p, SERVERNAME_LEN);
+    config_table_insert(custom_t, "name", name_value);
+
+    ConfigValue ip_value = config_string(DEFAULT_SERVER);
+    ip_value.v.s.p = realloc(ip_value.v.s.p, INET6_ADDRSTRLEN);
+    config_table_insert(custom_t, "ip", ip_value);
+    
+    config_table_insert(custom_t, "tcp_port", config_int(TCP_PORT));
+    config_table_insert(custom_t, "udp_port", config_int(UDP_PORT));
+    
+    ConfigValue valid_value = config_bool(true);
+    valid_value.displayed = false;
+    config_table_insert(custom_t, "valid", valid_value);
+    
+    config_array_append(ctx.settings_servers, custom_v);
+}
+
 GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset);
 GameMenu main_menu(void);
 GameMenu new_menu(void);
@@ -1983,7 +2235,6 @@ int main(int argc, char **argv) {
     // room/player settings, argparse
     bool print_help = false;
     char *prog = argv[0];
-    char *settings_file_name = DEFAULT_SETTINGS_FILE;
 
     if (argc > 1 && (strcmp(argv[1], "new") == 0 || strcmp(argv[1], "n") == 0)) {
         ctx.new_room = true;
@@ -2020,7 +2271,7 @@ int main(int argc, char **argv) {
                 } else if (strcmp(arg, "--settings") == 0 || strcmp(arg, "-e") == 0) {
                     if (argc == 1) ERRF("no value for option '%s'\n", arg);
 
-                    settings_file_name = *(++argv);
+                    ctx.settings_file_name = *(++argv);
                     argc--;
                 }
 
@@ -2376,144 +2627,9 @@ int main(int argc, char **argv) {
     // Init log
     init_cstack(ctx.log, MAX_LOG_LEN);
 
-    // Open settings file for reading
-    FILE *settings_file = fopen(settings_file_name, "r");
-    bool save_settings = true;
-    
-    if (settings_file == NULL) {
-        // If file does not exists, init empty table
-        ctx.settings = config_table_init();
-
-        log_message(&ctx.log, L_WARNING, "failed to open '%s' settings file for reading\n", settings_file_name);
-        set_menu_message(MESSAGE_INFO, false, "Settings file not found");
-    } else {
-        // Parse settings file
-        
-        ConfigFailData fail;
-        ctx.settings = config_parse_file(settings_file, &fail);
-        if (fail.fail) {
-            log_message(&ctx.log, L_WARNING, "error in '%s' settings file at %d:%d", settings_file_name, fail.pos.line, fail.pos.col);
-            set_menu_message(MESSAGE_WARNING, false, TextFormat("Error in '%s' settings file at %d:%d", settings_file_name, fail.pos.line, fail.pos.col));
-
-            // Free table
-            config_table_free(ctx.settings);
-            ctx.settings = NULL;
-
-            // Init empty table
-            ctx.settings = config_table_init();
-            save_settings = false;
-        }
-
-        fclose(settings_file);
-    }
-
-    if (ctx.settings != NULL) {
-        if (!ctx.cli_run) {
-            // Username
-            ConfigValue *username_value = config_table_get(ctx.settings, "username");
-            if (username_value != NULL && username_value->type == CONF_STRING) {
-                strncpy(ctx.username, username_value->v.s.p, USERNAME_LEN);
-                ctx.username[USERNAME_LEN-1] = '\0';
-            }
-
-            // Hide areas
-            ConfigValue *hide_areas_value = config_table_get(ctx.settings, "hide_areas");
-            if (hide_areas_value != NULL && (hide_areas_value->type == CONF_BOOL || hide_areas_value->type == CONF_INT)) {
-                ctx.hide_areas = hide_areas_value->v.b;
-            }
-
-            // Hide GUI
-            ConfigValue *hide_gui_value = config_table_get(ctx.settings, "hide_gui");
-            if (hide_gui_value != NULL && (hide_gui_value->type == CONF_BOOL || hide_gui_value->type == CONF_INT)) {
-                ctx.settings_hide_gui = hide_gui_value->v.b;
-            }
-        }
-
-        // Autoselect mode
-        ConfigValue *autoselect_value = config_table_get(ctx.settings, "autoselect");
-        ctx.settings_autoselect = (autoselect_value != NULL && (autoselect_value->type == CONF_BOOL || autoselect_value->type == CONF_INT)) ? autoselect_value->v.b : true;
-        
-        // Servers list
-        ConfigValue *servers_value = config_table_get(ctx.settings, "servers");
-        
-        // Remove invalid value
-        if (servers_value != NULL && servers_value->type != CONF_ARRAY) {
-            config_table_remove(ctx.settings, "servers");
-            servers_value = NULL;
-        }
-
-        // Add empty array
-        if (servers_value == NULL) {
-            ConfigValue v = config_array();
-            config_table_insert(ctx.settings, "servers", v);
-            servers_value = config_table_get(ctx.settings, "servers");
-        }
-
-        ctx.settings_servers = servers_value->v.a;
-        
-        // Add "custom" server
-        ConfigValue new_v = config_table();
-        ConfigTable *new_t = new_v.v.t;
-        config_table_insert(new_t, "name", config_string("--custom--"));
-        if (ctx.cli_run) {
-            config_table_insert(new_t, "ip", config_string(ctx.server));
-            config_table_insert(new_t, "tcp_port", config_int(ctx.tcp_port));
-            config_table_insert(new_t, "udp_port", config_int(ctx.udp_port));
-        } else {
-            config_table_insert(new_t, "ip", config_string(DEFAULT_SERVER));
-        }
-        config_array_append(ctx.settings_servers, new_v);
-        ctx.settings_custom_server = new_t;
-        
-        for (int i = 0; i < config_array_len(ctx.settings_servers); i++) {
-            bool valid = true;
-            
-            ConfigValue *v = config_array_get(ctx.settings_servers, i);
-            ConfigTable *t = NULL;
-            if (v->type != CONF_TABLE) {
-                valid = false;
-                goto invalid_server;
-            }
-            t = v->v.t;
-
-            // Server name
-            ConfigValue *name_value = config_table_get(t, "name");
-            if (name_value == NULL || name_value->type != CONF_STRING) {
-                valid = false;
-                goto invalid_server;
-            }
-            name_value->v.s.p = realloc(name_value->v.s.p, SERVERNAME_LEN);
-
-            // Server IP
-            ConfigValue *ip_value = config_table_get(t, "ip");
-            if (name_value == NULL || ip_value->type != CONF_STRING) {
-                valid = false;
-                goto invalid_server;
-            }
-            ip_value->v.s.p = realloc(ip_value->v.s.p, INET_ADDRSTRLEN);
-
-            // TCP port
-            ConfigValue *tcp_value = config_table_get(t, "tcp_port");
-            if (tcp_value != NULL && tcp_value->type != CONF_INT) // Remove invalid value
-                config_table_remove(t, "tcp_port");
-            if (tcp_value == NULL || tcp_value->type != CONF_INT) // Insert default value
-                config_table_insert(t, "tcp_port", config_int(TCP_PORT));
-
-            // UDP port
-            ConfigValue *udp_value = config_table_get(t, "udp_port");
-            if (udp_value != NULL && udp_value->type != CONF_INT) // Remove invalid value
-                config_table_remove(t, "udp_port");
-            if (udp_value == NULL || udp_value->type != CONF_INT) // Insert default value
-                config_table_insert(t, "udp_port", config_int(UDP_PORT));
-            
-            invalid_server:
-            if (t != NULL) {
-                ConfigValue valid_value = config_bool(valid);
-                valid_value.displayed = false;
-                config_table_insert(t, "valid", valid_value);
-            }
-        }
-    }
+    // Read and process settings
+    open_settings(ctx.settings_file_name);
+    process_settings();
 
     // Run game for ./client new|join|local
     if (ctx.cli_run) {
@@ -2563,12 +2679,22 @@ int main(int argc, char **argv) {
     }
     UnloadImage(image);
 
-    bool exit_window = false, show_exit_message = false;
+    bool exit_window = false;
 
     while (!exit_window) {
         // if (WindowShouldClose()) show_exit_message = true;
         if (WindowShouldClose()) exit_window = true;
-        if (IsKeyPressed(KEY_ESCAPE)) show_exit_message = !show_exit_message;
+        // if (IsKeyPressed(KEY_ESCAPE) && ctx.foreground_menu == FGMENU_NONE && ctx.menu != MENU_GAME) ctx.foreground_menu = FGMENU_CLOSE_GAME;
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            if (ctx.foreground_menu == FGMENU_NONE) {
+                ctx.foreground_menu = (ctx.menu == MENU_GAME) ? FGMENU_PAUSE : FGMENU_CLOSE_GAME;
+            } else {
+                ctx.foreground_menu = FGMENU_NONE;
+            }
+        }
+        
+        ctx.text_size = roundf(20 * ctx.settings_text_scale);
+        ctx.line_height = roundf(20 * ctx.settings_text_scale + 2);
         
         ctx.screen_width = GetScreenWidth();
         ctx.screen_height = GetScreenHeight();
@@ -2580,8 +2706,10 @@ int main(int argc, char **argv) {
         
         ClearBackground(RAYWHITE);
 
-        if (show_exit_message)
+        if (ctx.foreground_menu != FGMENU_NONE)
             GuiLock();
+        
+        ForegroundMenuType old_fgmenu = ctx.foreground_menu;
         
         // Draw menu
         GameMenu next_menu = 0;
@@ -2643,7 +2771,7 @@ int main(int argc, char **argv) {
             GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
             GuiSetIconScale(2);
             STYLE_START(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(msg_color));
-            STYLE_START(DEFAULT, TEXT_SIZE, 20);
+            STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
             GuiLabel(msg_rectangle, GuiIconText(msg_icon, ctx.message_text));
             STYLE_END();
             STYLE_END();
@@ -2656,16 +2784,19 @@ int main(int argc, char **argv) {
         }
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
         
+        GuiUnlock();
+        
         // Display a message before exiting
-        if (show_exit_message) {
-            GuiUnlock();
-            DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Fade(RAYWHITE, 0.8f));
+        if (ctx.foreground_menu == FGMENU_CLOSE_GAME && old_fgmenu == ctx.foreground_menu) {
+            ctx.foreground_menu = FGMENU_CLOSE_GAME;
+
+            DrawRectangle(0, 0, ctx.screen_width, ctx.screen_height, Fade(RAYWHITE, 0.8f));
             int btn_active = -1;
             GuiMessageBox((Rectangle){ (float)GetScreenWidth()/2 - 125, (float)GetScreenHeight()/2 - 50, 250, 100 }, 
                 GuiIconText(ICON_EXIT, "Close Window"), "Do you really want to exit?", "Yes;No", &btn_active);
 
-            if ((btn_active == 0) || (btn_active == 2)) show_exit_message = false;
-            else if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) exit_window = true;
+            if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.foreground_menu = FGMENU_NONE;
+            if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) exit_window = true;
         }
 
         EndDrawing();
@@ -2687,54 +2818,8 @@ int main(int argc, char **argv) {
         free(ctx.settings_servers_names.str);
     
     // Save settings
-    if (ctx.settings != NULL && !ctx.cli_run && save_settings) {
-        // Open settings file for writing
-        settings_file = fopen(settings_file_name, "w");
-        if (settings_file == NULL) {
-            log_message(&ctx.log, L_WARNING, "failed to save '%s' settings file\n", settings_file_name);
-        } else {
-            // Update values
-            
-            ConfigValue *username_value = config_table_get(ctx.settings, "username");
-            if (username_value == NULL)
-                config_table_insert(ctx.settings, "username", config_string(ctx.username));
-            else
-                config_value_set(username_value, config_string(ctx.username));
-
-            ConfigValue *hide_areas_value = config_table_get(ctx.settings, "hide_areas");
-            if (hide_areas_value == NULL)
-                config_table_insert(ctx.settings, "hide_areas", config_bool(ctx.hide_areas));
-            else
-                config_value_set(hide_areas_value, config_bool(ctx.hide_areas));
-
-            ConfigValue *hide_gui_value = config_table_get(ctx.settings, "hide_gui");
-            if (hide_gui_value == NULL)
-                config_table_insert(ctx.settings, "hide_gui", config_bool(ctx.settings_hide_gui));
-            else
-                config_value_set(hide_gui_value, config_bool(ctx.settings_hide_gui));
-
-            ConfigValue *autoselect_value = config_table_get(ctx.settings, "autoselect");
-            if (autoselect_value == NULL)
-                config_table_insert(ctx.settings, "autoselect", config_bool(ctx.settings_autoselect));
-            else
-                config_value_set(autoselect_value, config_bool(ctx.settings_autoselect));
-
-            // Remove "--custom--" server from config
-            if (ctx.settings_servers != NULL) {
-                for (int i = 0; i < config_array_len(ctx.settings_servers); i++) {
-                    ConfigTable *t = config_array_get(ctx.settings_servers, i)->v.t;
-                    if (!config_table_get(t, "valid"))
-                        continue;
-                    char *server_name = config_table_get(t, "name")->v.s.p;
-                    if (strcmp(server_name, "--custom--") == 0)
-                        config_array_remove(ctx.settings_servers, i);
-                }
-            }
-            
-            // Save config file
-            config_write_table(ctx.settings, settings_file);
-            fclose(settings_file);
-        }
+    if (!ctx.cli_run && ctx.save_settings_file) {
+        save_settings();
         
         config_table_free(ctx.settings);
     }
@@ -3089,51 +3174,52 @@ void exit_game(void) {
 
 /* <================================================== MENU AND GUI ==================================================> */
 
+#define ITEM_MARGIN 10
 #define ITEM_WIDTH 500
 #define ITEM_HEIGHT 30
 #define ITEM_SPACING 15
 #define ITEM_INNER_SPACING 5
 #define LABEL_SPACING 5
 #define CHECKBOX_SIZE 20
-#define CHECKBOX_OFFSET -10
 
-#define ITEM_X ctx.screen_width/2.0f - ITEM_WIDTH/2.0f + __label_width + LABEL_SPACING + __margin
-#define ITEM_W (ITEM_WIDTH - __label_width - LABEL_SPACING - __margin)
+#define ITEM_X (ctx.screen_width/2.0f - item_width/2.0f + __label_width + label_spacing + __margin)
+#define ITEM_W (item_width - __label_width - label_spacing - __margin)
 #define ITEM(n, x, y, ...)                                                                                               \
     do {                                                                                                                 \
-        int __label_width = MeasureText(n ": ", 20);                                                                     \
+        int __label_width = MeasureText(n ": ", ctx.text_size);                                                          \
         int __margin = (x);                                                                                              \
         STYLE_START(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);                                                           \
-        GuiLabel((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f + __margin, (y), ITEM_WIDTH, ITEM_HEIGHT}, n ": "); \
+        GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f + __margin, (y), item_width, item_height}, n ": "); \
         STYLE_END();                                                                                                     \
-        if (!active_gui) GuiLock(); \
+        if (!active_gui) GuiLock();                                                                                      \
         __VA_ARGS__                                                                                                      \
-        GuiUnlock(); \
     } while (0)
 
 #define INFOBOX_WIDTH 30
 
 // Draw an "info" box with tooltip
 void draw_info(int x, int y, const char *text) {
-    Rectangle info_rec = {x, y, INFOBOX_WIDTH, ITEM_HEIGHT};
+    Rectangle info_rec = {x, y, INFOBOX_WIDTH*ctx.settings_gui_scale, ITEM_HEIGHT*ctx.settings_gui_scale};
     GuiLabel(info_rec, GuiIconText(ICON_INFO_BOX, ""));
     
-    bool show_tooltip = CheckCollisionPointRec(GUI_POINTER_POSITION, info_rec);
-    GuiSetState(show_tooltip ? STATE_FOCUSED : STATE_NORMAL);
+    if (!guiLocked) {
+        bool show_tooltip = CheckCollisionPointRec(GUI_POINTER_POSITION, info_rec);
+        GuiSetState(show_tooltip ? STATE_FOCUSED : STATE_NORMAL);
     
-    if (show_tooltip) {
-        bool old_tooltip_state = guiTooltip;
-        GuiEnableTooltip();
-        GuiSetTooltip(text);
+        if (show_tooltip) {
+            bool old_tooltip_state = guiTooltip;
+            GuiEnableTooltip();
+            GuiSetTooltip(text);
         
-        STYLE_START(DEFAULT, TEXT_SIZE, 10);
-        GuiTooltip((Rectangle){info_rec.x + INFOBOX_WIDTH + 5, info_rec.y, 30, 1});
-        STYLE_END();
-        if (!old_tooltip_state)
-            GuiDisableTooltip();
-    }
+            STYLE_START(DEFAULT, TEXT_SIZE, 10);
+            GuiTooltip((Rectangle){info_rec.x + (INFOBOX_WIDTH + 5)*ctx.settings_gui_scale, info_rec.y, 30*ctx.settings_gui_scale, 1});
+            STYLE_END();
+            if (!old_tooltip_state)
+                GuiDisableTooltip();
+        }
 
-    GuiSetState(STATE_NORMAL);
+        GuiSetState(STATE_NORMAL);
+    }
 }
 
 void generate_servers_names() {
@@ -3172,33 +3258,41 @@ void generate_servers_names() {
 }
 
 GameMenu main_menu(void) {
+    const int item_width = ITEM_WIDTH * ctx.settings_gui_scale;
+    const int item_height = ITEM_HEIGHT * ctx.settings_gui_scale;
+    const int item_spacing = ITEM_SPACING * ctx.settings_gui_scale;
+    // const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
+    // const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
+    // const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
+    // const int checkbox_offset = -ctx.text_size/2.0f;
+    
     const int items_number = 4;
-    int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
+    int y = ctx.screen_height / 2 - (item_height*items_number + item_spacing*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
 
-    STYLE_START(DEFAULT, TEXT_SIZE, 20);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "New room")) {
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width, item_height}, "New room")) {
         generate_servers_names();
         next_menu = MENU_NEW;
     }
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    y += item_height + item_spacing;
 
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "Join room")) {
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width, item_height}, "Join room")) {
         generate_servers_names();
         next_menu = MENU_JOIN;
     }
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    y += item_height + item_spacing;
 
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "Local game")) next_menu = MENU_LOCAL;
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width, item_height}, "Local game")) next_menu = MENU_LOCAL;
+    y += item_height + item_spacing;
 
-    y += ITEM_SPACING;
+    y += item_spacing;
 
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, "Settings")) next_menu = MENU_SETTINGS;
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width, item_height}, "Settings")) next_menu = MENU_SETTINGS;
+    y += item_height + item_spacing;
     
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
     STYLE_END(); // TEXT_SIZE
@@ -3242,9 +3336,17 @@ void paste_server(const char *server_str, ConfigTable **selected_server, int *se
 }
 
 GameMenu new_menu(void) {
+    const int item_width = ITEM_WIDTH * ctx.settings_gui_scale;
+    const int item_height = ITEM_HEIGHT * ctx.settings_gui_scale;
+    const int item_spacing = ITEM_SPACING * ctx.settings_gui_scale;
+    const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
+    const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
+    const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
+    const int checkbox_offset = -ctx.text_size/2.0f;
+    
     static bool hide_server_data = true;
     const int items_number = 11 - hide_server_data*4;
-    int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
+    int y = ctx.screen_height / 2 - (item_height*items_number + item_spacing*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
 
@@ -3272,26 +3374,26 @@ GameMenu new_menu(void) {
         selected_server_set = true;
     }
     
-    STYLE_START(DEFAULT, TEXT_SIZE, 20);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
-    GuiLabel((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, MAX(MIN(ctx.screen_height/4.0f, y - ITEM_HEIGHT - ITEM_SPACING), 0), ITEM_WIDTH, ITEM_HEIGHT}, "Create a new game room");
+    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, MAX(MIN(ctx.screen_height/4.0f, y - item_height - item_spacing), 0), item_width, item_height}, "Create a new game room");
     
     ITEM("Username", 0, y, {
         static bool username_textbox_mode = false;
         
         STYLE_START(TEXTBOX, TEXT_ALIGNMENT, username_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-        if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, ctx.username, USERNAME_LEN, username_textbox_mode))
+        if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, ctx.username, USERNAME_LEN, username_textbox_mode))
             username_textbox_mode = !username_textbox_mode;
         STYLE_END();
         
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     });
 
     // Reserve place for "Server" item
     int server_dropdown_y = y;
     if (ctx.settings_servers != NULL)
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     
     // Server data
     if (!hide_server_data && ctx.settings_servers != NULL && selected_server != NULL) {
@@ -3304,7 +3406,7 @@ GameMenu new_menu(void) {
             bool custom_server = strcmp(servername, "--custom--") == 0;
         
             STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, servername, SERVERNAME_LEN, server_textbox_mode)) {
+            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, servername, SERVERNAME_LEN, server_textbox_mode)) {
                 server_textbox_mode = !server_textbox_mode;
                 if (server_textbox_mode == false) {
                     *servername_len = strlen(servername);
@@ -3315,41 +3417,41 @@ GameMenu new_menu(void) {
 
             if (custom_server && strcmp(servername, "--custom--") != 0) {
                 // Add new "--custom--" server
-                ConfigValue new_v = config_table();
-                ConfigTable *new_t = new_v.v.t;
+                ConfigValue custom_v = config_table();
+                ConfigTable *custom_t = custom_v.v.t;
                 
                 ConfigValue name_value = config_string("--custom--");
                 name_value.v.s.p = realloc(name_value.v.s.p, SERVERNAME_LEN);
-                config_table_insert(new_t, "name", name_value);
+                config_table_insert(custom_t, "name", name_value);
 
                 ConfigValue ip_value = config_string(DEFAULT_SERVER);
                 ip_value.v.s.p = realloc(ip_value.v.s.p, INET6_ADDRSTRLEN);
-                config_table_insert(new_t, "ip", ip_value);
+                config_table_insert(custom_t, "ip", ip_value);
                 
-                config_table_insert(new_t, "tcp_port", config_int(TCP_PORT));
-                config_table_insert(new_t, "udp_port", config_int(UDP_PORT));
+                config_table_insert(custom_t, "tcp_port", config_int(TCP_PORT));
+                config_table_insert(custom_t, "udp_port", config_int(UDP_PORT));
                 
                 ConfigValue valid_value = config_bool(true);
                 valid_value.displayed = false;
-                config_table_insert(new_t, "valid", valid_value);
+                config_table_insert(custom_t, "valid", valid_value);
                 
-                config_array_append(ctx.settings_servers, new_v);
+                config_array_append(ctx.settings_servers, custom_v);
 
                 generate_servers_names();
             }
 
-            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+            y += item_height + item_inner_spacing;
          });
 
         ITEM("Server IP", 50, y, {
             static bool server_textbox_mode = false;
         
             STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, config_table_get(selected_server, "ip")->v.s.p, INET_ADDRSTRLEN, server_textbox_mode))
+            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, config_table_get(selected_server, "ip")->v.s.p, INET_ADDRSTRLEN, server_textbox_mode))
                 server_textbox_mode = !server_textbox_mode;
             STYLE_END();
 
-            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+            y += item_height + item_inner_spacing;
         });
 
         const int port_textbox_width = 70;
@@ -3359,11 +3461,11 @@ GameMenu new_menu(void) {
         
             long *settings_tcp_port = &config_table_get(selected_server, "tcp_port")->v.i;
             int tcp_port = *settings_tcp_port;
-            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &tcp_port, 0, 65535, tcp_valuebox_mode))
+            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, item_height}, NULL, &tcp_port, 0, 65535, tcp_valuebox_mode))
                 tcp_valuebox_mode = !tcp_valuebox_mode;
             *settings_tcp_port = tcp_port;
         
-            y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+            y += item_height + item_inner_spacing;
         });
 
         ITEM("UDP port", 50, y, {
@@ -3371,66 +3473,68 @@ GameMenu new_menu(void) {
 
             long *settings_udp_port = &config_table_get(selected_server, "udp_port")->v.i;
             int udp_port = *settings_udp_port;
-            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, ITEM_HEIGHT}, NULL, &udp_port, 0, 65535, udp_valuebox_mode))
+            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, item_height}, NULL, &udp_port, 0, 65535, udp_valuebox_mode))
                 udp_valuebox_mode = !udp_valuebox_mode;
             *settings_udp_port = udp_port;
 
-            y += ITEM_HEIGHT + ITEM_SPACING;
+            y += item_height + item_spacing;
         });
     }
 
     ITEM("Chunk size", 0, y, {
         static bool chunk_spinner_mode = false;
         
-        if (GuiValueBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, NULL, &ctx.chunk_size_multiplayer, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, chunk_spinner_mode)) {
+        if (GuiValueBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, NULL, &ctx.chunk_size_multiplayer, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, chunk_spinner_mode)) {
             ctx.chunk_size = (ctx.chunk_size / BOID_SIZE) * BOID_SIZE;
             chunk_spinner_mode = !chunk_spinner_mode;
         }
         
-        y += ITEM_HEIGHT + ITEM_INNER_SPACING;
+        y += item_height + item_inner_spacing;
     });
     
     ITEM("World", 0, y, {
         static bool worldx_spinner_mode = false;
         static bool worldy_spinner_mode = false;
         const int x_label_width = 30;
+        const int item_x = ITEM_X;
+        const int item_w = ITEM_W;
 
-        if (GuiValueBox((Rectangle){ITEM_X, y, ITEM_W/2.0f - x_label_width/2.0f, ITEM_HEIGHT}, NULL, &ctx.world_size.x, BOID_SIZE, (65535/BOID_SIZE)*BOID_SIZE, worldx_spinner_mode)) {
+        if (GuiValueBox((Rectangle){item_x, y, item_w/2.0f - x_label_width/2.0f, item_height}, NULL, &ctx.world_size.x, BOID_SIZE, (65535/BOID_SIZE)*BOID_SIZE, worldx_spinner_mode)) {
             ctx.world_size.x = ceilf((float)ctx.world_size.x / BOID_SIZE) * BOID_SIZE;
             worldx_spinner_mode = !worldx_spinner_mode;
         }
         
-        GuiLabel((Rectangle){ITEM_X + ITEM_W/2.0f - x_label_width/2.0f, y, x_label_width, ITEM_HEIGHT}, "x");
-        if (GuiValueBox((Rectangle){ITEM_X + ITEM_W/2.0f + x_label_width/2.0f, y, ITEM_W/2.0f - x_label_width/2.0f, ITEM_HEIGHT}, NULL, &ctx.world_size.y, BOID_SIZE, (65535/BOID_SIZE)*BOID_SIZE, worldy_spinner_mode)) {
+        GuiLabel((Rectangle){item_x + item_w/2.0f - x_label_width/2.0f, y, x_label_width, item_height}, "x");
+        if (GuiValueBox((Rectangle){item_x + item_w/2.0f + x_label_width/2.0f, y, item_w/2.0f - x_label_width/2.0f, item_height}, NULL, &ctx.world_size.y, BOID_SIZE, (65535/BOID_SIZE)*BOID_SIZE, worldy_spinner_mode)) {
             ctx.world_size.y = ceilf((float)ctx.world_size.y / BOID_SIZE) * BOID_SIZE;
             worldy_spinner_mode = !worldy_spinner_mode;
         }
         
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     });
 
     STYLE_START(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
     
     ITEM("Players number", 0, y, {
-        GuiLabel((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, TextFormat("%d", ctx.players_number));
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        GuiLabel((Rectangle){ITEM_X, y, ITEM_W, item_height}, TextFormat("%d", ctx.players_number));
+        y += item_height + item_spacing;
     });
     STYLE_END();
 
     // Reserve place for "Boids" item
     int boids_dropdown_y = y;
     static int teams_count = 0;
-    y += ITEM_HEIGHT*(teams_count + 1) + ITEM_INNER_SPACING*teams_count + ITEM_SPACING;
+    y += item_height*(teams_count + 1) + item_inner_spacing*teams_count + item_spacing;
 
     // Reserve place for "Team" item
     int team_dropdown_y = y;
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    y += item_height + item_spacing;
     
     ITEM("Hide areas", 0, y, {
-        GuiCheckBox((Rectangle){ITEM_X + CHECKBOX_OFFSET, y + ITEM_HEIGHT/2.0f - CHECKBOX_SIZE/2.0f, CHECKBOX_SIZE, CHECKBOX_SIZE}, NULL, &ctx.hide_areas);
-        draw_info(ITEM_X + CHECKBOX_OFFSET + CHECKBOX_SIZE + ITEM_INNER_SPACING, y, "Do not show areas to otrher players while admin player draws them");
+        GuiCheckBox((Rectangle){ITEM_X + checkbox_offset, y + item_height/2.0f - checkbox_size/2.0f, checkbox_size, checkbox_size}, NULL, &ctx.hide_areas);
+        draw_info(ITEM_X + checkbox_offset + checkbox_size + item_inner_spacing, y, "Do not show areas to otrher players while admin player draws them");
 
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     });
 
     // Get warning text
@@ -3453,13 +3557,13 @@ GameMenu new_menu(void) {
     
     // "Back" and "Create" buttons
     if (!active_gui) GuiLock(); // Lock items when any GuiDropdownBox is active
-    const int back_btn_width = ITEM_HEIGHT; // Square button
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, back_btn_width, ITEM_HEIGHT}, GuiIconText(ICON_EXIT, "")))
+    const int back_btn_width = item_height; // Square button
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, back_btn_width, item_height}, GuiIconText(ICON_EXIT, "")))
         next_menu = MENU_MAIN;
     GuiSetState((warning_text == NULL) ? STATE_NORMAL : STATE_DISABLED);
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f + back_btn_width + ITEM_INNER_SPACING, y, ITEM_WIDTH - back_btn_width - ITEM_INNER_SPACING, ITEM_HEIGHT}, "Create"))
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f + back_btn_width + item_inner_spacing, y, item_width - back_btn_width - item_inner_spacing, item_height}, "Create"))
         next_menu = MENU_LOADING;
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    y += item_height + item_spacing;
     GuiSetState(STATE_NORMAL);
     GuiUnlock();
     
@@ -3467,24 +3571,27 @@ GameMenu new_menu(void) {
 
     y = team_dropdown_y;
     ITEM("Team", 0, y, {
-        const int dropdown_width = 100;
+        const int dropdown_width = 100 * ctx.settings_gui_scale;
         static bool team_dropdown_mode = false;
+        const int item_x = ITEM_X;
 
         if (!active_gui && !team_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
         
-        if (GuiDropdownBox((Rectangle){ITEM_X, y, dropdown_width, ITEM_HEIGHT}, TEAMS_LIST, (int*)&ctx.player_team, team_dropdown_mode)) {
+        if (GuiDropdownBox((Rectangle){item_x, y, dropdown_width, item_height}, TEAMS_LIST, (int*)&ctx.player_team, team_dropdown_mode)) {
             team_dropdown_mode = !team_dropdown_mode;
         }
         if (team_dropdown_mode) active_dropdown = true;
-        draw_info(ITEM_X + dropdown_width + ITEM_INNER_SPACING, y, "Your team at the beginning");
+        draw_info(item_x + dropdown_width + item_inner_spacing, y, "Your team at the beginning");
 
         GuiUnlock();
     });
     
     y = boids_dropdown_y;
     ITEM("Boids", 0, y, {
-        const int dropdown_width = 100;
-        const int btn_width = ITEM_HEIGHT; // Square "+" and "-" buttons
+        const int dropdown_width = 100 * ctx.settings_gui_scale;
+        const int btn_width = item_height; // Square "+" and "-" buttons
+        const int item_x = ITEM_X;
+        const int item_w = ITEM_W;
         
         static struct {
             int selected_team;
@@ -3495,31 +3602,31 @@ GameMenu new_menu(void) {
 
         // [+] button
         bool add_new = false;
-        y += ITEM_HEIGHT*teams_count + ITEM_INNER_SPACING*teams_count;
+        y += item_height*teams_count + item_inner_spacing*teams_count;
         GuiSetState((teams_count < TEAMS_COUNT) ? STATE_NORMAL : STATE_DISABLED);
-        if (GuiButton((Rectangle){ITEM_X, y, btn_width, ITEM_HEIGHT}, "+"))
+        if (GuiButton((Rectangle){item_x, y, btn_width, item_height}, "+"))
             add_new = true;
-        y -= ITEM_HEIGHT + ITEM_INNER_SPACING;
+        y -= item_height + item_inner_spacing;
         
         // Draw in reverse order
         bool delete = false;
         GuiSetState(STATE_NORMAL);
         for (int i = teams_count-1; i >= 0; i--) {
             if (!active_gui && !teams[i].dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
-            if (GuiDropdownBox((Rectangle){ITEM_X, y, dropdown_width, ITEM_HEIGHT}, TEAMS_LIST, &teams[i].selected_team, teams[i].dropdown_mode))
+            if (GuiDropdownBox((Rectangle){item_x, y, dropdown_width, item_height}, TEAMS_LIST, &teams[i].selected_team, teams[i].dropdown_mode))
                 teams[i].dropdown_mode = !teams[i].dropdown_mode;
             if (teams[i].dropdown_mode) active_dropdown = true;
             GuiUnlock();
 
-            if (GuiSpinner((Rectangle){ITEM_X + dropdown_width + ITEM_INNER_SPACING, y, ITEM_W - dropdown_width - ITEM_INNER_SPACING*2 - btn_width, ITEM_HEIGHT}, NULL, &teams[i].boids_number, 0, MAX_BOIDS_COUNT, teams[i].valuebox_mode))
+            if (GuiSpinner((Rectangle){item_x + dropdown_width + item_inner_spacing, y, item_w - dropdown_width - item_inner_spacing*2 - btn_width, item_height}, NULL, &teams[i].boids_number, 0, MAX_BOIDS_COUNT, teams[i].valuebox_mode))
                 teams[i].valuebox_mode = !teams[i].valuebox_mode;
 
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - btn_width, y, btn_width, ITEM_HEIGHT}, "-")) {
+            if (GuiButton((Rectangle){item_x + item_w - btn_width, y, btn_width, item_height}, "-")) {
                 teams[i].deleted = true;
                 delete = true;
             }
             
-            y -= ITEM_HEIGHT + ITEM_INNER_SPACING;
+            y -= item_height + item_inner_spacing;
         }
 
         if (add_new && teams_count < TEAMS_COUNT) {
@@ -3554,12 +3661,15 @@ GameMenu new_menu(void) {
     if (ctx.settings_servers != NULL) {
         y = server_dropdown_y;
         ITEM("Server", 0, y, {
+            const int item_x = ITEM_X;
+            const int item_w = ITEM_W;
+
             // Servers dropdown
             static bool server_dropdown_mode = false;
 
             if (!active_gui && !server_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
 
-            if (GuiDropdownBox((Rectangle){ITEM_X, y, ITEM_W - ITEM_INNER_SPACING*4 - ITEM_HEIGHT*4, ITEM_HEIGHT},
+            if (GuiDropdownBox((Rectangle){item_x, y, item_w - item_inner_spacing*4 - item_height*4, item_height},
                                ctx.settings_servers_names.str, &selected_server_idx, server_dropdown_mode)) {
                 server_dropdown_mode = !server_dropdown_mode;
             }
@@ -3572,7 +3682,7 @@ GameMenu new_menu(void) {
             // Hide/show server data button
             GuiEnableTooltip();
             GuiSetTooltip("Hide/show server data");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*3 - ITEM_HEIGHT*4, y, ITEM_HEIGHT, ITEM_HEIGHT},
+            if (GuiButton((Rectangle){item_x + item_w - item_inner_spacing*3 - item_height*4, y, item_height, item_height},
                           GuiIconText(hide_server_data ? ICON_ARROW_DOWN : ICON_ARROW_UP, ""))) {
                 hide_server_data = !hide_server_data;
                 generate_servers_names();
@@ -3580,7 +3690,7 @@ GameMenu new_menu(void) {
 
             // Copy to clipboard button
             GuiSetTooltip("Copy server to clipboard");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*2 - ITEM_HEIGHT*3, y, ITEM_HEIGHT, ITEM_HEIGHT},
+            if (GuiButton((Rectangle){item_x + item_w - item_inner_spacing*2 - item_height*3, y, item_height, item_height},
                           GuiIconText(ICON_LAYERS, ""))) {
                 char format[] = "name=\"%s\";ip=\"%s\";tcp_port=%d;udp_port=%d;";
                 const int buf_len = sizeof(format) + SERVERNAME_LEN + INET_ADDRSTRLEN + /*tcp_port*/5 + /*udp_port*/5;
@@ -3596,7 +3706,7 @@ GameMenu new_menu(void) {
 
             // Paste from clipboard button
             GuiSetTooltip("Paste server from clipboard");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING - ITEM_HEIGHT*2, y, ITEM_HEIGHT, ITEM_HEIGHT},
+            if (GuiButton((Rectangle){item_x + item_w - item_inner_spacing - item_height*2, y, item_height, item_height},
                           GuiIconText(ICON_FILE_OPEN, ""))) {
                 paste_server(GetClipboardText(), &selected_server, &selected_server_idx);
                 generate_servers_names();
@@ -3604,7 +3714,7 @@ GameMenu new_menu(void) {
 
             // Delete server button
             GuiSetTooltip("Delete server");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_HEIGHT, y, ITEM_HEIGHT, ITEM_HEIGHT}, GuiIconText(ICON_BIN, ""))) {
+            if (GuiButton((Rectangle){item_x + item_w - item_height, y, item_height, item_height}, GuiIconText(ICON_BIN, ""))) {
                 char *server_name = config_table_get(selected_server, "name")->v.s.p;
                 if (strcmp(server_name, "--custom--") == 0) {
                     // Set "--custom--" server to default
@@ -3646,9 +3756,17 @@ GameMenu new_menu(void) {
 }
 
 GameMenu join_menu(void) {
+    const int item_width = ITEM_WIDTH * ctx.settings_gui_scale;
+    const int item_height = ITEM_HEIGHT * ctx.settings_gui_scale;
+    const int item_spacing = ITEM_SPACING * ctx.settings_gui_scale;
+    // const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
+    const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
+    // const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
+    // const int checkbox_offset = -ctx.text_size/2.0f;
+    
     static bool hide_server_data = true;
     const int items_number = 8 - hide_server_data*4;
-    int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
+    int y = ctx.screen_height / 2 - (item_height*items_number + item_spacing*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
 
@@ -3676,38 +3794,124 @@ GameMenu join_menu(void) {
         selected_server_set = true;
     }
     
-    STYLE_START(DEFAULT, TEXT_SIZE, 20);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
     const char *warning_text = NULL;
     
-    GuiLabel((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, ctx.screen_height/4.0f, ITEM_WIDTH, ITEM_HEIGHT}, "Join a game room");
+    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, ctx.screen_height/4.0f, item_width, item_height}, "Join a game room");
     
     ITEM("Username", 0, y, {
         static bool username_textbox_mode = false;
         
         STYLE_START(TEXTBOX, TEXT_ALIGNMENT, username_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-        if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, ctx.username, USERNAME_LEN, username_textbox_mode))
+        if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, ctx.username, USERNAME_LEN, username_textbox_mode))
             username_textbox_mode = !username_textbox_mode;
         STYLE_END();
         
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     });
     
     // Reserve place for "Server" item
     int server_dropdown_y = y;
     if (ctx.settings_servers != NULL)
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
+    
+    // Server data
+    if (!hide_server_data && ctx.settings_servers != NULL && selected_server != NULL) {
+        // Server name
+        ITEM("Name", 50, y, {
+            static bool server_textbox_mode = false;
+
+            char *servername = config_table_get(selected_server, "name")->v.s.p;
+            int *servername_len = &config_table_get(selected_server, "name")->v.s.l;
+            bool custom_server = strcmp(servername, "--custom--") == 0;
+        
+            STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
+            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, servername, SERVERNAME_LEN, server_textbox_mode)) {
+                server_textbox_mode = !server_textbox_mode;
+                if (server_textbox_mode == false) {
+                    *servername_len = strlen(servername);
+                    generate_servers_names();
+                }
+            }
+            STYLE_END();
+
+            if (custom_server && strcmp(servername, "--custom--") != 0) {
+                // Add new "--custom--" server
+                ConfigValue new_v = config_table();
+                ConfigTable *new_t = new_v.v.t;
+                
+                ConfigValue name_value = config_string("--custom--");
+                name_value.v.s.p = realloc(name_value.v.s.p, SERVERNAME_LEN);
+                config_table_insert(new_t, "name", name_value);
+
+                ConfigValue ip_value = config_string(DEFAULT_SERVER);
+                ip_value.v.s.p = realloc(ip_value.v.s.p, INET6_ADDRSTRLEN);
+                config_table_insert(new_t, "ip", ip_value);
+                
+                config_table_insert(new_t, "tcp_port", config_int(TCP_PORT));
+                config_table_insert(new_t, "udp_port", config_int(UDP_PORT));
+                
+                ConfigValue valid_value = config_bool(true);
+                valid_value.displayed = false;
+                config_table_insert(new_t, "valid", valid_value);
+                
+                config_array_append(ctx.settings_servers, new_v);
+
+                generate_servers_names();
+            }
+
+            y += item_height + ITEM_INNER_SPACING;
+         });
+
+        ITEM("Server IP", 50, y, {
+            static bool server_textbox_mode = false;
+        
+            STYLE_START(TEXTBOX, TEXT_ALIGNMENT, server_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
+            if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, config_table_get(selected_server, "ip")->v.s.p, INET_ADDRSTRLEN, server_textbox_mode))
+                server_textbox_mode = !server_textbox_mode;
+            STYLE_END();
+
+            y += item_height + ITEM_INNER_SPACING;
+        });
+
+        const int port_textbox_width = 70;
+        
+        ITEM("TCP port", 50, y, {
+            static bool tcp_valuebox_mode = false;
+        
+            long *settings_tcp_port = &config_table_get(selected_server, "tcp_port")->v.i;
+            int tcp_port = *settings_tcp_port;
+            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, item_height}, NULL, &tcp_port, 0, 65535, tcp_valuebox_mode))
+                tcp_valuebox_mode = !tcp_valuebox_mode;
+            *settings_tcp_port = tcp_port;
+        
+            y += item_height + ITEM_INNER_SPACING;
+        });
+
+        ITEM("UDP port", 50, y, {
+            static bool udp_valuebox_mode = false;
+
+            long *settings_udp_port = &config_table_get(selected_server, "udp_port")->v.i;
+            int udp_port = *settings_udp_port;
+            if (GuiValueBox((Rectangle){ITEM_X, y, port_textbox_width, item_height}, NULL, &udp_port, 0, 65535, udp_valuebox_mode))
+                udp_valuebox_mode = !udp_valuebox_mode;
+            *settings_udp_port = udp_port;
+
+            y += item_height + item_spacing;
+        });
+    }
     
     ITEM("Chunk size", 0, y, {
         static bool chunk_spinner_mode = false;
         
-        if (GuiValueBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, NULL, &ctx.chunk_size_multiplayer, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, chunk_spinner_mode)) {
+        if (GuiValueBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, NULL, &ctx.chunk_size_multiplayer, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, chunk_spinner_mode)) {
             ctx.chunk_size = (ctx.chunk_size / BOID_SIZE) * BOID_SIZE;
             chunk_spinner_mode = !chunk_spinner_mode;
         }
         
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     });
     
     ITEM("Room ID", 0, y, {
@@ -3715,7 +3919,7 @@ GameMenu join_menu(void) {
         static char room_id[6+1] = "000000"; // 6-digit hex number + '\0'
 
         STYLE_START(TEXTBOX, TEXT_ALIGNMENT, room_textbox_mode ? TEXT_ALIGN_LEFT : TEXT_ALIGN_CENTER);
-        if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, room_id, sizeof(room_id), room_textbox_mode))
+        if (GuiTextBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, room_id, sizeof(room_id), room_textbox_mode))
             room_textbox_mode = !room_textbox_mode;
         STYLE_END();
 
@@ -3725,20 +3929,20 @@ GameMenu join_menu(void) {
             warning_text = "Invalid room ID";
         }
         
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     });
     
     set_menu_message(MESSAGE_WARNING, false, warning_text);
     
     // "Back" and "Join" buttons
     if (!active_gui) GuiLock(); // Lock items when any GuiDropdownBox is active
-    const int back_btn_width = ITEM_HEIGHT; // Square button
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, back_btn_width, ITEM_HEIGHT}, GuiIconText(ICON_EXIT, "")))
+    const int back_btn_width = item_height; // Square button
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, back_btn_width, item_height}, GuiIconText(ICON_EXIT, "")))
         next_menu = MENU_MAIN;
     GuiSetState((warning_text == NULL) ? STATE_NORMAL : STATE_DISABLED);
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f + back_btn_width + ITEM_INNER_SPACING, y, ITEM_WIDTH - back_btn_width - ITEM_INNER_SPACING, ITEM_HEIGHT}, "Join"))
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f + back_btn_width + ITEM_INNER_SPACING, y, item_width - back_btn_width - ITEM_INNER_SPACING, item_height}, "Join"))
         next_menu = MENU_LOADING;
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    y += item_height + item_spacing;
     GuiSetState(STATE_NORMAL);
     GuiUnlock();
     
@@ -3747,12 +3951,15 @@ GameMenu join_menu(void) {
     if (ctx.settings_servers != NULL) {
         y = server_dropdown_y;
         ITEM("Server", 0, y, {
+            const int item_x = ITEM_X;
+            const int item_w = ITEM_W;
+
             // Servers dropdown
             static bool server_dropdown_mode = false;
 
             if (!active_gui && !server_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
 
-            if (GuiDropdownBox((Rectangle){ITEM_X, y, ITEM_W - ITEM_INNER_SPACING*4 - ITEM_HEIGHT*4, ITEM_HEIGHT},
+            if (GuiDropdownBox((Rectangle){item_x, y, item_w - ITEM_INNER_SPACING*4 - item_height*4, item_height},
                                ctx.settings_servers_names.str, &selected_server_idx, server_dropdown_mode)) {
                 server_dropdown_mode = !server_dropdown_mode;
             }
@@ -3765,7 +3972,7 @@ GameMenu join_menu(void) {
             // Hide/show server data button
             GuiEnableTooltip();
             GuiSetTooltip("Hide/show server data");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*3 - ITEM_HEIGHT*4, y, ITEM_HEIGHT, ITEM_HEIGHT},
+            if (GuiButton((Rectangle){item_x + item_w - ITEM_INNER_SPACING*3 - item_height*4, y, item_height, item_height},
                           GuiIconText(hide_server_data ? ICON_ARROW_DOWN : ICON_ARROW_UP, ""))) {
                 hide_server_data = !hide_server_data;
                 generate_servers_names();
@@ -3773,7 +3980,7 @@ GameMenu join_menu(void) {
 
             // Copy to clipboard button
             GuiSetTooltip("Copy server to clipboard");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING*2 - ITEM_HEIGHT*3, y, ITEM_HEIGHT, ITEM_HEIGHT},
+            if (GuiButton((Rectangle){item_x + item_w - ITEM_INNER_SPACING*2 - item_height*3, y, item_height, item_height},
                           GuiIconText(ICON_LAYERS, ""))) {
                 char format[] = "name=\"%s\";ip=\"%s\";tcp_port=%d;udp_port=%d;";
                 const int buf_len = sizeof(format) + SERVERNAME_LEN + INET_ADDRSTRLEN + /*tcp_port*/5 + /*udp_port*/5;
@@ -3789,7 +3996,7 @@ GameMenu join_menu(void) {
 
             // Paste from clipboard button
             GuiSetTooltip("Paste server from clipboard");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_INNER_SPACING - ITEM_HEIGHT*2, y, ITEM_HEIGHT, ITEM_HEIGHT},
+            if (GuiButton((Rectangle){item_x + item_w - ITEM_INNER_SPACING - item_height*2, y, item_height, item_height},
                           GuiIconText(ICON_FILE_OPEN, ""))) {
                 paste_server(GetClipboardText(), &selected_server, &selected_server_idx);
                 generate_servers_names();
@@ -3797,7 +4004,7 @@ GameMenu join_menu(void) {
 
             // Delete server button
             GuiSetTooltip("Delete server");
-            if (GuiButton((Rectangle){ITEM_X + ITEM_W - ITEM_HEIGHT, y, ITEM_HEIGHT, ITEM_HEIGHT}, GuiIconText(ICON_BIN, ""))) {
+            if (GuiButton((Rectangle){item_x + item_w - item_height, y, item_height, item_height}, GuiIconText(ICON_BIN, ""))) {
                 char *server_name = config_table_get(selected_server, "name")->v.s.p;
                 if (strcmp(server_name, "--custom--") == 0) {
                     // Set "--custom--" server to default
@@ -3839,36 +4046,44 @@ GameMenu join_menu(void) {
 }
 
 GameMenu local_menu(void) {
+    const int item_width = ITEM_WIDTH * ctx.settings_gui_scale;
+    const int item_height = ITEM_HEIGHT * ctx.settings_gui_scale;
+    const int item_spacing = ITEM_SPACING * ctx.settings_gui_scale;
+    // const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
+    const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
+    // const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
+    // const int checkbox_offset = -ctx.text_size/2.0f;
+    
     const int items_number = 2;
-    int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
+    int y = ctx.screen_height / 2 - (item_height*items_number + item_spacing*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
 
     static bool active_gui = true;
 
-    STYLE_START(DEFAULT, TEXT_SIZE, 20);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
-    GuiLabel((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, ctx.screen_height/4.0f, ITEM_WIDTH, ITEM_HEIGHT}, "Launch the game locally");
+    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, ctx.screen_height/4.0f, item_width, item_height}, "Launch the game locally");
     
     ITEM("Chunk size", 0, y, {
         static bool chunk_spinner_mode = false;
         
-        if (GuiValueBox((Rectangle){ITEM_X, y, ITEM_W, ITEM_HEIGHT}, NULL, &ctx.chunk_size_local, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, chunk_spinner_mode)) {
+        if (GuiValueBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, NULL, &ctx.chunk_size_local, BOID_SIZE, DEFAULT_SERVER_CHUNK_SIZE_PIXELS, chunk_spinner_mode)) {
             ctx.chunk_size = (ctx.chunk_size / BOID_SIZE) * BOID_SIZE;
             chunk_spinner_mode = !chunk_spinner_mode;
         }
         
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     });
     
     // "Back" and "Run" buttons
-    const int back_btn_width = ITEM_HEIGHT; // Square button
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, back_btn_width, ITEM_HEIGHT}, GuiIconText(ICON_EXIT, "")))
+    const int back_btn_width = item_height; // Square button
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, back_btn_width, item_height}, GuiIconText(ICON_EXIT, "")))
         next_menu = MENU_MAIN;
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f + back_btn_width + ITEM_INNER_SPACING, y, ITEM_WIDTH - back_btn_width - ITEM_INNER_SPACING, ITEM_HEIGHT}, "Run"))
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f + back_btn_width + ITEM_INNER_SPACING, y, item_width - back_btn_width - ITEM_INNER_SPACING, item_height}, "Run"))
         next_menu = MENU_GAME;
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    y += item_height + item_spacing;
     
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
     STYLE_END(); // TEXT_SIZE
@@ -3881,38 +4096,138 @@ GameMenu local_menu(void) {
 }
 
 GameMenu settings_menu(void) {
-    const int items_number = 3;
-    int y = ctx.screen_height / 2 - (ITEM_HEIGHT*items_number + ITEM_SPACING*(items_number-1)) / 2;
+    const int item_width = ITEM_WIDTH * ctx.settings_gui_scale;
+    const int item_height = ITEM_HEIGHT * ctx.settings_gui_scale;
+    const int item_spacing = ITEM_SPACING * ctx.settings_gui_scale;
+    // const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
+    const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
+    const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
+    const int checkbox_offset = -ctx.text_size/2.0f;
+    
+    const int items_number = 7;
+    int y = ctx.screen_height / 2 - (item_height*items_number + item_spacing*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
 
     static bool active_gui = true;
 
-    STYLE_START(DEFAULT, TEXT_SIZE, 20);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
-    GuiLabel((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, ctx.screen_height/4.0f, ITEM_WIDTH, ITEM_HEIGHT}, "Settings");
+    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, ctx.screen_height/4.0f, item_width, item_height}, "Settings");
 
     ITEM("Hide GUI", 0, y, {
-        GuiCheckBox((Rectangle){ITEM_X + CHECKBOX_OFFSET, y + ITEM_HEIGHT/2.0f - CHECKBOX_SIZE/2.0f, CHECKBOX_SIZE, CHECKBOX_SIZE}, NULL, &ctx.settings_hide_gui);
-        draw_info(ITEM_X + CHECKBOX_OFFSET + CHECKBOX_SIZE + ITEM_INNER_SPACING, y, "Hide the GUI after the game starts");
+        GuiCheckBox((Rectangle){ITEM_X + checkbox_offset, y + item_height/2.0f - checkbox_size/2.0f, checkbox_size, checkbox_size}, NULL, &ctx.settings_hide_gui);
+        draw_info(ITEM_X + checkbox_offset + checkbox_size + ITEM_INNER_SPACING, y, "Hide the GUI after the game starts");
 
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
      });
 
     ITEM("Autoselect", 0, y, {
-        GuiCheckBox((Rectangle){ITEM_X + CHECKBOX_OFFSET, y + ITEM_HEIGHT/2.0f - CHECKBOX_SIZE/2.0f, CHECKBOX_SIZE, CHECKBOX_SIZE}, NULL, &ctx.settings_autoselect);
-        draw_info(ITEM_X + CHECKBOX_OFFSET + CHECKBOX_SIZE + ITEM_INNER_SPACING, y, "Enable autoselect mode by default");
+        GuiCheckBox((Rectangle){ITEM_X + checkbox_offset, y + item_height/2.0f - checkbox_size/2.0f, checkbox_size, checkbox_size}, NULL, &ctx.settings_autoselect);
+        draw_info(ITEM_X + checkbox_offset + checkbox_size + ITEM_INNER_SPACING, y, "Enable autoselect mode by default");
 
-        y += ITEM_HEIGHT + ITEM_SPACING;
+        y += item_height + item_spacing;
     });
+
+    ITEM("Interface size", 0, y, {
+        static bool size_spinner_mode = false;
     
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - ITEM_WIDTH/2.0f, y, ITEM_WIDTH, ITEM_HEIGHT}, GuiIconText(ICON_EXIT, "Back")))
+        if (GuiSpinner((Rectangle){ITEM_X, y, ITEM_W, item_height}, NULL, &ctx.settings_gui_value, MIN_GUI_SIZE, MAX_GUI_SIZE, size_spinner_mode)) {
+            size_spinner_mode = !size_spinner_mode;
+        }
+        if (!size_spinner_mode)
+            ctx.settings_gui_scale = ctx.settings_gui_value / 20.0f;
+
+        y += item_height + item_spacing;
+    });
+
+    ITEM("Text size", 0, y, {
+        static bool size_spinner_mode = false;
+    
+        if (GuiSpinner((Rectangle){ITEM_X, y, ITEM_W, item_height}, NULL, &ctx.settings_text_value, MIN_TEXT_SIZE, MAX_TEXT_SIZE, size_spinner_mode)) {
+            size_spinner_mode = !size_spinner_mode;
+        }
+        if (!size_spinner_mode)
+            ctx.settings_text_scale = ctx.settings_text_value / 20.0f;
+
+        y += item_height + item_spacing;
+    });
+
+    y += item_spacing;
+    
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width/2.0f - item_spacing/2.0f, item_height},
+                  GuiIconText(ICON_FILE_SAVE, "Save settings"))) {
+        save_settings();
+    }
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f + item_spacing/2.0f, y, item_width/2.0f - item_spacing/2.0f, item_height},
+                  GuiIconText(ICON_FILE_OPEN, "Load settings"))) {
+        
+        config_table_free(ctx.settings);
+        open_settings(ctx.settings_file_name);
+        process_settings();
+    }
+    y += item_height + item_spacing;
+    
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width/2.0f - item_spacing/2.0f, item_height},
+                  GuiIconText(ICON_BIN, "Clear data")))
+        ctx.foreground_menu = FGMENU_CLEAR_DATA;
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f + item_spacing/2.0f, y, item_width/2.0f - item_spacing/2.0f, item_height},
+                  GuiIconText(ICON_REREDO, "Reset settings")))
+        ctx.foreground_menu = FGMENU_RESET_SETTINGS;
+    y += item_height + item_spacing;
+    
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width, item_height}, GuiIconText(ICON_EXIT, "Back")))
         next_menu = MENU_MAIN;
-    y += ITEM_HEIGHT + ITEM_SPACING;
+    y += item_height + item_spacing;
     
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
     STYLE_END(); // TEXT_SIZE
+    
+    GuiUnlock();
+    
+    if (ctx.foreground_menu == FGMENU_CLEAR_DATA) {
+        GuiDisableTooltip();
+        GuiSetState(STATE_NORMAL);
+        DrawRectangle(0, 0, ctx.screen_width, ctx.screen_height, Fade(RAYWHITE, 0.8f));
+        int btn_active = -1;
+        GuiMessageBox((Rectangle){ (float)GetScreenWidth()/2 - 225, (float)GetScreenHeight()/2 - 50, 450, 100 }, 
+            GuiIconText(ICON_EXIT, "Clear data"), "Do you really want to clear all user data (settings, servers list, username, etc.)?",
+            "Yes;No", &btn_active);
+
+        if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.foreground_menu = FGMENU_NONE;
+        if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) {
+            // Free settings table
+            config_table_free(ctx.settings);
+            ctx.settings = NULL;
+
+            // Init empty settings table
+            ctx.settings = config_table_init();
+            ctx.save_settings_file = true;
+
+            process_settings();
+            save_settings();
+        }
+    } else if (ctx.foreground_menu == FGMENU_RESET_SETTINGS) {
+        GuiDisableTooltip();
+        GuiSetState(STATE_NORMAL);
+        DrawRectangle(0, 0, ctx.screen_width, ctx.screen_height, Fade(RAYWHITE, 0.8f));
+        int btn_active = -1;
+        GuiMessageBox((Rectangle){ (float)GetScreenWidth()/2 - 150, (float)GetScreenHeight()/2 - 50, 300, 100 }, 
+            GuiIconText(ICON_EXIT, "Reset settings"), "Do you really want to reset settings to default?", "Yes;No", &btn_active);
+
+        if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.foreground_menu = FGMENU_NONE;
+        if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) {
+            ctx.settings_hide_gui = DEFAULT_HIDE_GUI;
+            ctx.settings_autoselect = DEFAULT_AUTOSELECT;
+            
+            ctx.settings_gui_value = DEFAULT_GUI_SIZE;
+            ctx.settings_gui_scale = DEFAULT_GUI_SIZE / 20.0f;
+
+            ctx.settings_text_value = DEFAULT_TEXT_SIZE;
+            ctx.settings_text_scale = DEFAULT_TEXT_SIZE / 20.0f;
+        }
+    }
     
     return next_menu;
 }
@@ -3944,13 +4259,6 @@ GameMenu loading_menu(void) {
     
     return next_menu;
 }
-
-#undef ITEM_WIDTH
-#undef ITEM_HEIGHT
-#undef ITEM_SPACING
-#undef ITEM_INNER_SPACING
-#undef LABEL_SPACING
-#undef CHECKBOX_OFFSET
 
 
 /* <====================================================== GAME ======================================================> */
@@ -4213,6 +4521,19 @@ void set_button_tooltip(InputEvent event, const char *format, ...) {
     }
     
     GuiSetTooltip(tooltip);
+}
+
+// Draw current FPS
+// NOTE: Uses default font
+void DrawFPS(int posX, int posY)
+{
+    Color color = LIME;                         // Good FPS
+    int fps = GetFPS();
+
+    if ((fps < 30) && (fps >= 15)) color = ORANGE;  // Warning FPS
+    else if (fps < 15) color = RED;             // Low FPS
+
+    DrawText(TextFormat("%2i FPS", fps), posX, posY, ctx.text_size, color);
 }
 
 #define BUTTON_SIZE 60
@@ -5030,7 +5351,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
             draw_boid(boid, boids_textures[boid->b.team]);
             // if (show_health) {
             //     const char *text = TextFormat("%d %d", boid->b.health, boid->b.xp);
-            //     DrawText(text, boid->b.pos.x - MeasureText(text, 20)/2.0f, boid->b.pos.y - 50, 20, BLACK);
+            //     DrawText(text, boid->b.pos.x - MeasureText(text, 20)/2.0f, boid->b.pos.y - 50, ctx.text_size, BLACK);
             // }
         }
     }
@@ -5052,7 +5373,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     if (ctx.mode == MODE_SELECT && ctx.selecting) {
         float rectangleX = fmin(ctx.selection_start.x, ctx.mouse_position.x);
         float rectangleY = fmin(ctx.selection_start.y, ctx.mouse_position.y);
-        DrawText(TextFormat("%d", selected_boids_count), rectangleX, rectangleY-(20/ctx.camera.zoom), 20/ctx.camera.zoom, BLACK);
+        DrawText(TextFormat("%d", selected_boids_count), rectangleX, rectangleY-(ctx.text_size/ctx.camera.zoom), ctx.text_size/ctx.camera.zoom, BLACK);
         DrawRectangleLinesEx((Rectangle){rectangleX, rectangleY,
                              fabs(ctx.mouse_position.x - ctx.selection_start.x), fabs(ctx.mouse_position.y - ctx.selection_start.y)},
                              thick, BLACK);
@@ -5096,14 +5417,21 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     CLEAR_GUI_EVENTS();
 
     GuiEnableTooltip();
-    GuiSetIconScale(2);
+    GuiSetIconScale((ctx.settings_gui_scale + 0.25f) * 2);
+
+    const int button_size = BUTTON_SIZE * ctx.settings_gui_scale;
+    const int small_button_size = SMALL_BUTTON_SIZE * ctx.settings_gui_scale;
+    const int button_distance = BUTTON_DISTANCE * ctx.settings_gui_scale;
+    const int group_distance = GROUP_DISTANCE * ctx.settings_gui_scale;
+    const int button_margin = BUTTON_MARGIN * ctx.settings_gui_scale;
+    const int text_margin = TEXT_MARGIN * ctx.settings_text_scale;
     
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
     // Draw GUI
     if (ctx.show_gui) {
         // Buttons in the left corner
-        int btn_x = BUTTON_MARGIN;
+        int btn_x = button_margin;
     
         if (ctx.mode == MODE_AREAS || ctx.local_game) {
             for (int team = 0; team < TEAMS_COUNT; team++) {
@@ -5117,19 +5445,19 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
                 const char *str = get_team_name(team);
                 set_button_tooltip(IE_TEAM_RED+team, "%c%s color", toupper(str[0]), str+1); // Capitalize team name
         
-                if (GuiTextureButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, boids_textures[team],
-                                     (Rectangle){0, 0, 128, 150}, (Vector2){BUTTON_SIZE/2.0f, BUTTON_SIZE/2.0f}, 0.7f, -90.0f))
+                if (GuiTextureButton((Rectangle){btn_x, button_margin, button_size, button_size}, boids_textures[team],
+                                     (Rectangle){0, 0, 128, 150}, (Vector2){button_size/2.0f, button_size/2.0f}, 0.7f, -90.0f))
                     GUI_EVENT(IE_TEAM_RED + team);
-                btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+                btn_x += button_size + button_distance;
             }
         }
         if (ctx.mode == MODE_AREAS) {
             GuiSetState(ctx.selecting_team == -1 ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_ERASE_AREAS, "Erase areas");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_RUBBER, ""))) GUI_EVENT(IE_ERASE_AREAS);
-            btn_x += BUTTON_SIZE + GROUP_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_RUBBER, ""))) GUI_EVENT(IE_ERASE_AREAS);
+            btn_x += button_size + group_distance;
         } else if (ctx.local_game)
-            btn_x += GROUP_DISTANCE - BUTTON_DISTANCE;
+            btn_x += group_distance - button_distance;
 
         if (ctx.mode == MODE_AREAS) {
             bool ok;
@@ -5145,128 +5473,128 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
 
             GuiSetState(ok ? STATE_NORMAL : STATE_DISABLED);
             set_button_tooltip(IE_START_PLACING, "Start placing");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_OK_TICK, ""))) GUI_EVENT(IE_START_PLACING);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_OK_TICK, ""))) GUI_EVENT(IE_START_PLACING);
+            btn_x += button_size + button_distance;
         }
 
         else if (ctx.stage == STAGE_PLACING) {
             GuiSetState(ctx.mode == MODE_SPAWN ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_MODE_SPAWN, "Spawn mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_MODE_SPAWN);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_MODE_SPAWN);
+            btn_x += button_size + button_distance;
 
             GuiSetState(ctx.mode == MODE_SELECT ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_MODE_SELECT, "Select mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BOX_DOTS_BIG, ""))) GUI_EVENT(IE_MODE_SELECT);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_BOX_DOTS_BIG, ""))) GUI_EVENT(IE_MODE_SELECT);
+            btn_x += button_size + button_distance;
             
             GuiSetState(ctx.mode == MODE_DELETE ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_MODE_DELETE, "Delete mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_RUBBER, ""))) GUI_EVENT(IE_MODE_DELETE);
-            btn_x += BUTTON_SIZE + GROUP_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_RUBBER, ""))) GUI_EVENT(IE_MODE_DELETE);
+            btn_x += button_size + group_distance;
 
             GuiSetState(GET_EVENT(IE_DELETE_SELECTED_BOIDS) ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_DELETE_SELECTED_BOIDS, "Delete selected");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BIN, ""))) GUI_EVENT(IE_DELETE_SELECTED_BOIDS);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_BIN, ""))) GUI_EVENT(IE_DELETE_SELECTED_BOIDS);
+            btn_x += button_size + button_distance;
         
             GuiSetState((ctx.boids_count == ctx.boids_number[ctx.player_team]) ? STATE_NORMAL : STATE_DISABLED);
             set_button_tooltip(IE_READY, "Ready");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_OK_TICK, ""))) GUI_EVENT(IE_READY);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_OK_TICK, ""))) GUI_EVENT(IE_READY);
+            btn_x += button_size + button_distance;
         }
     
         else if (ctx.stage == STAGE_GAME) {
             GuiSetState(((ctx.action == ACT_STOP && ctx.mode == MODE_SPAWN) || GET_EVENT(IE_BOID_ACT_STOP)) ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_BOID_ACT_STOP, "Stop action");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_CURSOR_HAND, ""))) GUI_EVENT(IE_BOID_ACT_STOP);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_CURSOR_HAND, ""))) GUI_EVENT(IE_BOID_ACT_STOP);
+            btn_x += button_size + button_distance;
 
             GuiSetState(((ctx.action == ACT_ATTACK && ctx.mode == MODE_SPAWN) || GET_EVENT(IE_BOID_ACT_ATTACK)) ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_BOID_ACT_ATTACK, "Attack action");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_STEP_OUT, ""))) GUI_EVENT(IE_BOID_ACT_ATTACK);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_STEP_OUT, ""))) GUI_EVENT(IE_BOID_ACT_ATTACK);
+            btn_x += button_size + button_distance;
 
             GuiSetState(((ctx.action == ACT_RETREAT && ctx.mode == MODE_SPAWN) || GET_EVENT(IE_BOID_ACT_RETREAT)) ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_BOID_ACT_RETREAT, "Retreat action");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_STEP_INTO, ""))) GUI_EVENT(IE_BOID_ACT_RETREAT);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_STEP_INTO, ""))) GUI_EVENT(IE_BOID_ACT_RETREAT);
+            btn_x += button_size + button_distance;
 
             GuiSetState(GET_EVENT(IE_CLEAR_ORDERS) ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_CLEAR_ORDERS, "Clear orders");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_RESTART, ""))) GUI_EVENT(IE_CLEAR_ORDERS);
-            btn_x += BUTTON_SIZE + GROUP_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_RESTART, ""))) GUI_EVENT(IE_CLEAR_ORDERS);
+            btn_x += button_size + group_distance;
     
 
             if (ctx.local_game) {
                 GuiSetState(ctx.mode == MODE_SPAWN ? STATE_PRESSED : STATE_NORMAL);
                 set_button_tooltip(IE_MODE_SPAWN, "Spawn mode");
-                if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_MODE_SPAWN);
-                btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+                if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_MODE_SPAWN);
+                btn_x += button_size + button_distance;
             }
 
             GuiSetState(ctx.mode == MODE_SELECT ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_MODE_SELECT, "Select mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BOX_DOTS_BIG, ""))) GUI_EVENT(IE_MODE_SELECT);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_BOX_DOTS_BIG, ""))) GUI_EVENT(IE_MODE_SELECT);
+            btn_x += button_size + button_distance;
 
             GuiSetState(ctx.mode == MODE_DIRECTION ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_MODE_DIRECTION, "Direction mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_CURSOR_POINTER, ""))) GUI_EVENT(IE_MODE_DIRECTION);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_CURSOR_POINTER, ""))) GUI_EVENT(IE_MODE_DIRECTION);
+            btn_x += button_size + button_distance;
 
             GuiSetState(ctx.mode == MODE_POINT ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_MODE_POINT, "Point mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_TARGET_BIG_FILL, ""))) GUI_EVENT(IE_MODE_POINT);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_TARGET_BIG_FILL, ""))) GUI_EVENT(IE_MODE_POINT);
+            btn_x += button_size + button_distance;
 
             GuiSetState(ctx.mode == MODE_LINE ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_MODE_LINE, "Line mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_LINK_NET, ""))) GUI_EVENT(IE_MODE_LINE);
-            btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_LINK_NET, ""))) GUI_EVENT(IE_MODE_LINE);
+            btn_x += button_size + button_distance;
 
             if (ctx.mode == MODE_LINE) {
                 GuiSetState(STATE_NORMAL);
                 set_button_tooltip(IE_APPLY_LINE, "Apply line");
-                if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_OK_TICK, ""))) GUI_EVENT(IE_APPLY_LINE);
-                btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+                if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_OK_TICK, ""))) GUI_EVENT(IE_APPLY_LINE);
+                btn_x += button_size + button_distance;
             }
 
             if (ctx.mode == MODE_SELECT && ctx.local_game) {
                 GuiSetState(GET_EVENT(IE_DELETE_SELECTED_BOIDS) ? STATE_PRESSED : STATE_NORMAL);
                 set_button_tooltip(IE_DELETE_SELECTED_BOIDS, "Delete selected");
-                if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_BIN, ""))) GUI_EVENT(IE_DELETE_SELECTED_BOIDS);
-                btn_x += BUTTON_SIZE + BUTTON_DISTANCE;
+                if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_BIN, ""))) GUI_EVENT(IE_DELETE_SELECTED_BOIDS);
+                btn_x += button_size + button_distance;
             }
         }
 
         // Buttons in the right corner
-        btn_x = ctx.screen_width - BUTTON_SIZE - BUTTON_MARGIN;
+        btn_x = ctx.screen_width - button_size - button_margin;
 
         if (ctx.local_game) {
             GuiSetState(STATE_NORMAL);
             set_button_tooltip(IE_PAUSE, ctx.game_paused ? "Resume" : "Pause");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ctx.game_paused ? ICON_PLAYER_PLAY : ICON_PLAYER_PAUSE, ""))) GUI_EVENT(IE_PAUSE);
-            btn_x -= BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ctx.game_paused ? ICON_PLAYER_PLAY : ICON_PLAYER_PAUSE, ""))) GUI_EVENT(IE_PAUSE);
+            btn_x -= button_size + button_distance;
         }
 
         GuiSetState(STATE_NORMAL);
-        set_button_tooltip(IE_EXIT_GAME, "Exit");
-        if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_EXIT, ""))) GUI_EVENT(IE_EXIT_GAME);
-        btn_x -= BUTTON_SIZE + BUTTON_DISTANCE;
+        set_button_tooltip(IE_EXIT_ROOM, "Exit");
+        if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_EXIT, ""))) GUI_EVENT(IE_EXIT_ROOM);
+        btn_x -= button_size + button_distance;
         
         if (ctx.stage == STAGE_GAME) {
             GuiSetState(ctx.autoselect_mode ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_CHANGE_AUTOSELECT_MODE, "Auto-selection mode");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_SQUARE_TOGGLE, ""))) GUI_EVENT(IE_CHANGE_AUTOSELECT_MODE);
-            btn_x -= BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_SQUARE_TOGGLE, ""))) GUI_EVENT(IE_CHANGE_AUTOSELECT_MODE);
+            btn_x -= button_size + button_distance;
         }
 
         if (ctx.stage == STAGE_AREAS || ctx.stage == STAGE_PLACING) {
             GuiSetState(ctx.show_grid ? STATE_PRESSED : STATE_NORMAL);
             set_button_tooltip(IE_SHOW_GRID, "%s grid", ctx.show_grid ? "Hide" : "Show");
-            if (GuiButton((Rectangle){btn_x, BUTTON_MARGIN, BUTTON_SIZE, BUTTON_SIZE}, GuiIconText(ICON_GRID, ""))) GUI_EVENT(IE_SHOW_GRID);
-            btn_x -= BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){btn_x, button_margin, button_size, button_size}, GuiIconText(ICON_GRID, ""))) GUI_EVENT(IE_SHOW_GRID);
+            btn_x -= button_size + button_distance;
         }
 
         int btn_y = ctx.screen_height / 2;
@@ -5274,13 +5602,13 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
         if ((ctx.mode == MODE_SPAWN || ctx.mode == MODE_DELETE) && !ctx.local_game) {
             GuiSetState(STATE_NORMAL);
             set_button_tooltip(IE_BRUSH_REDUCE, "Reduce brush size");
-            if (GuiButton((Rectangle){ctx.screen_width - BUTTON_MARGIN - SMALL_BUTTON_SIZE, btn_y, SMALL_BUTTON_SIZE, SMALL_BUTTON_SIZE}, GuiIconText(ICON_BOX_MINUS_FILL, ""))) GUI_EVENT(IE_BRUSH_REDUCE);
-            btn_y -= SMALL_BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){ctx.screen_width - button_margin - small_button_size, btn_y, small_button_size, small_button_size}, GuiIconText(ICON_BOX_MINUS_FILL, ""))) GUI_EVENT(IE_BRUSH_REDUCE);
+            btn_y -= small_button_size + button_distance;
 
             GuiSetState(STATE_NORMAL);
             set_button_tooltip(IE_BRUSH_INCRASE, "Incrase brush size");
-            if (GuiButton((Rectangle){ctx.screen_width - BUTTON_MARGIN - SMALL_BUTTON_SIZE, btn_y, SMALL_BUTTON_SIZE, SMALL_BUTTON_SIZE}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_BRUSH_INCRASE);
-            btn_y -= SMALL_BUTTON_SIZE + BUTTON_DISTANCE;
+            if (GuiButton((Rectangle){ctx.screen_width - button_margin - small_button_size, btn_y, small_button_size, small_button_size}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_BRUSH_INCRASE);
+            btn_y -= small_button_size + button_distance;
         }
     }
     
@@ -5291,14 +5619,14 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     // for (int event = 0; event < IE_COUNT; event++) {
     //     DrawCircle(22 + 20*event, ctx.screen_height - 20, 7, GET_EVENT(event) ? GREEN : BLACK);
     //     if (GetMouseX() > (22 + 20*event - 7) && GetMouseX() < (22 + 20*event + 7) && GetMouseY() > ctx.screen_height - 40)
-    //         DrawText(TextFormat("%d", event), 15 + 20*event, ctx.screen_height - 45, 15, BLACK);
+    //         DrawText(TextFormat("%d", event), 15 + ctx.text_size*event, ctx.screen_height - 45, 15, BLACK);
     // }
 
-    const int y = ctx.show_gui ? (BUTTON_MARGIN + BUTTON_SIZE + 20 + BUTTON_MARGIN) : (TEXT_MARGIN);
-    const int x = ctx.screen_width - TEXT_MARGIN;
+    const int y = ctx.show_gui ? (button_margin + button_size + 20 + BUTTON_MARGIN) : (text_margin);
+    const int x = ctx.screen_width - text_margin;
     
-    DrawFPS(x - MeasureText(TextFormat("%d FPS", GetFPS()), 20), y + 22*0);
-    
+    DrawFPS(x - MeasureText(TextFormat("%d FPS", GetFPS()), ctx.text_size), y + ctx.line_height * 0);
+ 
     // Draw "Mode" label
     const char *mode_text = NULL;
     switch (ctx.mode) {
@@ -5312,7 +5640,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
         case MODE_LINE: mode_text = "Mode: Line"; break;
         default: break;
     }
-    DrawText(mode_text, x - MeasureText(mode_text, 20), y + 22*1, 20, BLACK);
+    DrawText(mode_text, x - MeasureText(mode_text, ctx.text_size), y + ctx.line_height * 1, ctx.text_size, BLACK);
     
     if (ctx.stage == STAGE_GAME && !ctx.local_game) {
         const char *text;
@@ -5325,14 +5653,14 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
 
         if (ctx.show_gui) {
             GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_RIGHT);
-            STYLE_START(DEFAULT, TEXT_SIZE, 20);
+            STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
                 const int width = (ctx.tps_display_type == TPS_HIDE) ? 35 : 180;
                 GuiSetState(STATE_NORMAL);
-                if (GuiLabelButton((Rectangle){ctx.screen_width - TEXT_MARGIN - width, y + 22*2, width, 27}, text)) GUI_EVENT(IE_CHANGE_TPS_DISPLAY);
+                if (GuiLabelButton((Rectangle){ctx.screen_width - text_margin - width, y + ctx.line_height * 2, width, 27}, text)) GUI_EVENT(IE_CHANGE_TPS_DISPLAY);
             STYLE_END();
             GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
         } else {
-            DrawText(text, ctx.screen_width - TEXT_MARGIN - MeasureText(text, 20), y + 22*2, 20, BLACK);
+            DrawText(text, ctx.screen_width - text_margin - MeasureText(text, ctx.text_size), y + ctx.line_height * 2, ctx.text_size, BLACK);
         }
     }
 
@@ -5351,7 +5679,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
     
-    // Draw log
+    // Draw log (in reverse order, from top to bottom)
     if (!ctx.local_game) {
         int line = 1;
         if (ctx.show_log) {
@@ -5361,10 +5689,10 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
                 line += ctx.log.items[idx].lines;
                 LogEntry *entry = &ctx.log.items[idx];
             
-                // DrawText(log_prefixes[entry->type], 10, screen_height - line*22 - 5, 20, log_colors[entry->type]);
-                // DrawText(entry->string, 40, screen_height - line*22 - 5, 20, BLACK);
+                // DrawText(log_prefixes[entry->type], 10, screen_height - line*22 - 5, ctx.text_size, log_colors[entry->type]);
+                // DrawText(entry->string, 40, screen_height - line*22 - 5, ctx.text_size, BLACK);
                 DrawText(TextFormat("%s%s", log_prefixes[entry->type], entry->string),
-                         TEXT_MARGIN, ctx.screen_height - line*22 - TEXT_MARGIN - 3, 20, log_colors[entry->type]);
+                         text_margin, ctx.screen_height - line * ctx.line_height - text_margin - 3, ctx.text_size, log_colors[entry->type]);
 
                 idx = (idx > 0)? (idx - 1) : ctx.log.max_len-1;
             }
@@ -5374,25 +5702,25 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
         if (ctx.show_gui) {
             line++;
             GuiSetState(STATE_NORMAL);
-            if (GuiLabelButton((Rectangle){TEXT_MARGIN-4, ctx.screen_height - line*22 - 22, 30, 30}, GuiIconText(ctx.show_log ? ICON_ARROW_DOWN_FILL : ICON_ARROW_UP_FILL, "")))
+            if (GuiLabelButton((Rectangle){text_margin-4, ctx.screen_height - (line) * ctx.line_height, 30, 30}, GuiIconText(ctx.show_log ? ICON_ARROW_DOWN_FILL : ICON_ARROW_UP_FILL, "")))
                 GUI_EVENT(IE_SHOW_LOG);
         }
     }
 
     // Draw keyboard input
     if (!ctx.local_game) {
-        DrawText(log_prefixes[L_INPUT], TEXT_MARGIN, ctx.screen_height - 22 - TEXT_MARGIN, 20, log_colors[L_INPUT]);
+        DrawText(log_prefixes[L_INPUT], text_margin, ctx.screen_height - ctx.line_height - text_margin, ctx.text_size, log_colors[L_INPUT]);
         if (!ctx.typing_keyboard_input)
-            DrawText("Press '/' or SPACE to start typing . . .", TEXT_MARGIN + MeasureText(log_prefixes[L_INPUT], 20), ctx.screen_height - 23 - TEXT_MARGIN, 20, GRAY);
+            DrawText("Press '/' or SPACE to start typing . . .", text_margin + MeasureText(log_prefixes[L_INPUT], ctx.text_size), ctx.screen_height - ctx.line_height - text_margin, ctx.text_size, GRAY);
         else {
             GuiDisableTooltip();
             GuiSetState(STATE_NORMAL);
-            STYLE_START(DEFAULT, TEXT_SIZE, 20);
+            STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
             STYLE_START(TEXTBOX, BORDER_WIDTH, 0);
             STYLE_START(TEXTBOX, BASE_COLOR_PRESSED, 0x00000000);
                 const bool enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
                 const char first_char = ctx.input_string[0];
-                if (GuiTextBox((Rectangle){TEXT_MARGIN + MeasureText(log_prefixes[L_INPUT], 20), ctx.screen_height - 23 - TEXT_MARGIN, 400, 25},
+                if (GuiTextBox((Rectangle){text_margin + MeasureText(log_prefixes[L_INPUT], ctx.text_size), ctx.screen_height - 23*ctx.settings_gui_scale - text_margin, 400, 25*ctx.settings_gui_scale},
                                ctx.input_string, LOG_BUF_SIZE, ctx.typing_keyboard_input)) {
                     ctx.typing_keyboard_input = !ctx.typing_keyboard_input;
                     if (enter)
@@ -5440,13 +5768,13 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
         for (int team = 0; team < TEAMS_COUNT; team++)
             total_boids_number += ctx.boids_number[team];
 
-        DrawText(TextFormat("ALL: %2d", total_boids_number), TEXT_MARGIN, y + 0, 20, BLACK);
-        DrawText(TextFormat("RED: %2d", ctx.boids_number[TEAM_RED]), TEXT_MARGIN, y + 30, 20, RED);
-        DrawText(TextFormat("BLUE: %2d", ctx.boids_number[TEAM_BLUE]), TEXT_MARGIN, y + 50, 20, BLUE);
-        DrawText(TextFormat("GREEN: %2d", ctx.boids_number[TEAM_GREEN]), TEXT_MARGIN, y + 70, 20, GREEN);
-        DrawText(TextFormat("YELLOW: %2d", ctx.boids_number[TEAM_YELLOW]), TEXT_MARGIN, y + 90, 20, ORANGE);
+        DrawText(TextFormat("ALL: %2d", total_boids_number), text_margin, y + 0*ctx.settings_text_scale, ctx.text_size, BLACK);
+        DrawText(TextFormat("RED: %2d", ctx.boids_number[TEAM_RED]), text_margin, y + 30*ctx.settings_text_scale, ctx.text_size, RED);
+        DrawText(TextFormat("BLUE: %2d", ctx.boids_number[TEAM_BLUE]), text_margin, y + 50*ctx.settings_text_scale, ctx.text_size, BLUE);
+        DrawText(TextFormat("GREEN: %2d", ctx.boids_number[TEAM_GREEN]), text_margin, y + 70*ctx.settings_text_scale, ctx.text_size, GREEN);
+        DrawText(TextFormat("YELLOW: %2d", ctx.boids_number[TEAM_YELLOW]), text_margin, y + 90*ctx.settings_text_scale, ctx.text_size, ORANGE);
     } else {
-        int text_y = (ctx.mode == MODE_WAIT) ? TEXT_MARGIN : y;
+        int text_y = (ctx.mode == MODE_WAIT) ? text_margin : y;
         
         int l = 0; // line
         pthread_mutex_lock(&players_mtx);
@@ -5490,7 +5818,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
             }
 
             if (str != NULL)
-                DrawText(str, TEXT_MARGIN, text_y + (l++)*22, 20, team_color);
+                DrawText(str, text_margin, text_y + (l++) * ctx.line_height, ctx.text_size, team_color);
         }
         pthread_mutex_unlock(&players_mtx);
     }
@@ -5531,23 +5859,105 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     }
 
     #undef BUTTON_SIZE
+    #undef SMALL_BUTTON_SIZE
     #undef BUTTON_DISTANCE
     #undef GROUP_DISTANCE
     #undef BUTTON_MARGIN
     #undef TEXT_MARGIN
 
-    if (ctx.exit_game_message) {
+    GuiUnlock();
+    
+    // "Do you really want to exit?" menu
+    if (ctx.foreground_menu == FGMENU_EXIT_ROOM) {
         GuiDisableTooltip();
         GuiSetState(STATE_NORMAL);
-        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Fade(RAYWHITE, 0.8f));
+        DrawRectangle(0, 0, ctx.screen_width, ctx.screen_height, Fade(RAYWHITE, 0.8f));
         int btn_active = -1;
         GuiMessageBox((Rectangle){ (float)GetScreenWidth()/2 - 125, (float)GetScreenHeight()/2 - 50, 250, 100 }, 
             GuiIconText(ICON_EXIT, "Exiting the game"), "Do you really want to exit?", "Yes;No", &btn_active);
 
-        if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.exit_game_message = false;
+        if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.foreground_menu = FGMENU_NONE;
         if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) next_menu = MENU_MAIN;
     }
     
+    // Show pause menu
+    if (ctx.foreground_menu == FGMENU_PAUSE) {
+        const int item_margin = ITEM_MARGIN * ctx.settings_gui_scale;
+        const int item_width = ITEM_WIDTH * ctx.settings_gui_scale;
+        const int item_height = ITEM_HEIGHT * ctx.settings_gui_scale;
+        const int item_spacing = ITEM_SPACING * ctx.settings_gui_scale;
+        // const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
+        const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
+        // const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
+        // const int checkbox_offset = -ctx.text_size/2.0f;
+        
+        bool active_gui = true;
+        
+        const int items_number = 5;
+        const int items_total_height = item_height*items_number + item_spacing*(items_number-1);
+        int y = ctx.screen_height / 2 - items_total_height / 2;
+        int x = ctx.screen_width/2.0f - item_width/2.0f;
+        
+        GuiDisableTooltip();
+        GuiSetState(STATE_NORMAL);
+        DrawRectangle(0, 0, ctx.screen_width, ctx.screen_height, Fade(RAYWHITE, 0.8f));
+        int r = GuiWindowBox((Rectangle){
+                             x - item_margin,
+                             y - RAYGUI_WINDOWBOX_STATUSBAR_HEIGHT - item_margin,
+                             item_width + item_margin*2,
+                             items_total_height + item_margin*2 + RAYGUI_WINDOWBOX_STATUSBAR_HEIGHT
+                         }, "Pause menu");
+        if (r) {
+            ctx.foreground_menu = FGMENU_NONE;
+        }
+
+        STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+        GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
+        
+        if (GuiButton((Rectangle){x, y, item_width, item_height},
+                      ctx.game_paused ? GuiIconText(ICON_PLAYER_PLAY, "Resume") : GuiIconText(ICON_PLAYER_PAUSE, "Pause"))) {
+            GUI_EVENT(IE_PAUSE);
+        }
+        y += item_height + item_spacing;
+
+        if (GuiButton((Rectangle){x, y, item_width, item_height}, GuiIconText(ICON_EXIT, "Exit the room"))) {
+            ctx.foreground_menu = FGMENU_EXIT_ROOM;
+        }
+        y += item_height + item_spacing;
+
+        if (GuiButton((Rectangle){x, y, item_width, item_height}, GuiIconText(ICON_EXIT, "Close game"))) {
+            ctx.foreground_menu = FGMENU_CLOSE_GAME;
+        }
+        y += item_height + item_spacing;
+
+        ITEM("Interface size", 0, y, {
+            static bool size_spinner_mode = false;
+    
+            if (GuiSpinner((Rectangle){ITEM_X, y, ITEM_W, item_height}, NULL, &ctx.settings_gui_value, MIN_GUI_SIZE, MAX_GUI_SIZE, size_spinner_mode)) {
+                size_spinner_mode = !size_spinner_mode;
+            }
+            if (!size_spinner_mode)
+                ctx.settings_gui_scale = ctx.settings_gui_value / 20.0f;
+
+            y += item_height + item_spacing;
+        });
+
+        ITEM("Text size", 0, y, {
+            static bool size_spinner_mode = false;
+    
+            if (GuiSpinner((Rectangle){ITEM_X, y, ITEM_W, item_height}, NULL, &ctx.settings_text_value, MIN_TEXT_SIZE, MAX_TEXT_SIZE, size_spinner_mode)) {
+                size_spinner_mode = !size_spinner_mode;
+            }
+            if (!size_spinner_mode)
+                ctx.settings_text_scale = ctx.settings_text_value / 20.0f;
+
+            y += item_height + item_spacing;
+        });
+
+        GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+        STYLE_END(); // TEXT_SIZE
+    }
+
     // END DRAWING -----------------------------------------------------------------------------
 
     handle_input();
