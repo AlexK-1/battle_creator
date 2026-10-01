@@ -43,6 +43,7 @@ typedef struct {
 
 typedef enum {
     SP_CLOSE,
+    SP_UDP_PING, // server->client ping
     SP_APPROVE_PLAYER, // Approve/reject request for new player
     SP_JOIN_PLAYER, // Player joined to the room (sent after the request to create/join to the room)
     SP_NEW_JOIN, // New player joined to the room
@@ -63,6 +64,7 @@ typedef enum {
 typedef enum {
     CP_CLOSE,
     CP_UDP_HELLO, // First client->server UDP packet
+    CP_UDP_PONG, // Answer to SP_UDP_PING
     CP_NEW_ROOM, // Create new room
     CP_JOIN_ROOM, // Join to the room
     CP_APPROVE_PLAYER, // Approve/reject new player

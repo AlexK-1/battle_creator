@@ -261,7 +261,7 @@ typedef struct {
     BoidTeam player_team;
     uint32_t approved_player_id;
     char approved_player_username[USERNAME_LEN], username[USERNAME_LEN], orig_username[USERNAME_LEN], server[INET_ADDRSTRLEN];
-    int tcp_port, udp_port;
+    int tcp_port, udp_port, server_tcp_fd;
 
     // Game control
     bool show_log, show_grid, show_health, game_paused, show_arrow, autoselect_mode, show_gui;
@@ -314,6 +314,12 @@ typedef struct {
     } tps_display_type;
     int server_tps, server_target_tps;
 } GameContext;
+
+typedef enum {
+    PROTOCOL_NONE,
+    PROTOCOL_TCP,
+    PROTOCOL_UDP
+} TransportProtocol;
 
 GameContext ctx = {.running = true, .stage = STAGE_AREAS, .mode = MODE_WAIT, .chunk_size = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS,
                    .chunk_size_local = DEFAULT_SERVER_CHUNK_SIZE_PIXELS, .chunk_size_multiplayer = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS,
@@ -381,10 +387,27 @@ int _check_field(int condition, uint8_t packet_type) {
             return 1;                                                                                                       \
     } while (0)
 
-int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
+int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data, TransportProtocol protocol) {
     char *d = packet_data;
     
     switch (packet_type) {
+    case SP_UDP_PING: {
+        if (protocol != PROTOCOL_UDP || !ctx.udp_opened)
+            break;
+
+        /* CP_UDP_HELLO PACKET FORMAT
+        (uint32 player_id) (int32_t player_tcp_fd)
+        */
+        
+        char buf[sizeof(uint32_t) + sizeof(int32_t)];
+        char *b = buf;
+        PUSH_DATA(b, uint32_t, htonl(ctx.player_id));
+        PUSH_DATA(b, int32_t, htonl(ctx.server_tcp_fd));
+
+        sendto_packet(ctx.udp_fd, CP_UDP_PONG, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
+        
+        break;
+    }
     case SP_JOIN_PLAYER: { // This player has joined (or not) to the room
         /* SP_JOIN_PLAYER PACKET FORMAT
         (uint8 status)
@@ -450,8 +473,8 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
         ctx.player_id = ntohl(POP_DATA(d, uint32_t));
         CHECK_FIELD(ctx.player_id > 0);
 
-        int32_t server_tcp_fd = ntohl(POP_DATA(d, int32_t));
-        CHECK_FIELD(server_tcp_fd > 0);
+        ctx.server_tcp_fd = ntohl(POP_DATA(d, int32_t));
+        CHECK_FIELD(ctx.server_tcp_fd > 0);
 
         ctx.players_number = POP_DATA(d, uint8_t);
         CHECK_FIELD(ctx.players_number <= TEAMS_COUNT);
@@ -515,7 +538,7 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data) {
             char buf[sizeof(uint32_t) + sizeof(int32_t)];
             char *b = buf;
             PUSH_DATA(b, uint32_t, htonl(ctx.player_id));
-            PUSH_DATA(b, int32_t, htonl(server_tcp_fd));
+            PUSH_DATA(b, int32_t, htonl(ctx.server_tcp_fd));
 
             sendto_packet(ctx.udp_fd, CP_UDP_HELLO, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
         }
@@ -1031,11 +1054,7 @@ void *net_thread_fn(void *arg) {
     }
     free(arg);
     
-    enum {
-        SYNC_PROTO_NONE = 0,
-        SYNC_PROTO_TCP,
-        SYNC_PROTO_UDP,
-    } sync_proto = SYNC_PROTO_NONE;
+    TransportProtocol sync_proto = PROTOCOL_NONE;
     
     struct timeval timeout;
     fd_set read_fds;
@@ -1154,12 +1173,12 @@ void *net_thread_fn(void *arg) {
                         break;
                     }
 
-                    if (process_data(packet_type, packet_size, packet_data)) {
+                    if (process_data(packet_type, packet_size, packet_data, PROTOCOL_TCP)) {
                         free(packet_data);
                         break;
                     }
-                    if (packet_type == SP_BOIDS_SYNC && sync_proto != SYNC_PROTO_TCP) {
-                        sync_proto = SYNC_PROTO_TCP;
+                    if (packet_type == SP_BOIDS_SYNC && sync_proto != PROTOCOL_TCP) {
+                        sync_proto = PROTOCOL_TCP;
                         log_message(&ctx.log, L_DEBUG, "Using TCP as a protocol for boids sync\n");
                     }
                     free(packet_data);
@@ -1195,10 +1214,10 @@ void *net_thread_fn(void *arg) {
                         char *packet_data = recv_buf + 1 + sizeof(packet_size); // Skip header
 
                         if ((uint32_t)n == (1 + sizeof(packet_size) + packet_size)) {
-                            if (process_data(packet_type, packet_size, packet_data))
+                            if (process_data(packet_type, packet_size, packet_data, PROTOCOL_UDP))
                                 break;
-                            if (packet_type == SP_BOIDS_SYNC && sync_proto != SYNC_PROTO_UDP) {
-                                sync_proto = SYNC_PROTO_UDP;
+                            if (packet_type == SP_BOIDS_SYNC && sync_proto != PROTOCOL_UDP) {
+                                sync_proto = PROTOCOL_UDP;
                                 log_message(&ctx.log, L_DEBUG, "Using UDP as a protocol for boids sync\n");
                             }
                         }
