@@ -36,8 +36,13 @@
 #endif
 
 #define CFLAGS_COMMON "-std=c99 -Wall -Iraylib "
+#ifdef _WIN32
+    #define ASAN_FLAG ""
+#else
+    #define ASAN_FLAG "-fsanitize=address"
+#endif
 #ifdef DEBUG
-    #define CFLAGS CFLAGS_COMMON "-Wextra -pedantic -g -fsanitize=address -DDEBUG "
+    #define CFLAGS CFLAGS_COMMON "-Wextra -pedantic -g " ASAN_FLAG " -DDEBUG "
 #else
     #define CFLAGS CFLAGS_COMMON "-O2 "
 #endif
@@ -48,7 +53,7 @@
     #ifdef DEBUG
         #define LDFLAGS ""
     #else
-        #define LDFLAGS "-static -static-libgcc -s "
+        #define LDFLAGS "-mwindows -static -static-libgcc -s "
     #endif
     #define LDFLAGS_CLIENT LDFLAGS RAYLIB_LINK "-lraylib -lpthread -lopengl32 -lgdi32 -lwinmm -lkernel32 -luser32 -lshell32 -lws2_32 "
     #define LDFLAGS_SERVER LDFLAGS
@@ -95,6 +100,16 @@
 
 
 #define FILE_NEWER(st1, st2) ((st1).st_mtime > (st2).st_mtime)
+
+char *strdup(const char *str) {
+    int len = strlen(str);
+    char *new_str = malloc(len+1);
+    
+    memcpy(new_str, str, len);
+    new_str[len] = '\0';
+
+    return new_str;
+}
 
 typedef enum {
     BUILD_OK = 0,

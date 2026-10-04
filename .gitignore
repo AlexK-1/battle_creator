@@ -4,4 +4,5 @@ client
 build
 boids
 *.o
+*.exe
 settings.cfg

@@ -518,7 +518,7 @@ ConfigTable *config_parse(const char *str, int len, ConfigFailData *fail_data) {
                 char *p;
                 value.v.i = strtol(int_ptr, &p, base);
 
-                if (*p != '\n' && *p != ';' && *p != '\0') FAIL();
+                if (*p != '\n' && *p != '\r' && *p != ';' && *p != '\0') FAIL();
             } else if (token.type == TOKEN_BOOL) {
                 value.type = CONF_BOOL;
                 if (strncmp(token.ptr, "true", token.len) == 0)
@@ -621,7 +621,7 @@ ConfigTable *config_parse_file(FILE *file, ConfigFailData *fail_data) {
     fseek(file, 0, SEEK_SET);
 
     char *str = malloc(size);
-    fread(str, 1, size, file);
+    size = fread(str, 1, size, file);
 
     ConfigTable *table = config_parse(str, size, fail_data);
     

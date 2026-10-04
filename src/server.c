@@ -423,11 +423,12 @@ void *room_thread_fn(void *args) {
     double delay = 0.0;
     int timer = 0;
 
-    // Set all user's last_udp_probe to the current time
+    // Set all user's last_udp_probe to the current time - 10.
+    // It is necessary in order to do a UDP probe immediately when starting the game
     time_t current = time(NULL);
     for (int i = 0; i < room->joined_players; i++) {
         room->players[i]->wait_udp_probe = false;
-        room->players[i]->last_udp_probe = current;
+        room->players[i]->last_udp_probe = current - 10;
     }
     
     while (room->thread_run && boids_count > 0) {
@@ -473,15 +474,16 @@ void *room_thread_fn(void *args) {
                 Player *p = room->players[i];
                 if (p->udp_set) {
                     time_t diff = current_time - p->last_udp_probe;
-                    // If last probe was made more than 15 seconds ago, send a new probe
-                    if (!p->wait_udp_probe && diff > 15) {
+                    // If last probe was made more than 10 seconds ago, send a new probe
+                    if (!p->wait_udp_probe && diff > 10) {
                         p->wait_udp_probe = true;
-                        sendto_packet(udp_fd, SP_UDP_PING, NULL, 0, 0, (struct sockaddr*)&p->udp_addr, sizeof(p->udp_addr));
+                        sendto_packet(udp_fd, SP_PING, NULL, 0, 0, (struct sockaddr*)&p->udp_addr, sizeof(p->udp_addr));
                     }
 
-                    // If last probe was made more than 20 seconds ago, disable UDP sync
-                    else if (p->wait_udp_probe && diff > 20) {
-                        write_log(L_INFO, "id=%d lost UDP connection\n", p->id);
+                    // If last probe was made more than 13 seconds ago, disable UDP sync
+                    else if (p->wait_udp_probe && diff > 13) {
+                        if (p->udp_enabled)
+                            write_log(L_DEBUG, "id=%d lost UDP connection\n", p->id);
                         p->udp_enabled = false;
                         p->wait_udp_probe = false;
                         p->last_udp_probe = current_time;
@@ -2036,11 +2038,8 @@ int main(int argc, char **argv) {
                     if (p != NULL && p->id == player_id && !p->udp_enabled) {
                         p->udp_addr = client_addr;
                         p->udp_set = true;
-                        p->wait_udp_probe = true;
-
-                        sendto_packet(udp_fd, SP_UDP_PING, NULL, 0, 0, (struct sockaddr*)&client_addr, client_len);
                     }
-                } else if (packet_type == CP_UDP_PONG) {
+                } else if (packet_type == CP_PONG) {
                     /* CP_UDP_PONG PACKET FORMAT
                     (uint32 player_id) (int32_t player_tcp_fd)
                     */
@@ -2059,10 +2058,11 @@ int main(int argc, char **argv) {
                     Player *p = players[player_tcp_fd];
                     
                     if (p != NULL && p->id == player_id && p->wait_udp_probe) {
+                        if (!p->udp_enabled)
+                            write_log(L_DEBUG, "id=%d enabled UDP sync\n", p->id);
                         p->udp_enabled = true;
                         p->wait_udp_probe = false;
                         p->last_udp_probe = time(NULL);
-                        write_log(L_DEBUG, "id=%d enabled UDP sync\n", p->id);
                     }
                 }
             } else if (events[i].data.fd == STDIN_FILENO) {

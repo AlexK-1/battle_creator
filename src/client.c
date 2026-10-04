@@ -49,6 +49,7 @@
 #define DEFAULT_HIDE_GUI false
 #define DEFAULT_AUTOSELECT true
 #define DEFAULT_HIDE_AREAS false
+#define DEFAULT_DISPLAY_MODE DISPLAY_BORDERLESS
 
 #define DEFAULT_GUI_SIZE 20
 #define MIN_GUI_SIZE 5
@@ -173,7 +174,7 @@ ClientPlayer *find_player(ClientPlayer *players, uint32_t id) {
 }
 
 
-/* <=========================================== NETWORK THREAD AND CONTEXT ===========================================> */
+/* <===================================================== CONTEXT ====================================================> */
 
 #define INPUT_STRING_LEN 1024
 
@@ -216,6 +217,13 @@ typedef enum {
     FGMENU_RESET_SETTINGS
 } ForegroundMenuType;
 
+typedef enum {
+    DISPLAY_WINDOWED,
+    DISPLAY_BORDERLESS,
+    DISPLAY_FULLSCREEN,
+} DisplayMode;
+#define DISPLAY_MODES "Windowed;Borderless windowed;Exclusive fullscreen"
+
 typedef struct {
     // String input
     bool get_input, input_received, typing_keyboard_input;
@@ -232,7 +240,7 @@ typedef struct {
     bool udp_opened;
 
     // Global game
-    bool running, game_initialized, net_thread_running, local_game, cli_run, reset_game;
+    bool raylib_initialized, running, game_initialized, net_thread_running, local_game, cli_run, reset_game;
     BoidIndex boids_number[TEAMS_COUNT], total_boids_number;
     int screen_width, screen_height;
     struct {
@@ -241,6 +249,7 @@ typedef struct {
     RoomStage stage;
     GameMode mode;
     GameMenu menu;
+    DisplayMode display_mode;
     Log log;
 
     // Boids
@@ -321,12 +330,13 @@ typedef enum {
     PROTOCOL_UDP
 } TransportProtocol;
 
-GameContext ctx = {.running = true, .stage = STAGE_AREAS, .mode = MODE_WAIT, .chunk_size = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS,
-                   .chunk_size_local = DEFAULT_SERVER_CHUNK_SIZE_PIXELS, .chunk_size_multiplayer = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS,
-                   .players_number = DEFAULT_PLAYERS_COUNT, .world_size = {DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y},
-                   .username = DEFAULT_USERNAME, .server = DEFAULT_SERVER, .tcp_port = TCP_PORT, .udp_port = UDP_PORT,
-                   .show_log = true, .autoselect_mode = true, .show_gui = true, .brush_size = 1, .action = ACT_STOP,
-                   .settings_file_name = DEFAULT_SETTINGS_FILE, .selecting_team = TEAM_RED, .tps_display_type = TPS_NUM};
+GameContext ctx = {.running = true, .stage = STAGE_AREAS, .display_mode = DISPLAY_WINDOWED, .mode = MODE_WAIT,
+                   .chunk_size = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS, .chunk_size_local = DEFAULT_SERVER_CHUNK_SIZE_PIXELS,
+                   .chunk_size_multiplayer = DEFAULT_CLIENT_CHUNK_SIZE_PIXELS, .players_number = DEFAULT_PLAYERS_COUNT,
+                   .world_size = {DEFAULT_WORLD_SIZE_X, DEFAULT_WORLD_SIZE_Y}, .username = DEFAULT_USERNAME, .server = DEFAULT_SERVER,
+                   .tcp_port = TCP_PORT, .udp_port = UDP_PORT, .show_log = true, .autoselect_mode = true, .show_gui = true,
+                   .brush_size = 1, .action = ACT_STOP, .settings_file_name = DEFAULT_SETTINGS_FILE, .selecting_team = TEAM_RED,
+                   .tps_display_type = TPS_NUM};
 
 // The message will disappear after the first moving to next menu if save_message is not true
 void set_menu_message(MenuMessageType type, bool save_message, const char *msg) {
@@ -340,6 +350,30 @@ void set_menu_message(MenuMessageType type, bool save_message, const char *msg) 
 void clear_menu_message(void) {
     ctx.message_text = NULL;
 }
+
+void set_display_mode(DisplayMode new_mode) {
+    if (ctx.display_mode == new_mode) return;
+    if (!ctx.raylib_initialized) {
+        ctx.display_mode = new_mode;
+        return;
+    }
+    
+    if (ctx.display_mode == DISPLAY_FULLSCREEN)
+        ToggleFullscreen();
+    else if (ctx.display_mode == DISPLAY_BORDERLESS)
+        ToggleBorderlessWindowed();
+
+    ctx.display_mode = new_mode;
+    if (new_mode == DISPLAY_FULLSCREEN)
+        ToggleFullscreen();
+    else if (new_mode == DISPLAY_BORDERLESS)
+        ToggleBorderlessWindowed();
+    else  if (new_mode == DISPLAY_WINDOWED)
+        MaximizeWindow();
+}
+
+
+/* <================================================= NETWORK THREAD =================================================> */
 
 pthread_t net_thread;
 pthread_mutex_t areas_mtx;
@@ -391,7 +425,7 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data, T
     char *d = packet_data;
     
     switch (packet_type) {
-    case SP_UDP_PING: {
+    case SP_PING: {
         if (protocol != PROTOCOL_UDP || !ctx.udp_opened)
             break;
 
@@ -404,7 +438,7 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data, T
         PUSH_DATA(b, uint32_t, htonl(ctx.player_id));
         PUSH_DATA(b, int32_t, htonl(ctx.server_tcp_fd));
 
-        sendto_packet(ctx.udp_fd, CP_UDP_PONG, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
+        sendto_packet(ctx.udp_fd, CP_PONG, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
         
         break;
     }
@@ -565,11 +599,11 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data, T
         POP_MEM(d, ctx.approved_player_username, USERNAME_LEN);
         ctx.approved_player_username[USERNAME_LEN-1] = '\0';
 
+        log_message(&ctx.log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", ctx.approved_player_username);
+
         pthread_mutex_lock(&input_mtx);
         ctx.get_input = true;
         pthread_mutex_unlock(&input_mtx);
-
-        log_message(&ctx.log, L_QUESTION, "team of new player '%s' (r/b/g/y or n for reject):\n", ctx.approved_player_username);
 
         break;   
         }
@@ -818,7 +852,7 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data, T
         break;
         }
     case SP_INVALID_PACKET: {
-        write_log(L_INFO, "the server received an invalid packet; check the compatibillity of the server and client verions\n");
+        write_log(L_INFO, "the server received an invalid packet; check the compatibility of the server and client versions\n");
         
         break;
         }
@@ -1288,7 +1322,7 @@ CommandInfo commands_list[] = {
 };
 const int commands_count = sizeof(commands_list)/sizeof(commands_list[0]);
 
-char *autocomple_word(char *word) {
+char *autocomplete_word(char *word) {
     static char new_word[LOG_BUF_SIZE];
     strcpy(new_word, word);
 
@@ -1347,7 +1381,7 @@ char *autocomple_word(char *word) {
 
 #define CHECK_ADMIN()                                                                              \
     if (get_player_idx(ctx.players, ctx.player_id) != 0) {                                         \
-        log_message(&ctx.log, L_WARNING, "command %s is not aviable\n", argv[0]);                  \
+        log_message(&ctx.log, L_WARNING, "command %s is not available\n", argv[0]);                  \
         return 1;                                                                                  \
     }
 
@@ -1617,6 +1651,7 @@ typedef enum {
     IE_CLEAR_ORDERS,
     IE_DELETE_SELECTED_BOIDS,
     IE_PAUSE,
+    IE_DISPLAY_MODE,
     IE_CHANGE_GUI_DISPLAY,
     IE_EXIT_ROOM,
     IE_CHAT_MSG,
@@ -1625,7 +1660,7 @@ typedef enum {
     IE_INPUT_END,
     IE_START_PLACING,
     IE_READY,
-    IE_BRUSH_INCRASE,
+    IE_BRUSH_INCREASE,
     IE_BRUSH_REDUCE,
     IE_TEAM_RED,
     IE_TEAM_BLUE,
@@ -1659,11 +1694,11 @@ typedef enum {
     IMOD_CTRL = 1,
     IMOD_ALT = 2,
     IMOD_SHIFT = 4
-} InputModificator;
+} InputModifier;
 
 typedef enum {
     KTYPE_PRESS = 0,
-    KTYPE_REPEATE,
+    KTYPE_REPEAT,
     KTYPE_DOWN,
     KTYPE_RELEASE,
     KTYPE_UP,
@@ -1689,7 +1724,7 @@ typedef struct {
     bool use_mb;
     MouseInputType mb_type;
     uint8_t mb_mod; // or'ed mouse modifier keys
-    float mwf; // mouse weel factor
+    float mwf; // mouse wheel factor
     // Game status
     RoomStage gstage1, gstage2; // game stage
     GameMode gmode; // game mode
@@ -1707,6 +1742,7 @@ InputBinding bindings[] = {
     [IE_CLEAR_ORDERS]           = {.kb1 = KEY_Z, .gstage1 = STAGE_GAME},
     [IE_DELETE_SELECTED_BOIDS]  = {.kb1 = KEY_X, .gstage1 = STAGE_PLACING, .gmode = MODE_SELECT, .gloc = true},
     [IE_PAUSE]                  = {.kb1 = KEY_SPACE, .goloc = true},
+    [IE_DISPLAY_MODE]           = {.kb1 = KEY_F11},
     [IE_CHANGE_GUI_DISPLAY]     = {.kb1 = KEY_I},
     [IE_EXIT_ROOM]              = {.kb1 = KEY_Q, .kb_mod = IMOD_CTRL},
     [IE_CHAT_MSG]               = {.kb1 = KEY_SPACE, .gomul = true},
@@ -1714,8 +1750,8 @@ InputBinding bindings[] = {
     [IE_COMMAND]                = {.kb1 = KEY_SLASH, .kb2 = KEY_KP_DIVIDE, .gomul = true},
     [IE_START_PLACING]          = {.kb1 = KEY_ENTER, .gstage1 = STAGE_AREAS},
     [IE_READY]                  = {.kb1 = KEY_ENTER, .gstage1 = STAGE_PLACING},
-    [IE_BRUSH_INCRASE]          = {.kb1 = KEY_P, .kb_type = KTYPE_REPEATE, .mb_mod = IMOD_CTRL, .mwf = 1.0f, .gomul = true},
-    [IE_BRUSH_REDUCE]           = {.kb1 = KEY_O, .kb_type = KTYPE_REPEATE, .mb_mod = IMOD_CTRL, .mwf = -1.0f, .gomul = true},
+    [IE_BRUSH_INCREASE]         = {.kb1 = KEY_P, .kb_type = KTYPE_REPEAT, .mb_mod = IMOD_CTRL, .mwf = 1.0f, .gomul = true},
+    [IE_BRUSH_REDUCE]           = {.kb1 = KEY_O, .kb_type = KTYPE_REPEAT, .mb_mod = IMOD_CTRL, .mwf = -1.0f, .gomul = true},
     [IE_TEAM_RED]               = {.kb1 = KEY_Q, .gmode = MODE_AREAS, .gloc = true},
     [IE_TEAM_BLUE]              = {.kb1 = KEY_W, .gmode = MODE_AREAS, .gloc = true},
     [IE_TEAM_GREEN]             = {.kb1 = KEY_E, .gmode = MODE_AREAS, .gloc = true},
@@ -1732,8 +1768,8 @@ InputBinding bindings[] = {
     [IE_BOID_ACT_ATTACK]        = {.kb1 = KEY_TWO, .gstage1 = STAGE_GAME},
     [IE_BOID_ACT_RETREAT]       = {.kb1 = KEY_THREE, .gstage1 = STAGE_GAME},
     [IE_CAMERA_MOVE]            = {.mb = MOUSE_BUTTON_LEFT, .use_mb = true},
-    [IE_CAMERA_ZOOM_IN]         = {.kb1 = KEY_EQUAL, .kb2 = KEY_KP_ADD,      .kb_type = KTYPE_REPEATE, .mwf = 1.0f},
-    [IE_CAMERA_ZOOM_OUT]        = {.kb1 = KEY_MINUS, .kb2 = KEY_KP_SUBTRACT, .kb_type = KTYPE_REPEATE, .mwf = -1.0f},
+    [IE_CAMERA_ZOOM_IN]         = {.kb1 = KEY_EQUAL, .kb2 = KEY_KP_ADD,      .kb_type = KTYPE_REPEAT, .mwf = 1.0f},
+    [IE_CAMERA_ZOOM_OUT]        = {.kb1 = KEY_MINUS, .kb2 = KEY_KP_SUBTRACT, .kb_type = KTYPE_REPEAT, .mwf = -1.0f},
     [IE_BORDER_MOVE]            = {.mb = MOUSE_BUTTON_LEFT, .use_mb = true, .mb_type = MTYPE_DOWN, .goloc = true},
     [IE_BORDER_MOVE_START]      = {.mb = MOUSE_BUTTON_LEFT, .use_mb = true, .mb_type = MTYPE_PRESS, .goloc = true},
     [IE_BORDER_MOVE_END]        = {.mb = MOUSE_BUTTON_LEFT, .use_mb = true, .mb_type = MTYPE_RELEASE, .goloc = true},
@@ -1784,7 +1820,7 @@ void handle_input() {
         bool (*key_fn)(int key) = IsKeyPressed;
         switch (b.kb_type) {
             case KTYPE_PRESS: key_fn = IsKeyPressed; break;
-            case KTYPE_REPEATE: key_fn = IsKeyPressed; break;
+            case KTYPE_REPEAT: key_fn = IsKeyPressed; break;
             case KTYPE_DOWN: key_fn = IsKeyDown; break;
             case KTYPE_RELEASE: key_fn = IsKeyReleased; break;
             case KTYPE_UP: key_fn = IsKeyDown; break;
@@ -1804,8 +1840,8 @@ void handle_input() {
             (!b.gomul || !ctx.local_game) &&
             (!b.goloc || ctx.local_game) &&
             (!ctx.typing_keyboard_input) &&
-            ((b.kb1 != KEY_NULL && (key_fn(b.kb1) || (b.kb_type == KTYPE_REPEATE && IsKeyPressedRepeat(b.kb1))) && CHECK_MOD(b.kb_mod)) ||
-             (b.kb2 != KEY_NULL && (key_fn(b.kb2) || (b.kb_type == KTYPE_REPEATE && IsKeyPressedRepeat(b.kb2))) && CHECK_MOD(b.kb_mod)) ||
+            ((b.kb1 != KEY_NULL && (key_fn(b.kb1) || (b.kb_type == KTYPE_REPEAT && IsKeyPressedRepeat(b.kb1))) && CHECK_MOD(b.kb_mod)) ||
+             (b.kb2 != KEY_NULL && (key_fn(b.kb2) || (b.kb_type == KTYPE_REPEAT && IsKeyPressedRepeat(b.kb2))) && CHECK_MOD(b.kb_mod)) ||
              (((b.use_mb && (mouse_button_fn(b.mb))) || b.mwf*ctx.mouse_wheel > 0) && CHECK_MOD(b.mb_mod)) ||
              GET_GUI_EVENT(event))) {
             SET_EVENT(event);
@@ -1876,7 +1912,7 @@ void handle_input() {
                 pthread_mutex_unlock(&input_mtx);
                 break;
             
-            case IE_BRUSH_INCRASE:
+            case IE_BRUSH_INCREASE:
             case IE_BRUSH_REDUCE:
                 if (wheel == 0) wheel = b.mwf;
                 ctx.brush_size += wheel * MAX(1, roundf(logf(ctx.brush_size)));
@@ -2098,6 +2134,10 @@ void process_settings() {
         ctx.settings_text_scale = MAX_TEXT_SIZE / 20.0f;
     ctx.settings_text_value = ctx.settings_text_scale * 20;
     
+    // Display mode
+    ConfigValue *display_mode_value = config_table_get(ctx.settings, "display_mode");
+    set_display_mode((display_mode_value != NULL && display_mode_value->type == CONF_INT) ? display_mode_value->v.i : DEFAULT_DISPLAY_MODE);
+
     // Servers list
     ConfigValue *servers_value = config_table_get(ctx.settings, "servers");
     
@@ -2180,6 +2220,18 @@ void process_settings() {
     }
 }
 
+void set_default_settings() {
+    ctx.settings_hide_gui = DEFAULT_HIDE_GUI;
+    ctx.settings_autoselect = DEFAULT_AUTOSELECT;
+    set_display_mode(DEFAULT_DISPLAY_MODE);
+            
+    ctx.settings_gui_value = DEFAULT_GUI_SIZE;
+    ctx.settings_gui_scale = DEFAULT_GUI_SIZE / 20.0f;
+
+    ctx.settings_text_value = DEFAULT_TEXT_SIZE;
+    ctx.settings_text_scale = DEFAULT_TEXT_SIZE / 20.0f;
+}
+
 void save_settings() {
     if (ctx.settings == NULL)
         return;
@@ -2202,6 +2254,8 @@ void save_settings() {
         config_table_insert(ctx.settings, "gui_size", config_int(ctx.settings_gui_value));
 
         config_table_insert(ctx.settings, "text_size", config_int(ctx.settings_text_value));
+
+        config_table_insert(ctx.settings, "display_mode", config_int(ctx.display_mode));
 
         // Remove "--custom--" server from config (it should not be saved to a file)
         if (ctx.settings_servers != NULL) {
@@ -2671,11 +2725,21 @@ int main(int argc, char **argv) {
     }
     
     // Init Raylib
-    SetTraceLogLevel(LOG_WARNING);
-    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_FULLSCREEN_MODE);
+    #ifndef DEBUG
+        SetTraceLogLevel(LOG_WARNING);
+    #else
+        SetTraceLogLevel(LOG_INFO);
+    #endif
+    SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE); // FLAG_FULLSCREEN_MODE
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Battle creator");
     SetTargetFPS(60);
     SetExitKey(0);
+    ctx.raylib_initialized = true;
+
+    DisplayMode dm = ctx.display_mode; // Save old display mode
+    ctx.display_mode = DISPLAY_WINDOWED; // Set display mode to windowed
+    MaximizeWindow();
+    set_display_mode(dm); // Reset to the old display mode
 
     // Textures
     Image image = LoadImage("resources/texture.png");
@@ -2700,15 +2764,33 @@ int main(int argc, char **argv) {
 
     bool exit_window = false;
 
+    // dm = display mode
+    int dm_message_timer = 0;
+    bool dm_message_show = false;
+    char *dm_message_text;
+
     while (!exit_window) {
-        // if (WindowShouldClose()) show_exit_message = true;
-        if (WindowShouldClose()) exit_window = true;
-        // if (IsKeyPressed(KEY_ESCAPE) && ctx.foreground_menu == FGMENU_NONE && ctx.menu != MENU_GAME) ctx.foreground_menu = FGMENU_CLOSE_GAME;
-        if (IsKeyPressed(KEY_ESCAPE)) {
+        if (WindowShouldClose()) {
+            if (ctx.menu == MENU_GAME)
+                ctx.foreground_menu = FGMENU_CLOSE_GAME; // Show exit message
+            else
+                exit_window = true; // Close game
+        } else if (IsKeyPressed(KEY_ESCAPE)) {
             if (ctx.foreground_menu == FGMENU_NONE) {
-                ctx.foreground_menu = (ctx.menu == MENU_GAME) ? FGMENU_PAUSE : FGMENU_CLOSE_GAME;
+                ctx.foreground_menu = (ctx.menu == MENU_GAME) ? FGMENU_PAUSE : FGMENU_CLOSE_GAME; // Show exit/pause menu
             } else {
-                ctx.foreground_menu = FGMENU_NONE;
+                ctx.foreground_menu = FGMENU_NONE; // Hide message
+            }
+        }
+        
+        if (IsKeyPressed(bindings[IE_DISPLAY_MODE].kb1)) {
+            set_display_mode((ctx.display_mode + 1) % 3);
+            dm_message_timer = 0;
+            dm_message_show = true;
+            switch (ctx.display_mode) {
+                case DISPLAY_WINDOWED: dm_message_text = "Display mode: Windowed"; break;
+                case DISPLAY_BORDERLESS: dm_message_text = "Display mode: Borderless windowed"; break;
+                case DISPLAY_FULLSCREEN: dm_message_text = "Display mode: Exclusive fullscreen"; break;
             }
         }
         
@@ -2803,6 +2885,18 @@ int main(int argc, char **argv) {
         }
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
         
+        // Draw a display mode message (appears for 2.5 seconds, then disappears in 1 second)
+        if (dm_message_show) {
+            Rectangle msg_recatangle = (Rectangle){0, 100, ctx.screen_width, 30};
+            STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+            GuiDrawText(dm_message_text, msg_recatangle, TEXT_ALIGN_CENTER, ColorAlpha(BLACK, 1 - ((dm_message_timer - 2.5*60) / 60.0f)));
+            STYLE_END();
+
+            dm_message_timer++;
+            if (dm_message_timer > 3.5*60)
+                dm_message_show = false;
+        }
+
         GuiUnlock();
         
         // Display a message before exiting
@@ -2814,7 +2908,10 @@ int main(int argc, char **argv) {
             GuiMessageBox((Rectangle){ (float)GetScreenWidth()/2 - 125, (float)GetScreenHeight()/2 - 50, 250, 100 }, 
                 GuiIconText(ICON_EXIT, "Close Window"), "Do you really want to exit?", "Yes;No", &btn_active);
 
-            if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.foreground_menu = FGMENU_NONE;
+            if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) {
+                ToggleBorderlessWindowed();
+                ctx.foreground_menu = FGMENU_NONE;
+            }
             if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) exit_window = true;
         }
 
@@ -3207,10 +3304,10 @@ void exit_game(void) {
     do {                                                                                                                 \
         int __label_width = MeasureText(n ": ", ctx.text_size);                                                          \
         int __margin = (x);                                                                                              \
-        STYLE_START(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);                                                           \
+        int __old_text_alignment = GuiGetStyle(DEFAULT, TEXT_ALIGNMENT);                                                 \
+        GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);                                                           \
         GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f + __margin, (y), item_width, item_height}, n ": "); \
-        STYLE_END();                                                                                                     \
-        if (!active_gui) GuiLock();                                                                                      \
+        GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, __old_text_alignment);                                                      \
         __VA_ARGS__                                                                                                      \
     } while (0)
 
@@ -3374,6 +3471,8 @@ GameMenu new_menu(void) {
                                    // All items that may be under GuiDropdownBox should be locked using GuiLock() function
                                    // when active_gui is false
 
+    if (!active_gui) GuiLock(); // Lock all items when any GuiDropdownBox is active
+
     static ConfigTable *selected_server = NULL;
     static int selected_server_idx = 0;
 
@@ -3473,7 +3572,7 @@ GameMenu new_menu(void) {
             y += item_height + item_inner_spacing;
         });
 
-        const int port_textbox_width = 70;
+        const int port_textbox_width = 80;
             
         ITEM("TCP port", 50, y, {
             static bool tcp_valuebox_mode = false;
@@ -3575,7 +3674,6 @@ GameMenu new_menu(void) {
     set_menu_message(MESSAGE_WARNING, false, warning_text);
     
     // "Back" and "Create" buttons
-    if (!active_gui) GuiLock(); // Lock items when any GuiDropdownBox is active
     const int back_btn_width = item_height; // Square button
     if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, back_btn_width, item_height}, GuiIconText(ICON_EXIT, "")))
         next_menu = MENU_MAIN;
@@ -3584,7 +3682,6 @@ GameMenu new_menu(void) {
         next_menu = MENU_LOADING;
     y += item_height + item_spacing;
     GuiSetState(STATE_NORMAL);
-    GuiUnlock();
     
     // GuiDropdownBox must draw after any other control that can be covered on unfolding
 
@@ -3593,16 +3690,13 @@ GameMenu new_menu(void) {
         const int dropdown_width = 100 * ctx.settings_gui_scale;
         static bool team_dropdown_mode = false;
         const int item_x = ITEM_X;
-
-        if (!active_gui && !team_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
         
         if (GuiDropdownBox((Rectangle){item_x, y, dropdown_width, item_height}, TEAMS_LIST, (int*)&ctx.player_team, team_dropdown_mode)) {
             team_dropdown_mode = !team_dropdown_mode;
+            printf("press %d\n", team_dropdown_mode);
         }
         if (team_dropdown_mode) active_dropdown = true;
         draw_info(item_x + dropdown_width + item_inner_spacing, y, "Your team at the beginning");
-
-        GuiUnlock();
     });
     
     y = boids_dropdown_y;
@@ -3631,11 +3725,9 @@ GameMenu new_menu(void) {
         bool delete = false;
         GuiSetState(STATE_NORMAL);
         for (int i = teams_count-1; i >= 0; i--) {
-            if (!active_gui && !teams[i].dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
             if (GuiDropdownBox((Rectangle){item_x, y, dropdown_width, item_height}, TEAMS_LIST, &teams[i].selected_team, teams[i].dropdown_mode))
                 teams[i].dropdown_mode = !teams[i].dropdown_mode;
             if (teams[i].dropdown_mode) active_dropdown = true;
-            GuiUnlock();
 
             if (GuiSpinner((Rectangle){item_x + dropdown_width + item_inner_spacing, y, item_w - dropdown_width - item_inner_spacing*2 - btn_width, item_height}, NULL, &teams[i].boids_number, 0, MAX_BOIDS_COUNT, teams[i].valuebox_mode))
                 teams[i].valuebox_mode = !teams[i].valuebox_mode;
@@ -3685,8 +3777,6 @@ GameMenu new_menu(void) {
 
             // Servers dropdown
             static bool server_dropdown_mode = false;
-
-            if (!active_gui && !server_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
 
             if (GuiDropdownBox((Rectangle){item_x, y, item_w - item_inner_spacing*4 - item_height*4, item_height},
                                ctx.settings_servers_names.str, &selected_server_idx, server_dropdown_mode)) {
@@ -3751,8 +3841,6 @@ GameMenu new_menu(void) {
             GuiDisableTooltip();
 
             STYLE_END(); // TEXT_SIZE
-            
-            GuiUnlock();
         });
     }
     
@@ -3794,6 +3882,8 @@ GameMenu join_menu(void) {
                                    // All items that may be under GuiDropdownBox should be locked using GuiLock() function
                                    // when active_gui is false
 
+    if (!active_gui) GuiLock(); // Lock all items when any GuiDropdownBox is active
+    
     static ConfigTable *selected_server = NULL;
     static int selected_server_idx = 0;
 
@@ -3895,7 +3985,7 @@ GameMenu join_menu(void) {
             y += item_height + ITEM_INNER_SPACING;
         });
 
-        const int port_textbox_width = 70;
+        const int port_textbox_width = 80;
         
         ITEM("TCP port", 50, y, {
             static bool tcp_valuebox_mode = false;
@@ -3954,7 +4044,6 @@ GameMenu join_menu(void) {
     set_menu_message(MESSAGE_WARNING, false, warning_text);
     
     // "Back" and "Join" buttons
-    if (!active_gui) GuiLock(); // Lock items when any GuiDropdownBox is active
     const int back_btn_width = item_height; // Square button
     if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, back_btn_width, item_height}, GuiIconText(ICON_EXIT, "")))
         next_menu = MENU_MAIN;
@@ -3963,7 +4052,6 @@ GameMenu join_menu(void) {
         next_menu = MENU_LOADING;
     y += item_height + item_spacing;
     GuiSetState(STATE_NORMAL);
-    GuiUnlock();
     
     // GuiDropdownBox must draw after any other control that can be covered on unfolding
 
@@ -3975,8 +4063,6 @@ GameMenu join_menu(void) {
 
             // Servers dropdown
             static bool server_dropdown_mode = false;
-
-            if (!active_gui && !server_dropdown_mode) GuiLock(); // Lock this GuiDropdownBox when any other GuiDropdownBox is active
 
             if (GuiDropdownBox((Rectangle){item_x, y, item_w - ITEM_INNER_SPACING*4 - item_height*4, item_height},
                                ctx.settings_servers_names.str, &selected_server_idx, server_dropdown_mode)) {
@@ -4041,8 +4127,6 @@ GameMenu join_menu(void) {
             GuiDisableTooltip();
 
             STYLE_END(); // TEXT_SIZE
-            
-            GuiUnlock();
         });
     }
     
@@ -4077,8 +4161,6 @@ GameMenu local_menu(void) {
     int y = ctx.screen_height / 2 - (item_height*items_number + item_spacing*(items_number-1)) / 2;
 
     GameMenu next_menu = 0;
-
-    static bool active_gui = true;
 
     STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
@@ -4128,7 +4210,12 @@ GameMenu settings_menu(void) {
 
     GameMenu next_menu = 0;
 
-    static bool active_gui = true;
+    bool active_dropdown = false;  // true if at least one GuiDropdownBox is active
+    static bool active_gui = true; // false if active_dropdown is true;
+                                   // All items that may be under GuiDropdownBox should be locked using GuiLock() function
+                                   // when active_gui is false
+
+    if (!active_gui) GuiLock(); // Lock all items when any GuiDropdownBox is active
 
     STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
@@ -4173,6 +4260,10 @@ GameMenu settings_menu(void) {
         y += item_height + item_spacing;
     });
 
+    // Reserve place for "Display mode" item
+    int display_dropdown_y = y;
+    y += item_height + item_spacing;
+
     y += item_spacing;
     
     if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width/2.0f - item_spacing/2.0f, item_height},
@@ -4200,11 +4291,29 @@ GameMenu settings_menu(void) {
         next_menu = MENU_MAIN;
     y += item_height + item_spacing;
     
+    // GuiDropdownBox must draw after any other control that can be covered on unfolding
+
+    y = display_dropdown_y;
+    ITEM("Display mode", 0, y, {
+        static bool display_dropdown_mode = false;
+        static int selected_display_mode = DEFAULT_DISPLAY_MODE;
+        
+        selected_display_mode = ctx.display_mode;
+        if (GuiDropdownBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, DISPLAY_MODES, &selected_display_mode, display_dropdown_mode)) {
+            if (display_dropdown_mode)
+                set_display_mode(selected_display_mode);
+            display_dropdown_mode = !display_dropdown_mode;
+        }
+        if (display_dropdown_mode) active_dropdown = true;
+    });
+
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
     STYLE_END(); // TEXT_SIZE
+
+    active_gui = !active_dropdown;
     
     GuiUnlock();
-    
+
     if (ctx.foreground_menu == FGMENU_CLEAR_DATA) {
         GuiDisableTooltip();
         GuiSetState(STATE_NORMAL);
@@ -4236,16 +4345,7 @@ GameMenu settings_menu(void) {
             GuiIconText(ICON_EXIT, "Reset settings"), "Do you really want to reset settings to default?", "Yes;No", &btn_active);
 
         if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.foreground_menu = FGMENU_NONE;
-        if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) {
-            ctx.settings_hide_gui = DEFAULT_HIDE_GUI;
-            ctx.settings_autoselect = DEFAULT_AUTOSELECT;
-            
-            ctx.settings_gui_value = DEFAULT_GUI_SIZE;
-            ctx.settings_gui_scale = DEFAULT_GUI_SIZE / 20.0f;
-
-            ctx.settings_text_value = DEFAULT_TEXT_SIZE;
-            ctx.settings_text_scale = DEFAULT_TEXT_SIZE / 20.0f;
-        }
+        if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) set_default_settings();
     }
     
     return next_menu;
@@ -4544,7 +4644,7 @@ void set_button_tooltip(InputEvent event, const char *format, ...) {
 
 // Draw current FPS
 // NOTE: Uses default font
-void DrawFPS(int posX, int posY)
+void draw_fps(int posX, int posY)
 {
     Color color = LIME;                         // Good FPS
     int fps = GetFPS();
@@ -5625,8 +5725,8 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
             btn_y -= small_button_size + button_distance;
 
             GuiSetState(STATE_NORMAL);
-            set_button_tooltip(IE_BRUSH_INCRASE, "Incrase brush size");
-            if (GuiButton((Rectangle){ctx.screen_width - button_margin - small_button_size, btn_y, small_button_size, small_button_size}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_BRUSH_INCRASE);
+            set_button_tooltip(IE_BRUSH_INCREASE, "Incrase brush size");
+            if (GuiButton((Rectangle){ctx.screen_width - button_margin - small_button_size, btn_y, small_button_size, small_button_size}, GuiIconText(ICON_BOX_MORE, ""))) GUI_EVENT(IE_BRUSH_INCREASE);
             btn_y -= small_button_size + button_distance;
         }
     }
@@ -5644,7 +5744,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     const int y = ctx.show_gui ? (button_margin + button_size + 20 + BUTTON_MARGIN) : (text_margin);
     const int x = ctx.screen_width - text_margin;
     
-    DrawFPS(x - MeasureText(TextFormat("%d FPS", GetFPS()), ctx.text_size), y + ctx.line_height * 0);
+    draw_fps(x - MeasureText(TextFormat("%d FPS", GetFPS()), ctx.text_size), y + ctx.line_height * 0);
  
     // Draw "Mode" label
     const char *mode_text = NULL;
@@ -5763,7 +5863,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
                         word[word_len] = '\0';
 
                         // Get new word
-                        char *new_word = autocomple_word(word);
+                        char *new_word = autocomplete_word(word);
                         int new_word_len = strlen(new_word);
         
                         // Insert new word
@@ -5909,14 +6009,19 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
         const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
         // const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
         // const int checkbox_offset = -ctx.text_size/2.0f;
-        
-        bool active_gui = true;
-        
-        const int items_number = 5;
+
+        const int items_number = 6;
         const int items_total_height = item_height*items_number + item_spacing*(items_number-1);
         int y = ctx.screen_height / 2 - items_total_height / 2;
         int x = ctx.screen_width/2.0f - item_width/2.0f;
         
+        bool active_dropdown = false;  // true if at least one GuiDropdownBox is active
+        static bool active_gui = true; // false if active_dropdown is true;
+                                    // All items that may be under GuiDropdownBox should be locked using GuiLock() function
+                                    // when active_gui is false
+
+        if (!active_gui) GuiLock(); // Lock all items when any GuiDropdownBox is active
+
         GuiDisableTooltip();
         GuiSetState(STATE_NORMAL);
         DrawRectangle(0, 0, ctx.screen_width, ctx.screen_height, Fade(RAYWHITE, 0.8f));
@@ -5973,8 +6078,30 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
             y += item_height + item_spacing;
         });
 
+        // Reserve place for "Display mode" item
+        int display_dropdown_y = y;
+        y += item_height + item_spacing;
+
+        // GuiDropdownBox must draw after any other control that can be covered on unfolding
+
+        y = display_dropdown_y;
+        ITEM("Display mode", 0, y, {
+            static bool display_dropdown_mode = false;
+            static int selected_display_mode = DEFAULT_DISPLAY_MODE;
+            
+            selected_display_mode = ctx.display_mode;
+            if (GuiDropdownBox((Rectangle){ITEM_X, y, ITEM_W, item_height}, DISPLAY_MODES, &selected_display_mode, display_dropdown_mode)) {
+                if (display_dropdown_mode)
+                    set_display_mode(selected_display_mode);
+                display_dropdown_mode = !display_dropdown_mode;
+            }
+            if (display_dropdown_mode) active_dropdown = true;
+        });
+
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
         STYLE_END(); // TEXT_SIZE
+
+        active_gui = !active_dropdown;
     }
 
     // END DRAWING -----------------------------------------------------------------------------
