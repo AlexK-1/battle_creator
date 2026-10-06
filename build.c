@@ -96,6 +96,16 @@
 
 #define FILE_NEWER(st1, st2) ((st1).st_mtime > (st2).st_mtime)
 
+char *strdup(const char *str) {
+    int len = strlen(str);
+    char *new_str = malloc(len+1);
+    
+    memcpy(new_str, str, len);
+    new_str[len] = '\0';
+
+    return new_str;
+}
+
 typedef enum {
     BUILD_OK = 0,
     BUILD_COMPILATION_ERR,

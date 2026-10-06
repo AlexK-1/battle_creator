@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/eventfd.h>
 #include <ctype.h>
 
 #define RAYMATH_STATIC_INLINE
@@ -117,8 +118,9 @@ typedef struct Player {
 
     bool udp_enabled; // can send messages to udp_addr
     bool udp_set; // udp_addr is set
-    bool wait_udp_probe;
-    time_t last_udp_probe;
+    short udp_succes, tcp_fall;
+    bool wait_udp_pong, wait_tcp_pong;
+    time_t last_ping;
 } Player;
 
 typedef struct Room {
@@ -136,16 +138,29 @@ typedef struct Room {
     RoomStage stage;
 } Room;
 
-/* V global variables V */
 Player **players = NULL;
 uint32_t last_player_id = 0; // 0 must be an invalid player id
+
 Room *rooms[MAX_ROOMS] = { 0 };
 int32_t last_room_idx = -1;
+
+// When the main thread receives the event, it will close all clients from the list
+int close_clients_event = 0; // eventfd
+int close_clients_count = 0;
+pthread_mutex_t close_clients_mtx;
+typedef struct {
+    // Arguments for close_client function
+    int fd;
+    DisconnectionReason reason;
+    bool cl_room;
+} CloseClientData;
+#define MAX_CLOSE_CLIENT_COUNT 16
+CloseClientData close_clients_data[MAX_CLOSE_CLIENT_COUNT] = { 0 };
+
 int chunk_size = CHUNK_SIZE_PIXELS, epfd, tcp_fd, udp_fd;
 bool udp_opened = false;
 long max_fd;
 int tps = DEFAULT_TPS;
-/* ^ global variables ^ */
 
 // Search by id or fd among the ROOM players
 int get_player_idx(Player **players, int fd, uint32_t id) {
@@ -216,23 +231,27 @@ void close_client(int fd, DisconnectionReason reason, bool cl_room) {
     //cl_room - close the room if admin is disconnected
     
     Player *p = players[fd];
+    if (p == NULL)
+        return;
 
+    write_log(L_DISCONNECT, "fd=%d id=%d hung up\n", fd, p->id);
+    
     // Room
     bool room_closed = false;
     if (p->joined && p->room != NULL) {
         Room *room = p->room;
 
+        pthread_mutex_lock(&room->players_mtx);
+
         int player_idx = get_player_idx(room->players, p->tcp_fd, 0);
 
         // Send a message to all players in the room that the player has disconnected
         uint32_t nid = htonl(p->id);
-        pthread_mutex_lock(&room->players_mtx);
         for (int i = 0; i < room->joined_players; i++) {
             Player *op = room->players[i];
             if (op->id != room->players[player_idx]->id)
-                send_packet(op->tcp_fd, SP_PLAYER_EXIT, &nid, sizeof(op->id), MSG_NOSIGNAL);
+               send_packet(op->tcp_fd, SP_PLAYER_EXIT, &nid, sizeof(op->id), MSG_NOSIGNAL);
         }
-        pthread_mutex_unlock(&room->players_mtx);
 
         /* SP_DISCONNECT_PLAYER PACKET FORMAT
         (uint8 reason)
@@ -245,17 +264,16 @@ void close_client(int fd, DisconnectionReason reason, bool cl_room) {
             (room->stage == STAGE_PLACING && player_idx == 0 && cl_room) || // Room's creator disconnected
              room->joined_players == 1) { // Last player disconnected
             p->joined = false;
+            pthread_mutex_unlock(&room->players_mtx);
             close_room(room, DISCONNECT_ADMIN_EXITED); // Close entire room
             room_closed = true;
         } else {
             // Delete player from array
-            pthread_mutex_lock(&room->players_mtx);
             memmove(room->players + player_idx, room->players + player_idx + 1,
                     sizeof(room->players[0]) * (room->joined_players - player_idx - 1));
             room->joined_players--;
             pthread_mutex_unlock(&room->players_mtx);
         }
-
     }
 
     if (!room_closed) {
@@ -310,13 +328,25 @@ void close_client(int fd, DisconnectionReason reason, bool cl_room) {
             }
         }
 
-        write_log(L_DISCONNECT, "fd=%d id=%d hung up\n", fd, p->id);
-        
         if (p->net.data_buf != NULL)
             free(p->net.data_buf);
         free(p);
         players[fd] = NULL;
     }
+}
+
+void pending_close_client(int fd, DisconnectionReason reason, bool cl_room) {
+    pthread_mutex_lock(&close_clients_mtx);
+    
+    if (close_clients_count < MAX_CLOSE_CLIENT_COUNT) {
+        CloseClientData new_data = {.fd = fd, .reason = reason, .cl_room = cl_room};
+        close_clients_data[close_clients_count++] = new_data;
+
+        uint64_t count = 1;
+        write(close_clients_event, &count, sizeof(count));
+    }
+
+    pthread_mutex_unlock(&close_clients_mtx);
 }
 
 void *room_thread_fn(void *args) {
@@ -423,11 +453,12 @@ void *room_thread_fn(void *args) {
     double delay = 0.0;
     int timer = 0;
 
-    // Set all user's last_udp_probe to the current time
+    // Set all user's last_udp_probe to the current time - 10.
+    // It is necessary in order to do a UDP probe immediately when starting the game
     time_t current = time(NULL);
     for (int i = 0; i < room->joined_players; i++) {
-        room->players[i]->wait_udp_probe = false;
-        room->players[i]->last_udp_probe = current;
+        room->players[i]->wait_udp_pong = false;
+        room->players[i]->last_ping = current - 10;
     }
     
     while (room->thread_run && boids_count > 0) {
@@ -467,27 +498,44 @@ void *room_thread_fn(void *args) {
 
         pthread_mutex_lock(&room->boids_mtx);
         if (timer == 0 || room->sync_boids) {
-            // Check playrs last UDP probe
+            // Check playrs last ping
             time_t current_time = time(NULL);
+            pthread_mutex_lock(&room->players_mtx);
             for (int i = 0; i < room->joined_players; i++) {
                 Player *p = room->players[i];
-                if (p->udp_set) {
-                    time_t diff = current_time - p->last_udp_probe;
-                    // If last probe was made more than 15 seconds ago, send a new probe
-                    if (!p->wait_udp_probe && diff > 15) {
-                        p->wait_udp_probe = true;
-                        sendto_packet(udp_fd, SP_UDP_PING, NULL, 0, 0, (struct sockaddr*)&p->udp_addr, sizeof(p->udp_addr));
+                time_t diff = current_time - p->last_ping;
+
+                // If last probe was made more than 7 seconds ago, send a new probe
+                if (!p->wait_udp_pong && !p->wait_tcp_pong && diff > 10) {
+                    p->wait_tcp_pong = true;
+                    p->wait_udp_pong = true;
+                    p->udp_succes = 0;
+                    p->last_ping = current_time;
+                    send_packet(p->tcp_fd, SP_PING, NULL, 0, 0); // TCP ping
+                    sendto_packet(udp_fd, SP_PING, NULL, 0, 0, (struct sockaddr*)&p->udp_addr, sizeof(p->udp_addr)); // UDP ping
+                }
+
+                // If last probe was made more than 3 seconds ago...
+                else if (diff > 3) {
+                    // disable UDP sync if less than 2 UDP pong were received
+                    if (p->udp_set && p->wait_udp_pong && p->udp_succes < 2) {
+                        if (p->udp_enabled)
+                            write_log(L_DEBUG, "id=%d lost UDP connection\n", p->id);
+                        p->udp_enabled = false;
+                        p->wait_udp_pong = false;
+                        p->udp_succes = 0;
                     }
 
-                    // If last probe was made more than 20 seconds ago, disable UDP sync
-                    else if (p->wait_udp_probe && diff > 20) {
-                        write_log(L_INFO, "id=%d lost UDP connection\n", p->id);
-                        p->udp_enabled = false;
-                        p->wait_udp_probe = false;
-                        p->last_udp_probe = current_time;
+                    // Close the client if he has not responded 3 times in a row
+                    if (p->wait_tcp_pong) {
+                        p->tcp_fall++;
+                        p->wait_tcp_pong = false;
+                        if (p->tcp_fall >= 3)
+                            pending_close_client(p->tcp_fd, DISCONNECT_PLAYER_EXITED, true);
                     }
                 }
             }
+            pthread_mutex_unlock(&room->players_mtx);
             
             // Send boids data to clients (boids sync)
 
@@ -646,6 +694,12 @@ void process_data(Player *p) {
     bool invalid_packet = false;
     
     switch (package_type) {
+    case CP_TCP_PONG: {
+        p->wait_tcp_pong = false;
+        p->tcp_fall = 0;
+
+        break;
+    }
     case CP_NEW_ROOM: {
         /* CP_NEW_ROOM
         (uint8 player_team) (uint8 players_number) (uint8 hide_areas) (uint16 world_size_x) (uint16 world_size_y)
@@ -1683,13 +1737,14 @@ void quit(int sig) {
     write_log(L_WARNING, "shutting down server\n");
 
     for (long i = 0; i < max_fd; i++) {
-        if (players[i] != NULL) {
-            // players[i]->joined = false;
+        if (players[i] != NULL)
             close_client(i, DISCONNECT_SERVER_DOWN, false);
-        };
     }
     free(players);
 
+    pthread_mutex_destroy(&close_clients_mtx);
+    
+    close(close_clients_event);
     close(epfd);
     close(tcp_fd);
     if (udp_opened)
@@ -1828,19 +1883,19 @@ int main(int argc, char **argv) {
     bool tcp_opened = false;
     tcp_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (tcp_fd < 0) {
-        perror("socket");
+        perror("socket tcp_fd");
         goto tcp_fail;
     }
 
     int opt = 1;
     if (setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt SO_REUSEADDR");
+        perror("setsockopt tcp_fd SO_REUSEADDR");
         goto tcp_fail;
     }
 
     opt = 1;
     if (setsockopt(tcp_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt))) {
-        perror("setsockopt TCP_NODELAY");
+        perror("setsockopt tcp_fd TCP_NODELAY");
         goto tcp_fail;
     }
     
@@ -1851,12 +1906,12 @@ int main(int argc, char **argv) {
 
     // Forcefully attaching socket to the port
     if (bind(tcp_fd, (struct sockaddr*)&tcp_servaddr, sizeof(tcp_servaddr)) < 0) {
-        perror("bind");
+        perror("bind tcp_fd");
         goto tcp_fail;
     }
 
     if (listen(tcp_fd, SOMAXCONN) < 0) {
-        perror("listen");
+        perror("listen tcp_fd");
         goto tcp_fail;
     }
 
@@ -1874,13 +1929,13 @@ int main(int argc, char **argv) {
     // Create a UDP socket
     udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (udp_fd < 0) {
-        perror("socket");
+        perror("socket udp_fd");
         goto udp_fail;
     }
 
     opt = 1;
     if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt SO_REUSEADDR");
+        perror("setsockopt udp_fd SO_REUSEADDR");
         close(udp_fd);
         goto udp_fail;
     }
@@ -1892,7 +1947,7 @@ int main(int argc, char **argv) {
 
     // Forcefully attaching socket to the port
     if (bind(udp_fd, (struct sockaddr*)&udp_servaddr, sizeof(udp_servaddr)) < 0) {
-        perror("bind");
+        perror("bind udp_fd");
         close(udp_fd);
         goto udp_fail;
     }
@@ -1914,25 +1969,51 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Add tcp_fd to epoll
     event.events = EPOLLIN;
     event.data.fd = tcp_fd;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, tcp_fd, &event)) {
-        perror("epoll_ctl");
+        perror("epoll_ctl tcp_fd");
         close(tcp_fd);
+        if (udp_opened)
+            close(udp_fd);
         close(epfd);
         return 1;
     }
 
+    // Add udp_fd to epoll
     if (udp_opened) {
         event.events = EPOLLIN;
         event.data.fd = udp_fd;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, udp_fd, &event)) {
             write_log(L_ERROR, "failed to add a UDP socket to epoll");
-            perror("epoll_ctl");
+            perror("epoll_ctl udp_fd");
             close(udp_fd);
         }
     }
 
+    // Create event_fd and add it to epoll
+    close_clients_event = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (close_clients_event < 0) {
+        perror("eventfd");
+        close(tcp_fd);
+        if (udp_opened)
+            close(udp_fd);
+        close(epfd);
+        return 1;
+    }
+    event.events = EPOLLIN;
+    event.data.fd = close_clients_event;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, close_clients_event, &event)) {
+        perror("epoll_ctl event_fd");
+        close(tcp_fd);
+        if (udp_opened)
+            close(udp_fd);
+        close(epfd);
+        return 1;
+    }
+    pthread_mutex_init(&close_clients_mtx, NULL);
+    
     if (fcntl(STDIN_FILENO, F_GETFD) != -1) {
         // Make stdin nonblocking
         int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
@@ -1941,8 +2022,10 @@ int main(int argc, char **argv) {
         // Add stdin to epoll
         event.events = EPOLLIN;
         event.data.fd = STDIN_FILENO;
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &event))
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &event)) {
+            perror("epoll_ctl stdin");
             write_log(L_WARNING, "stdin is invalid\n");
+        }
     } else {
         write_log(L_WARNING, "stdin is closed\n");
     }
@@ -2036,9 +2119,6 @@ int main(int argc, char **argv) {
                     if (p != NULL && p->id == player_id && !p->udp_enabled) {
                         p->udp_addr = client_addr;
                         p->udp_set = true;
-                        p->wait_udp_probe = true;
-
-                        sendto_packet(udp_fd, SP_UDP_PING, NULL, 0, 0, (struct sockaddr*)&client_addr, client_len);
                     }
                 } else if (packet_type == CP_UDP_PONG) {
                     /* CP_UDP_PONG PACKET FORMAT
@@ -2058,11 +2138,14 @@ int main(int argc, char **argv) {
 
                     Player *p = players[player_tcp_fd];
                     
-                    if (p != NULL && p->id == player_id && p->wait_udp_probe) {
-                        p->udp_enabled = true;
-                        p->wait_udp_probe = false;
-                        p->last_udp_probe = time(NULL);
-                        write_log(L_DEBUG, "id=%d enabled UDP sync\n", p->id);
+                    if (p != NULL && p->id == player_id) {
+                        p->udp_succes++;
+                        if (p->udp_succes >= 2) {
+                            if (!p->udp_enabled)
+                                write_log(L_DEBUG, "id=%d enabled UDP sync\n", p->id);
+                            p->udp_enabled = true;
+                            p->wait_udp_pong = false;
+                        }
                     }
                 }
             } else if (events[i].data.fd == STDIN_FILENO) {
@@ -2080,6 +2163,20 @@ int main(int argc, char **argv) {
                     running = false;
                     break;
                 }
+            } else if (events[i].data.fd == close_clients_event) {
+                // Close clients that are in the list
+                pthread_mutex_lock(&close_clients_mtx);
+
+                uint64_t count;
+                read(close_clients_event, &count, sizeof(count));
+                for (unsigned int i = 0; i < count; i++) {
+                    CloseClientData client_data = close_clients_data[i];
+                    close_client(client_data.fd, client_data.reason, client_data.cl_room);
+                }
+
+                close_clients_count = 0;
+
+                pthread_mutex_unlock(&close_clients_mtx);
             } else if (events[i].events & EPOLLERR) {
                 // Disconnect client
                 close_client(fd, DISCONNECT_SERVER_ERROR, true);

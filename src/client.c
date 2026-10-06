@@ -391,20 +391,23 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data, T
     char *d = packet_data;
     
     switch (packet_type) {
-    case SP_UDP_PING: {
-        if (protocol != PROTOCOL_UDP || !ctx.udp_opened)
-            break;
+    case SP_PING: {
+        if (protocol == PROTOCOL_TCP) {
+            send_packet(ctx.tcp_fd, CP_TCP_PONG, NULL, 0, 0);
+        } else if (protocol == PROTOCOL_UDP && ctx.udp_opened) {
+            /* CP_UDP_PONG PACKET FORMAT
+            (uint32 player_id) (int32_t player_tcp_fd)
+            */
 
-        /* CP_UDP_HELLO PACKET FORMAT
-        (uint32 player_id) (int32_t player_tcp_fd)
-        */
-        
-        char buf[sizeof(uint32_t) + sizeof(int32_t)];
-        char *b = buf;
-        PUSH_DATA(b, uint32_t, htonl(ctx.player_id));
-        PUSH_DATA(b, int32_t, htonl(ctx.server_tcp_fd));
+            char buf[sizeof(uint32_t) + sizeof(int32_t)];
+            char *b = buf;
+            PUSH_DATA(b, uint32_t, htonl(ctx.player_id));
+            PUSH_DATA(b, int32_t, htonl(ctx.server_tcp_fd));
 
-        sendto_packet(ctx.udp_fd, CP_UDP_PONG, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
+            // Send 3 PONG packets
+            for (int i = 0; i < 3; i++)
+                sendto_packet(ctx.udp_fd, CP_UDP_PONG, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
+        }
         
         break;
     }
@@ -540,7 +543,9 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data, T
             PUSH_DATA(b, uint32_t, htonl(ctx.player_id));
             PUSH_DATA(b, int32_t, htonl(ctx.server_tcp_fd));
 
-            sendto_packet(ctx.udp_fd, CP_UDP_HELLO, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
+            // Send UDP_HELLO 3 times
+            for (int i = 0; i < 3; i++)
+                sendto_packet(ctx.udp_fd, CP_UDP_HELLO, buf, sizeof(buf), 0, (struct sockaddr*)&ctx.udp_servaddr, sizeof(ctx.udp_servaddr));
         }
 
         pthread_mutex_unlock(&players_mtx);
@@ -3473,7 +3478,7 @@ GameMenu new_menu(void) {
             y += item_height + item_inner_spacing;
         });
 
-        const int port_textbox_width = 70;
+        const int port_textbox_width = 80;
             
         ITEM("TCP port", 50, y, {
             static bool tcp_valuebox_mode = false;
@@ -3895,7 +3900,7 @@ GameMenu join_menu(void) {
             y += item_height + ITEM_INNER_SPACING;
         });
 
-        const int port_textbox_width = 70;
+        const int port_textbox_width = 80;
         
         ITEM("TCP port", 50, y, {
             static bool tcp_valuebox_mode = false;
@@ -4544,7 +4549,7 @@ void set_button_tooltip(InputEvent event, const char *format, ...) {
 
 // Draw current FPS
 // NOTE: Uses default font
-void DrawFPS(int posX, int posY)
+void draw_fps(int posX, int posY)
 {
     Color color = LIME;                         // Good FPS
     int fps = GetFPS();
@@ -5644,7 +5649,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     const int y = ctx.show_gui ? (button_margin + button_size + 20 + BUTTON_MARGIN) : (text_margin);
     const int x = ctx.screen_width - text_margin;
     
-    DrawFPS(x - MeasureText(TextFormat("%d FPS", GetFPS()), ctx.text_size), y + ctx.line_height * 0);
+    draw_fps(x - MeasureText(TextFormat("%d FPS", GetFPS()), ctx.text_size), y + ctx.line_height * 0);
  
     // Draw "Mode" label
     const char *mode_text = NULL;
