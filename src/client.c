@@ -226,7 +226,7 @@ typedef enum {
 
 typedef struct {
     // String input
-    bool get_input, input_received, typing_keyboard_input;
+    bool get_input, typing_keyboard_input;
     char input_string[INPUT_STRING_LEN];
     
     // Message in menu
@@ -238,6 +238,7 @@ typedef struct {
     int tcp_fd, udp_fd;
     struct sockaddr_in udp_servaddr;
     bool udp_opened;
+    bool connected; // Connected to the server
 
     // Global game
     bool raylib_initialized, running, game_initialized, net_thread_running, local_game, cli_run, reset_game;
@@ -298,7 +299,7 @@ typedef struct {
     } settings_servers_names;
     float settings_gui_scale, settings_text_scale; // 1.0 - default
     int settings_gui_value, settings_text_value; // 20 - default
-    int text_size, line_height, icon_size;
+    int font_size, line_height, icon_size;
     
     // Changes from the second (network) thread
     GameMenu next_menu;
@@ -1063,7 +1064,7 @@ int process_data(uint8_t packet_type, uint32_t packet_size, char *packet_data, T
 #undef CHECK_FIELD
 
 void prepare_context(bool local, bool new_room, bool cli_run);
-void start_net_thread(bool create_sockets);
+void start_net_thread(bool new_sockets);
 void init_game(void);
 int create_sockets(void);
 void send_request_new(void);
@@ -1093,6 +1094,8 @@ void *net_thread_fn(void *arg) {
     }
     free(arg);
     
+    ctx.connected = true;
+    
     TransportProtocol sync_proto = PROTOCOL_NONE;
     
     struct timeval timeout;
@@ -1105,66 +1108,6 @@ void *net_thread_fn(void *arg) {
             break;
         }
         pthread_mutex_unlock(&running_mtx);
-        
-        pthread_mutex_lock(&input_mtx);
-        if (ctx.input_received) {
-            if (ctx.approved_player_id != 0) { // 0 is an invalid player id
-                bool ok = true;
-                int8_t team;
-
-                if (ctx.input_string[0] == 'n') {
-                    team = -1; // reject new player
-                } else {
-                    team = get_team_id(ctx.input_string);
-                    if (team < 0) {
-                        log_message(&ctx.log, L_WARNING, "enter valid team\n");
-                        ctx.get_input = true;
-                        ok = false;
-                    }
-                }
-
-                if (team >= 0) {
-                    if (ctx.boids_number[team] == 0) {
-                        log_message(&ctx.log, L_WARNING, "enter valid team\n");
-                        ctx.get_input = true;
-                        ok = false;
-                    }
-
-                    bool team_used = false;
-                    pthread_mutex_lock(&players_mtx);
-                    for (int i = 0; i < ctx.joined_players; i++) {
-                        if (ctx.players[i].team == team) {
-                            team_used = true;
-                            break;
-                        }
-                    }
-                    pthread_mutex_unlock(&players_mtx);
-                    if (team_used) {
-                        log_message(&ctx.log, L_WARNING, "enter an unused team\n");
-                        ctx.get_input = true;
-                        ok = false;
-                    }
-                }
-                
-                if (ok) {
-                    /* CP_APPROVE_PLAYER PACKET FORMAT
-                    (uint32 player_id) (int8 team)
-                    */
-
-                    const uint32_t packet_size = 4 + 1;
-                    char data[packet_size];
-                    char *d = data;
-
-                    PUSH_DATA(d, uint32_t, htonl(ctx.approved_player_id));
-                    PUSH_DATA(d, int8_t, team);
-                    
-                    send_packet(ctx.tcp_fd, CP_APPROVE_PLAYER, data, packet_size, 0);
-                }
-            }
-            
-            ctx.input_received = false;
-        }
-        pthread_mutex_unlock(&input_mtx);
         
         FD_ZERO(&read_fds);
         FD_SET(ctx.tcp_fd, &read_fds);
@@ -1656,6 +1599,7 @@ typedef enum {
     IE_CLEAR_ORDERS,
     IE_DELETE_SELECTED_BOIDS,
     IE_PAUSE,
+    IE_FORCE_EXIT,
     IE_DISPLAY_MODE,
     IE_CHANGE_GUI_DISPLAY,
     IE_EXIT_ROOM,
@@ -1696,8 +1640,9 @@ typedef enum {
 } InputEvent;
 
 typedef enum {
-    IMOD_CTRL = 1,
-    IMOD_ALT = 2,
+    IMOD_NONE  = 0,
+    IMOD_CTRL  = 1,
+    IMOD_ALT   = 2,
     IMOD_SHIFT = 4
 } InputModifier;
 
@@ -1730,7 +1675,7 @@ typedef struct {
     MouseInputType mb_type;
     uint8_t mb_mod; // or'ed mouse modifier keys
     float mwf; // mouse wheel factor
-    // Game status
+    // Game state
     RoomStage gstage1, gstage2; // game stage
     GameMode gmode; // game mode
     bool gomul; // multiplayer game only
@@ -1747,6 +1692,7 @@ InputBinding bindings[] = {
     [IE_CLEAR_ORDERS]           = {.kb1 = KEY_Z, .gstage1 = STAGE_GAME},
     [IE_DELETE_SELECTED_BOIDS]  = {.kb1 = KEY_X, .gstage1 = STAGE_PLACING, .gmode = MODE_SELECT, .gloc = true},
     [IE_PAUSE]                  = {.kb1 = KEY_SPACE, .goloc = true},
+    [IE_FORCE_EXIT]             = {.kb1 = KEY_ESCAPE, .kb_mod = IMOD_SHIFT},
     [IE_DISPLAY_MODE]           = {.kb1 = KEY_F11},
     [IE_CHANGE_GUI_DISPLAY]     = {.kb1 = KEY_I},
     [IE_EXIT_ROOM]              = {.kb1 = KEY_Q, .kb_mod = IMOD_CTRL},
@@ -1893,7 +1839,61 @@ void handle_input() {
 
                 if (ctx.get_input) {
                     ctx.get_input = false;
-                    ctx.input_received = true;
+
+                    if (ctx.approved_player_id != 0) { // 0 is an invalid player id
+                        bool ok = true;
+                        int8_t team;
+
+                        if (ctx.input_string[0] == 'n') {
+                            team = -1; // reject new player
+                        } else {
+                            team = get_team_id(ctx.input_string);
+                            if (team < 0) {
+                                log_message(&ctx.log, L_WARNING, "enter valid team\n");
+                                ctx.get_input = true;
+                                ok = false;
+                            }
+                        }
+
+                        if (team >= 0) {
+                            if (ctx.boids_number[team] == 0) {
+                                log_message(&ctx.log, L_WARNING, "enter valid team\n");
+                                ctx.get_input = true;
+                                ok = false;
+                            }
+
+                            bool team_used = false;
+                            pthread_mutex_lock(&players_mtx);
+                            for (int i = 0; i < ctx.joined_players; i++) {
+                                if (ctx.players[i].team == team) {
+                                    team_used = true;
+                                    break;
+                                }
+                            }
+                            pthread_mutex_unlock(&players_mtx);
+                            if (team_used) {
+                                log_message(&ctx.log, L_WARNING, "enter an unused team\n");
+                                ctx.get_input = true;
+                                ok = false;
+                            }
+                        }
+                
+                        if (ok) {
+                            /* CP_APPROVE_PLAYER PACKET FORMAT
+                            (uint32 player_id) (int8 team)
+                            */
+
+                            const uint32_t packet_size = 4 + 1;
+                            char data[packet_size];
+                            char *d = data;
+
+                            PUSH_DATA(d, uint32_t, htonl(ctx.approved_player_id));
+                            PUSH_DATA(d, int8_t, team);
+                    
+                            send_packet(ctx.tcp_fd, CP_APPROVE_PLAYER, data, packet_size, 0);
+                        }
+                    }
+            
                     log_message(&ctx.log, L_INPUT, "%s", ctx.input_string);
                 } else if (ctx.input_string[0] == '/') { // command
                     log_message(&ctx.log, L_INPUT, "%s", ctx.input_string);
@@ -2780,9 +2780,13 @@ int main(int argc, char **argv) {
                 ctx.foreground_menu = FGMENU_CLOSE_GAME; // Show exit message
             else
                 exit_window = true; // Close game
-        } else if (IsKeyPressed(KEY_ESCAPE)) {
+        }
+
+        // Esc = in MENU_GAME show pause menu, else show exit menu
+        // Shift + Esc = show exit menu
+        if (IsKeyPressed(KEY_ESCAPE)) {
             if (ctx.foreground_menu == FGMENU_NONE) {
-                ctx.foreground_menu = (ctx.menu == MENU_GAME) ? FGMENU_PAUSE : FGMENU_CLOSE_GAME; // Show exit/pause menu
+                ctx.foreground_menu = (ctx.menu == MENU_GAME && !GET_MOD(IMOD_SHIFT)) ? FGMENU_PAUSE : FGMENU_CLOSE_GAME; // Show exit/pause menu
             } else {
                 ctx.foreground_menu = FGMENU_NONE; // Hide message
             }
@@ -2799,7 +2803,7 @@ int main(int argc, char **argv) {
             }
         }
         
-        ctx.text_size = roundf(20 * ctx.settings_text_scale);
+        ctx.font_size = roundf(20 * ctx.settings_text_scale);
         ctx.line_height = roundf(20 * ctx.settings_text_scale + 2);
         
         ctx.screen_width = GetScreenWidth();
@@ -2877,7 +2881,7 @@ int main(int argc, char **argv) {
             GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
             GuiSetIconScale(2);
             STYLE_START(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(msg_color));
-            STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+            STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
             GuiLabel(msg_rectangle, GuiIconText(msg_icon, ctx.message_text));
             STYLE_END();
             STYLE_END();
@@ -2887,13 +2891,14 @@ int main(int argc, char **argv) {
                 if (CheckCollisionPointRec(GUI_POINTER_POSITION, msg_rectangle) && GUI_BUTTON_PRESSED)
                     ctx.message_text = NULL;
             }
+
+            GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
         }
-        GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
         
         // Draw a display mode message (appears for 2.5 seconds, then disappears in 1 second)
         if (dm_message_show) {
             Rectangle msg_recatangle = (Rectangle){0, 100, ctx.screen_width, 30};
-            STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+            STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
             GuiDrawText(dm_message_text, msg_recatangle, TEXT_ALIGN_CENTER, ColorAlpha(BLACK, 1 - ((dm_message_timer - 2.5*60) / 60.0f)));
             STYLE_END();
 
@@ -2913,10 +2918,7 @@ int main(int argc, char **argv) {
             GuiMessageBox((Rectangle){ (float)GetScreenWidth()/2 - 125, (float)GetScreenHeight()/2 - 50, 250, 100 }, 
                 GuiIconText(ICON_EXIT, "Close Window"), "Do you really want to exit?", "Yes;No", &btn_active);
 
-            if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) {
-                ToggleBorderlessWindowed();
-                ctx.foreground_menu = FGMENU_NONE;
-            }
+            if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.foreground_menu = FGMENU_NONE;
             if (btn_active == 1 || IsKeyPressed(KEY_ENTER)) exit_window = true;
         }
 
@@ -3099,9 +3101,9 @@ void prepare_context(bool local, bool new_room, bool cli_run) {
     ctx.show_arrow = false;
     
     ctx.get_input = false;
-    ctx.input_received = false;
     ctx.typing_keyboard_input = false;
 
+    ctx.connected = false;
     ctx.local_game = local;
     ctx.new_room = new_room;
     ctx.cli_run = cli_run;
@@ -3141,7 +3143,7 @@ void prepare_context(bool local, bool new_room, bool cli_run) {
 }
 
 // Start a thread to receive messages from the server
-void start_net_thread(bool create_sockets) {
+void start_net_thread(bool new_sockets) {
     if (ctx.local_game || ctx.net_thread_running)
         return;
 
@@ -3153,7 +3155,7 @@ void start_net_thread(bool create_sockets) {
     pthread_mutex_init(&players_mtx, NULL);
 
     bool *arg = malloc(1);
-    *(bool*)arg = create_sockets;
+    *(bool*)arg = new_sockets;
     pthread_create(&net_thread, NULL, net_thread_fn, arg);
     ctx.net_thread_running = true;
 }
@@ -3251,9 +3253,6 @@ void send_request_join(void) {
 }
 
 void exit_game(void) {
-    if (!ctx.game_initialized)
-        return;
-    
     if (!ctx.local_game && ctx.net_thread_running) {
         // Close the second (network) thread
         // pthread_cancel(net_thread);
@@ -3307,7 +3306,7 @@ void exit_game(void) {
 #define ITEM_W (item_width - __label_width - label_spacing - __margin)
 #define ITEM(n, x, y, ...)                                                                                               \
     do {                                                                                                                 \
-        int __label_width = MeasureText(n ": ", ctx.text_size);                                                          \
+        int __label_width = MeasureText(n ": ", ctx.font_size);                                                          \
         int __margin = (x);                                                                                              \
         int __old_text_alignment = GuiGetStyle(DEFAULT, TEXT_ALIGNMENT);                                                 \
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);                                                           \
@@ -3392,7 +3391,7 @@ GameMenu main_menu(void) {
 
     GameMenu next_menu = 0;
 
-    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
     if (GuiButton((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, y, item_width, item_height}, "New room")) {
@@ -3463,7 +3462,7 @@ GameMenu new_menu(void) {
     const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
     const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
     const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
-    const int checkbox_offset = -ctx.text_size/2.0f;
+    const int checkbox_offset = -ctx.font_size/2.0f;
     
     static bool hide_server_data = true;
     const int items_number = 11 - hide_server_data*4;
@@ -3497,10 +3496,11 @@ GameMenu new_menu(void) {
         selected_server_set = true;
     }
     
-    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
-    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, MAX(MIN(ctx.screen_height/4.0f, y - item_height - item_spacing), 0), item_width, item_height}, "Create a new game room");
+    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, MAX(MIN(ctx.screen_height/4.0f, y - item_height - item_spacing), 0), item_width, item_height},
+             "Create a new game room");
     
     ITEM("Username", 0, y, {
         static bool username_textbox_mode = false;
@@ -3908,12 +3908,13 @@ GameMenu join_menu(void) {
         selected_server_set = true;
     }
     
-    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
     const char *warning_text = NULL;
     
-    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, ctx.screen_height/4.0f, item_width, item_height}, "Join a game room");
+    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, MAX(MIN(ctx.screen_height/4.0f, y - item_height - item_spacing), 0), item_width, item_height},
+             "Join a game room");
     
     ITEM("Username", 0, y, {
         static bool username_textbox_mode = false;
@@ -4167,7 +4168,7 @@ GameMenu local_menu(void) {
 
     GameMenu next_menu = 0;
 
-    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
     GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, ctx.screen_height/4.0f, item_width, item_height}, "Launch the game locally");
@@ -4208,7 +4209,7 @@ GameMenu settings_menu(void) {
     // const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
     const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
     const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
-    const int checkbox_offset = -ctx.text_size/2.0f;
+    const int checkbox_offset = -ctx.font_size/2.0f;
     
     const int items_number = 7;
     int y = ctx.screen_height / 2 - (item_height*items_number + item_spacing*(items_number-1)) / 2;
@@ -4222,10 +4223,11 @@ GameMenu settings_menu(void) {
 
     if (!active_gui) GuiLock(); // Lock all items when any GuiDropdownBox is active
 
-    STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
-    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, ctx.screen_height/4.0f, item_width, item_height}, "Settings");
+    GuiLabel((Rectangle){ctx.screen_width/2.0f - item_width/2.0f, MAX(MIN(ctx.screen_height/4.0f, y - item_height - item_spacing), 0), item_width, item_height},
+             "Settings");
 
     ITEM("Hide GUI", 0, y, {
         GuiCheckBox((Rectangle){ITEM_X + checkbox_offset, y + item_height/2.0f - checkbox_size/2.0f, checkbox_size, checkbox_size}, NULL, &ctx.settings_hide_gui);
@@ -4358,6 +4360,14 @@ GameMenu settings_menu(void) {
 
 GameMenu loading_menu(void) {
     GameMenu next_menu = 0;
+
+    // const int item_width = ITEM_WIDTH * ctx.settings_gui_scale;
+    const int item_height = ITEM_HEIGHT * ctx.settings_gui_scale;
+    const int item_spacing = ITEM_SPACING * ctx.settings_gui_scale;
+    // const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
+    // const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
+    // const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
+    // const int checkbox_offset = -ctx.text_size/2.0f;
     
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
@@ -4374,12 +4384,20 @@ GameMenu loading_menu(void) {
     timer++;
     if (timer > 2*PI*100) timer -= 2*PI*100;
 
+    STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
+    
+    char *text = (!ctx.connected || ctx.new_room) ? "Connecting to the server" : "Waiting for a response from the room admin";
+    GuiLabel((Rectangle){0, ctx.screen_height - item_height*2 - item_spacing*2, ctx.screen_width, item_height},
+             text);
+    
     const int back_btn_width = 150;
     GuiSetState(STATE_NORMAL);
-    if (GuiButton((Rectangle){ctx.screen_width/2.0f - back_btn_width/2.0f, ctx.screen_height - ITEM_HEIGHT - ITEM_SPACING, back_btn_width, ITEM_HEIGHT}, GuiIconText(ICON_EXIT, "Back")))
+    if (GuiButton((Rectangle){ctx.screen_width/2.0f - back_btn_width/2.0f, ctx.screen_height - item_height - item_spacing, back_btn_width, item_height},
+                  GuiIconText(ICON_EXIT, "Back")))
         next_menu = MENU_MAIN;
 
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+    STYLE_END(); // TEXT_SIZE
     
     return next_menu;
 }
@@ -4657,7 +4675,7 @@ void draw_fps(int posX, int posY)
     if ((fps < 30) && (fps >= 15)) color = ORANGE;  // Warning FPS
     else if (fps < 15) color = RED;             // Low FPS
 
-    DrawText(TextFormat("%2i FPS", fps), posX, posY, ctx.text_size, color);
+    DrawText(TextFormat("%2i FPS", fps), posX, posY, ctx.font_size, color);
 }
 
 #define BUTTON_SIZE 60
@@ -5497,7 +5515,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     if (ctx.mode == MODE_SELECT && ctx.selecting) {
         float rectangleX = fmin(ctx.selection_start.x, ctx.mouse_position.x);
         float rectangleY = fmin(ctx.selection_start.y, ctx.mouse_position.y);
-        DrawText(TextFormat("%d", selected_boids_count), rectangleX, rectangleY-(ctx.text_size/ctx.camera.zoom), ctx.text_size/ctx.camera.zoom, BLACK);
+        DrawText(TextFormat("%d", selected_boids_count), rectangleX, rectangleY-(ctx.font_size/ctx.camera.zoom), ctx.font_size/ctx.camera.zoom, BLACK);
         DrawRectangleLinesEx((Rectangle){rectangleX, rectangleY,
                              fabs(ctx.mouse_position.x - ctx.selection_start.x), fabs(ctx.mouse_position.y - ctx.selection_start.y)},
                              thick, BLACK);
@@ -5550,10 +5568,229 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     const int button_margin = BUTTON_MARGIN * ctx.settings_gui_scale;
     const int text_margin = TEXT_MARGIN * ctx.settings_text_scale;
     
+
+    // // Draw events indicators
+    // DrawCircle(20, ctx.screen_height - 20, 10, GRAY);
+    // DrawLineEx((Vector2){20, ctx.screen_height - 20}, (Vector2){2 + IE_COUNT*20, ctx.screen_height - 20}, 20, GRAY);
+    // DrawCircle(4 + IE_COUNT*20, ctx.screen_height - 20, 10, GRAY);
+    // for (int event = 0; event < IE_COUNT; event++) {
+    //     DrawCircle(22 + 20*event, ctx.screen_height - 20, 7, GET_EVENT(event) ? GREEN : BLACK);
+    //     if (GetMouseX() > (22 + 20*event - 7) && GetMouseX() < (22 + 20*event + 7) && GetMouseY() > ctx.screen_height - 40)
+    //         DrawText(TextFormat("%d", event), 15 + ctx.text_size*event, ctx.screen_height - 45, 15, BLACK);
+    // }
+
+    const int y = ctx.show_gui ? (button_margin + button_size + 20 + BUTTON_MARGIN) : (text_margin);
+    const int x = ctx.screen_width - text_margin;
+    
+    draw_fps(x - MeasureText(TextFormat("%d FPS", GetFPS()), ctx.font_size), y + ctx.line_height * 0);
+ 
+    // Draw "Mode" label
+    const char *mode_text = NULL;
+    switch (ctx.mode) {
+        case MODE_WAIT: mode_text = "Mode: Wait"; break;
+        case MODE_AREAS: mode_text = "Mode: Areas"; break;
+        case MODE_SPAWN: mode_text = "Mode: Spawn"; break;
+        case MODE_DELETE: mode_text = "Mode: Delete"; break;
+        case MODE_SELECT: mode_text = "Mode: Select"; break;
+        case MODE_DIRECTION: mode_text = "Mode: Direction"; break;
+        case MODE_POINT: mode_text = "Mode: Point"; break;
+        case MODE_LINE: mode_text = "Mode: Line"; break;
+        default: break;
+    }
+    DrawText(mode_text, x - MeasureText(mode_text, ctx.font_size), y + ctx.line_height * 1, ctx.font_size, BLACK);
+    
+    // Draw server TPS
+    if (ctx.stage == STAGE_GAME && !ctx.local_game) {
+        const char *text;
+        switch (ctx.tps_display_type) {
+            case TPS_NUM: text = TextFormat("Server TPS: %2d/%2d", ctx.server_tps, ctx.server_target_tps); break;
+            case TPS_PERCENT: text = TextFormat("Server TPS: %3.0f%%", (float)ctx.server_tps/ctx.server_target_tps * 100); break;
+            case TPS_HIDE: text = GuiIconText(ICON_ARROW_LEFT, ""); break;
+            default: text = ""; break;
+        }
+
+        if (ctx.show_gui) {
+            GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_RIGHT);
+            STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
+                const int width = (ctx.tps_display_type == TPS_HIDE) ? 35 : 180;
+                GuiSetState(STATE_NORMAL);
+                if (GuiLabelButton((Rectangle){ctx.screen_width - text_margin - width, y + ctx.line_height * 2, width, 27}, text)) GUI_EVENT(IE_CHANGE_TPS_DISPLAY);
+            STYLE_END();
+            GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+        } else {
+            DrawText(text, ctx.screen_width - text_margin - MeasureText(text, ctx.font_size), y + ctx.line_height * 2, ctx.font_size, BLACK);
+        }
+    }
+
+    Color log_colors[] = {
+        [L_DEBUG] = GRAY,
+        [L_JOIN] = LIME,
+        [L_DISCONNECT] = ORANGE,
+        [L_CHAT] = DARKBLUE,
+        [L_QUESTION] = BLUE,
+        [L_INPUT] = DARKPURPLE,
+        [L_INFO] = BLACK,
+        [L_WARNING] = RED,
+        [L_ERROR] = DARKRED,
+        [L_NONE] = BLANK
+    };
+    
+    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+    
+    // Draw log (in reverse order, from top to bottom)
+    if (!ctx.local_game) {
+        int line = 1;
+        if (ctx.show_log) {
+            int idx = ctx.log.front;
+            pthread_mutex_lock(&log_mtx);
+            for (int i = 0; i < ctx.log.size; i++) {
+                line += ctx.log.items[idx].lines;
+                LogEntry *entry = &ctx.log.items[idx];
+            
+                // DrawText(log_prefixes[entry->type], 10, screen_height - line*22 - 5, ctx.text_size, log_colors[entry->type]);
+                // DrawText(entry->string, 40, screen_height - line*22 - 5, ctx.text_size, BLACK);
+                DrawText(TextFormat("%s%s", log_prefixes[entry->type], entry->string),
+                         text_margin, ctx.screen_height - line * ctx.line_height - text_margin - 3, ctx.font_size, log_colors[entry->type]);
+
+                idx = (idx > 0)? (idx - 1) : ctx.log.max_len-1;
+            }
+            pthread_mutex_unlock(&log_mtx);
+        }
+
+        if (ctx.show_gui) {
+            line += 2;
+            GuiSetIconScale((ctx.settings_text_scale + 0.25f) * 2);
+            GuiSetState(STATE_NORMAL);
+            if (GuiLabelButton((Rectangle){text_margin-4, ctx.screen_height - line * ctx.line_height, ctx.line_height, ctx.line_height},
+                               GuiIconText(ctx.show_log ? ICON_ARROW_DOWN_FILL : ICON_ARROW_UP_FILL, "")))
+                GUI_EVENT(IE_SHOW_LOG);
+        }
+    }
+
+    GuiSetIconScale((ctx.settings_gui_scale + 0.25f) * 2);
+
+    // Draw keyboard input
+    if (!ctx.local_game) {
+        DrawText(log_prefixes[L_INPUT], text_margin, ctx.screen_height - ctx.line_height - text_margin, ctx.font_size, log_colors[L_INPUT]);
+        if (!ctx.typing_keyboard_input)
+            DrawText("Press '/' or SPACE to start typing . . .", text_margin + MeasureText(log_prefixes[L_INPUT], ctx.font_size), ctx.screen_height - ctx.line_height - text_margin, ctx.font_size, GRAY);
+        else {
+            GuiDisableTooltip();
+            GuiSetState(STATE_NORMAL);
+            STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
+            STYLE_START(TEXTBOX, BORDER_WIDTH, 0);
+            STYLE_START(TEXTBOX, BASE_COLOR_PRESSED, 0x00000000);
+                const bool enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
+                const char first_char = ctx.input_string[0];
+                if (GuiTextBox((Rectangle){text_margin + MeasureText(log_prefixes[L_INPUT], ctx.font_size), ctx.screen_height - 23*ctx.settings_gui_scale - text_margin, 400, 25*ctx.settings_gui_scale},
+                               ctx.input_string, LOG_BUF_SIZE, ctx.typing_keyboard_input)) {
+                    ctx.typing_keyboard_input = !ctx.typing_keyboard_input;
+                    if (enter)
+                        GUI_EVENT(IE_INPUT_END);
+                }
+                if ((first_char == '/') ? (ctx.input_string[0] == '\0') : (first_char == '\0' && ctx.input_string[0] == '\0' && IsKeyPressed(KEY_BACKSPACE))) {
+                    ctx.typing_keyboard_input = false;
+                }
+
+                if (ctx.typing_keyboard_input) {
+                    // Autocomplete last word
+                    if (IsKeyPressed(KEY_TAB)) {
+                        // Get the word before the cursor
+                        char word[LOG_BUF_SIZE];
+                        char *word_ptr = ctx.input_string + textBoxCursorIndex;
+                        char *cursor_ptr = word_ptr;
+                        while (word_ptr > ctx.input_string && !isspace(*(word_ptr-1)))
+                            word_ptr--;
+                        int word_len = cursor_ptr - word_ptr;
+                        memcpy(word, word_ptr, word_len);
+                        word[word_len] = '\0';
+
+                        // Get new word
+                        char *new_word = autocomplete_word(word);
+                        int new_word_len = strlen(new_word);
+        
+                        // Insert new word
+                        const int input_len = strlen(ctx.input_string);
+                        memmove(cursor_ptr + (new_word_len - word_len), cursor_ptr, input_len - textBoxCursorIndex + (new_word_len - word_len));
+                        memmove(word_ptr, new_word, new_word_len);
+                        textBoxCursorIndex += new_word_len - word_len;
+                    }
+                }
+            STYLE_END();
+            STYLE_END();
+            STYLE_END();
+        }
+    }
+
+    GuiSetIconScale(1);
+
+    // Draw boids number
+    if (ctx.local_game) {
+        BoidIndex total_boids_number = 0;
+        for (int team = 0; team < TEAMS_COUNT; team++)
+            total_boids_number += ctx.boids_number[team];
+
+        DrawText(TextFormat("ALL: %2d", total_boids_number), text_margin, y + 0*ctx.settings_text_scale, ctx.font_size, BLACK);
+        DrawText(TextFormat("RED: %2d", ctx.boids_number[TEAM_RED]), text_margin, y + 30*ctx.settings_text_scale, ctx.font_size, RED);
+        DrawText(TextFormat("BLUE: %2d", ctx.boids_number[TEAM_BLUE]), text_margin, y + 50*ctx.settings_text_scale, ctx.font_size, BLUE);
+        DrawText(TextFormat("GREEN: %2d", ctx.boids_number[TEAM_GREEN]), text_margin, y + 70*ctx.settings_text_scale, ctx.font_size, GREEN);
+        DrawText(TextFormat("YELLOW: %2d", ctx.boids_number[TEAM_YELLOW]), text_margin, y + 90*ctx.settings_text_scale, ctx.font_size, ORANGE);
+    } else {
+        int text_y = (ctx.mode == MODE_WAIT) ? text_margin : y;
+        
+        int l = 0; // line
+        pthread_mutex_lock(&players_mtx);
+        for (int team = 0; team < TEAMS_COUNT; team++) {
+            if (!ctx.teams_used[team]) continue;
+        
+            bool player_joined = false;
+            int player_idx = 0;
+            for (; player_idx < ctx.joined_players; player_idx++) {
+                if (ctx.players[player_idx].team == team) {
+                    player_joined = true;
+                    break;
+                }
+            }
+        
+            Color team_color = BLACK;
+            switch (team) {
+                case TEAM_RED: team_color = RED; break;
+                case TEAM_BLUE: team_color = BLUE; break;
+                case TEAM_GREEN: team_color = GREEN; break;
+                case TEAM_YELLOW: team_color = ORANGE; break;
+            }
+
+            const char *str = NULL;
+            if (ctx.stage == STAGE_AREAS) {
+                // <player_name>: <target_boids_number> (<areas_size><! if boids_count less than areas_size>)
+                str = TextFormat("%s: %d%c(%d%s", player_joined ? ctx.players[player_idx].name : "-", ctx.boids_number[team], ctx.new_room ? ' ' : '\0',
+                                        areas_size[team], (ctx.boids_number[team] < areas_size[team])? ")" : "!)");
+            } else if (ctx.stage == STAGE_PLACING) {
+                if (team == (signed)ctx.player_team) {
+                    str = TextFormat("%s: %d (%d left) %s", ctx.players[player_idx].name, ctx.boids_count, ctx.boids_number[team]-ctx.boids_count,
+                                            ctx.players[team].ready? "ready" : "");
+                } else {
+                    if (player_joined)
+                        str = TextFormat("%s: - %s", ctx.players[player_idx].name, ctx.players[team].ready? "(ready)" : "");
+                    else
+                        str = "- : -";
+                }
+            } else if (ctx.stage == STAGE_GAME) {
+                str = TextFormat("%s: %d", player_joined? ctx.players[player_idx].name : "-", ctx.boids_number[team]);
+            }
+
+            if (str != NULL)
+                DrawText(str, text_margin, text_y + (l++) * ctx.line_height, ctx.font_size, team_color);
+        }
+        pthread_mutex_unlock(&players_mtx);
+    }
+
     GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
     
     // Draw GUI
     if (ctx.show_gui) {
+        GuiSetIconScale((ctx.settings_gui_scale + 0.25f) * 2);
+
         // Buttons in the left corner
         int btn_x = button_margin;
     
@@ -5736,217 +5973,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
         }
     }
     
-    // // Draw events indicators
-    // DrawCircle(20, ctx.screen_height - 20, 10, GRAY);
-    // DrawLineEx((Vector2){20, ctx.screen_height - 20}, (Vector2){2 + IE_COUNT*20, ctx.screen_height - 20}, 20, GRAY);
-    // DrawCircle(4 + IE_COUNT*20, ctx.screen_height - 20, 10, GRAY);
-    // for (int event = 0; event < IE_COUNT; event++) {
-    //     DrawCircle(22 + 20*event, ctx.screen_height - 20, 7, GET_EVENT(event) ? GREEN : BLACK);
-    //     if (GetMouseX() > (22 + 20*event - 7) && GetMouseX() < (22 + 20*event + 7) && GetMouseY() > ctx.screen_height - 40)
-    //         DrawText(TextFormat("%d", event), 15 + ctx.text_size*event, ctx.screen_height - 45, 15, BLACK);
-    // }
-
-    const int y = ctx.show_gui ? (button_margin + button_size + 20 + BUTTON_MARGIN) : (text_margin);
-    const int x = ctx.screen_width - text_margin;
-    
-    draw_fps(x - MeasureText(TextFormat("%d FPS", GetFPS()), ctx.text_size), y + ctx.line_height * 0);
- 
-    // Draw "Mode" label
-    const char *mode_text = NULL;
-    switch (ctx.mode) {
-        case MODE_WAIT: mode_text = "Mode: Wait"; break;
-        case MODE_AREAS: mode_text = "Mode: Areas"; break;
-        case MODE_SPAWN: mode_text = "Mode: Spawn"; break;
-        case MODE_DELETE: mode_text = "Mode: Delete"; break;
-        case MODE_SELECT: mode_text = "Mode: Select"; break;
-        case MODE_DIRECTION: mode_text = "Mode: Direction"; break;
-        case MODE_POINT: mode_text = "Mode: Point"; break;
-        case MODE_LINE: mode_text = "Mode: Line"; break;
-        default: break;
-    }
-    DrawText(mode_text, x - MeasureText(mode_text, ctx.text_size), y + ctx.line_height * 1, ctx.text_size, BLACK);
-    
-    if (ctx.stage == STAGE_GAME && !ctx.local_game) {
-        const char *text;
-        switch (ctx.tps_display_type) {
-            case TPS_NUM: text = TextFormat("Server TPS: %2d/%2d", ctx.server_tps, ctx.server_target_tps); break;
-            case TPS_PERCENT: text = TextFormat("Server TPS: %3.0f%%", (float)ctx.server_tps/ctx.server_target_tps * 100); break;
-            case TPS_HIDE: text = GuiIconText(ICON_ARROW_LEFT, ""); break;
-            default: text = ""; break;
-        }
-
-        if (ctx.show_gui) {
-            GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_RIGHT);
-            STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
-                const int width = (ctx.tps_display_type == TPS_HIDE) ? 35 : 180;
-                GuiSetState(STATE_NORMAL);
-                if (GuiLabelButton((Rectangle){ctx.screen_width - text_margin - width, y + ctx.line_height * 2, width, 27}, text)) GUI_EVENT(IE_CHANGE_TPS_DISPLAY);
-            STYLE_END();
-            GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
-        } else {
-            DrawText(text, ctx.screen_width - text_margin - MeasureText(text, ctx.text_size), y + ctx.line_height * 2, ctx.text_size, BLACK);
-        }
-    }
-
-    Color log_colors[] = {
-        [L_DEBUG] = GRAY,
-        [L_JOIN] = LIME,
-        [L_DISCONNECT] = ORANGE,
-        [L_CHAT] = DARKBLUE,
-        [L_QUESTION] = BLUE,
-        [L_INPUT] = DARKPURPLE,
-        [L_INFO] = BLACK,
-        [L_WARNING] = RED,
-        [L_ERROR] = DARKRED,
-        [L_NONE] = BLANK
-    };
-    
-    GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
-    
-    // Draw log (in reverse order, from top to bottom)
-    if (!ctx.local_game) {
-        int line = 1;
-        if (ctx.show_log) {
-            int idx = ctx.log.front;
-            pthread_mutex_lock(&log_mtx);
-            for (int i = 0; i < ctx.log.size; i++) {
-                line += ctx.log.items[idx].lines;
-                LogEntry *entry = &ctx.log.items[idx];
-            
-                // DrawText(log_prefixes[entry->type], 10, screen_height - line*22 - 5, ctx.text_size, log_colors[entry->type]);
-                // DrawText(entry->string, 40, screen_height - line*22 - 5, ctx.text_size, BLACK);
-                DrawText(TextFormat("%s%s", log_prefixes[entry->type], entry->string),
-                         text_margin, ctx.screen_height - line * ctx.line_height - text_margin - 3, ctx.text_size, log_colors[entry->type]);
-
-                idx = (idx > 0)? (idx - 1) : ctx.log.max_len-1;
-            }
-            pthread_mutex_unlock(&log_mtx);
-        }
-
-        if (ctx.show_gui) {
-            line++;
-            GuiSetState(STATE_NORMAL);
-            if (GuiLabelButton((Rectangle){text_margin-4, ctx.screen_height - (line) * ctx.line_height, 30, 30}, GuiIconText(ctx.show_log ? ICON_ARROW_DOWN_FILL : ICON_ARROW_UP_FILL, "")))
-                GUI_EVENT(IE_SHOW_LOG);
-        }
-    }
-
-    // Draw keyboard input
-    if (!ctx.local_game) {
-        DrawText(log_prefixes[L_INPUT], text_margin, ctx.screen_height - ctx.line_height - text_margin, ctx.text_size, log_colors[L_INPUT]);
-        if (!ctx.typing_keyboard_input)
-            DrawText("Press '/' or SPACE to start typing . . .", text_margin + MeasureText(log_prefixes[L_INPUT], ctx.text_size), ctx.screen_height - ctx.line_height - text_margin, ctx.text_size, GRAY);
-        else {
-            GuiDisableTooltip();
-            GuiSetState(STATE_NORMAL);
-            STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
-            STYLE_START(TEXTBOX, BORDER_WIDTH, 0);
-            STYLE_START(TEXTBOX, BASE_COLOR_PRESSED, 0x00000000);
-                const bool enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
-                const char first_char = ctx.input_string[0];
-                if (GuiTextBox((Rectangle){text_margin + MeasureText(log_prefixes[L_INPUT], ctx.text_size), ctx.screen_height - 23*ctx.settings_gui_scale - text_margin, 400, 25*ctx.settings_gui_scale},
-                               ctx.input_string, LOG_BUF_SIZE, ctx.typing_keyboard_input)) {
-                    ctx.typing_keyboard_input = !ctx.typing_keyboard_input;
-                    if (enter)
-                        GUI_EVENT(IE_INPUT_END);
-                }
-                if ((first_char == '/') ? (ctx.input_string[0] == '\0') : (first_char == '\0' && ctx.input_string[0] == '\0' && IsKeyPressed(KEY_BACKSPACE))) {
-                    ctx.typing_keyboard_input = false;
-                }
-
-                if (ctx.typing_keyboard_input) {
-                    // Autocomplete last word
-                    if (IsKeyPressed(KEY_TAB)) {
-                        // Get the word before the cursor
-                        char word[LOG_BUF_SIZE];
-                        char *word_ptr = ctx.input_string + textBoxCursorIndex;
-                        char *cursor_ptr = word_ptr;
-                        while (word_ptr > ctx.input_string && !isspace(*(word_ptr-1)))
-                            word_ptr--;
-                        int word_len = cursor_ptr - word_ptr;
-                        memcpy(word, word_ptr, word_len);
-                        word[word_len] = '\0';
-
-                        // Get new word
-                        char *new_word = autocomplete_word(word);
-                        int new_word_len = strlen(new_word);
-        
-                        // Insert new word
-                        const int input_len = strlen(ctx.input_string);
-                        memmove(cursor_ptr + (new_word_len - word_len), cursor_ptr, input_len - textBoxCursorIndex + (new_word_len - word_len));
-                        memmove(word_ptr, new_word, new_word_len);
-                        textBoxCursorIndex += new_word_len - word_len;
-                    }
-                }
-            STYLE_END();
-            STYLE_END();
-            STYLE_END();
-        }
-    }
-
-    GuiSetIconScale(1);
-
-    // Draw boids number
-    if (ctx.local_game) {
-        BoidIndex total_boids_number = 0;
-        for (int team = 0; team < TEAMS_COUNT; team++)
-            total_boids_number += ctx.boids_number[team];
-
-        DrawText(TextFormat("ALL: %2d", total_boids_number), text_margin, y + 0*ctx.settings_text_scale, ctx.text_size, BLACK);
-        DrawText(TextFormat("RED: %2d", ctx.boids_number[TEAM_RED]), text_margin, y + 30*ctx.settings_text_scale, ctx.text_size, RED);
-        DrawText(TextFormat("BLUE: %2d", ctx.boids_number[TEAM_BLUE]), text_margin, y + 50*ctx.settings_text_scale, ctx.text_size, BLUE);
-        DrawText(TextFormat("GREEN: %2d", ctx.boids_number[TEAM_GREEN]), text_margin, y + 70*ctx.settings_text_scale, ctx.text_size, GREEN);
-        DrawText(TextFormat("YELLOW: %2d", ctx.boids_number[TEAM_YELLOW]), text_margin, y + 90*ctx.settings_text_scale, ctx.text_size, ORANGE);
-    } else {
-        int text_y = (ctx.mode == MODE_WAIT) ? text_margin : y;
-        
-        int l = 0; // line
-        pthread_mutex_lock(&players_mtx);
-        for (int team = 0; team < TEAMS_COUNT; team++) {
-            if (!ctx.teams_used[team]) continue;
-        
-            bool player_joined = false;
-            int player_idx = 0;
-            for (; player_idx < ctx.joined_players; player_idx++) {
-                if (ctx.players[player_idx].team == team) {
-                    player_joined = true;
-                    break;
-                }
-            }
-        
-            Color team_color = BLACK;
-            switch (team) {
-                case TEAM_RED: team_color = RED; break;
-                case TEAM_BLUE: team_color = BLUE; break;
-                case TEAM_GREEN: team_color = GREEN; break;
-                case TEAM_YELLOW: team_color = ORANGE; break;
-            }
-
-            const char *str = NULL;
-            if (ctx.stage == STAGE_AREAS) {
-                // <player_name>: <target_boids_number> (<areas_size><! if boids_count less than areas_size>)
-                str = TextFormat("%s: %d%c(%d%s", player_joined ? ctx.players[player_idx].name : "-", ctx.boids_number[team], ctx.new_room ? ' ' : '\0',
-                                        areas_size[team], (ctx.boids_number[team] < areas_size[team])? ")" : "!)");
-            } else if (ctx.stage == STAGE_PLACING) {
-                if (team == (signed)ctx.player_team) {
-                    str = TextFormat("%s: %d (%d left) %s", ctx.players[player_idx].name, ctx.boids_count, ctx.boids_number[team]-ctx.boids_count,
-                                            ctx.players[team].ready? "ready" : "");
-                } else {
-                    if (player_joined)
-                        str = TextFormat("%s: - %s", ctx.players[player_idx].name, ctx.players[team].ready? "(ready)" : "");
-                    else
-                        str = "- : -";
-                }
-            } else if (ctx.stage == STAGE_GAME) {
-                str = TextFormat("%s: %d", player_joined? ctx.players[player_idx].name : "-", ctx.boids_number[team]);
-            }
-
-            if (str != NULL)
-                DrawText(str, text_margin, text_y + (l++) * ctx.line_height, ctx.text_size, team_color);
-        }
-        pthread_mutex_unlock(&players_mtx);
-    }
-
+    // Draw confetti
     if (ctx.stage == STAGE_GAME && !ctx.local_game) {
         static bool win_message = false;
         static uint32_t winner_id;
@@ -5989,15 +6016,102 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
     #undef BUTTON_MARGIN
     #undef TEXT_MARGIN
 
+    GuiDisableTooltip();
+
+    GuiSetIconScale(1);
+    
+    // New player team selection menu
+    if (ctx.show_gui && ctx.get_input && !ctx.local_game) {
+        const int item_margin = ITEM_MARGIN * ctx.settings_gui_scale;
+        // const int item_width = ITEM_WIDTH * ctx.settings_gui_scale;
+        const int item_height = ITEM_HEIGHT * ctx.settings_gui_scale;
+        const int item_spacing = ITEM_SPACING * ctx.settings_gui_scale;
+        // const int item_inner_spacing = ITEM_INNER_SPACING * ctx.settings_gui_scale;
+        // const int label_spacing = LABEL_SPACING * ctx.settings_gui_scale;
+        // const int checkbox_size = CHECKBOX_SIZE * ctx.settings_gui_scale;
+        // const int checkbox_offset = -ctx.text_size/2.0f;
+        
+        const int menu_width = 500 * ctx.settings_gui_scale;
+        int x = ctx.screen_width/2 - menu_width/2;
+        int y = 150;
+
+        Rectangle menu_rec = {x, y, menu_width, item_height*2 + item_spacing + item_margin*2};
+        DrawRectangleRec(menu_rec, GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+        DrawRectangleLinesEx(menu_rec, GuiGetStyle(DEFAULT, BORDER_WIDTH), GetColor(GuiGetStyle(DEFAULT, BORDER_COLOR_NORMAL)));
+        // DrawRectangle(x, y, menu_width, item_height*2 + item_spacing + item_margin*2,
+        //               GetColor(GuiGetStyle(DEFAULT, BASE_COLOR_NORMAL)));
+        y += item_margin;
+        x += item_margin;
+
+        STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
+        GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
+
+        GuiDrawText(TextFormat("Team of new player '%s'", ctx.approved_player_username), (Rectangle){x, y, menu_width - item_margin*2, item_height}, TEXT_ALIGN_CENTER, BLACK);
+        y += item_height + item_spacing;
+
+        const int btn_width = (menu_width - item_margin*2 - item_spacing*TEAMS_COUNT) / (TEAMS_COUNT + 1);
+        
+        bool can_select_team[TEAMS_COUNT] = { 0 };
+        for (int team = 0; team < TEAMS_COUNT; team++) {
+            can_select_team[team] = ctx.teams_used[team];
+        }
+
+        pthread_mutex_lock(&players_mtx);
+        for (int i = 0; i < ctx.joined_players; i++) {
+            can_select_team[ctx.players[i].team] = false;
+        }
+        pthread_mutex_unlock(&players_mtx);
+        
+        GuiSetState(can_select_team[TEAM_RED] ? STATE_NORMAL : STATE_DISABLED);
+        if (GuiButton((Rectangle){x, y, btn_width, item_height}, "Red")) {
+            strcpy(ctx.input_string, "r");
+            GUI_EVENT(IE_INPUT_END);
+        }
+        x += btn_width + item_spacing;
+
+        GuiSetState(can_select_team[TEAM_BLUE] ? STATE_NORMAL : STATE_DISABLED);
+        if (GuiButton((Rectangle){x, y, btn_width, item_height}, "Blue")) {
+            strcpy(ctx.input_string, "b");
+            GUI_EVENT(IE_INPUT_END);
+        }
+        x += btn_width + item_spacing;
+
+        GuiSetState(can_select_team[TEAM_GREEN] ? STATE_NORMAL : STATE_DISABLED);
+        if (GuiButton((Rectangle){x, y, btn_width, item_height}, "Green")) {
+            strcpy(ctx.input_string, "g");
+            GUI_EVENT(IE_INPUT_END);
+        }
+        x += btn_width + item_spacing;
+
+        GuiSetState(can_select_team[TEAM_YELLOW] ? STATE_NORMAL : STATE_DISABLED);
+        if (GuiButton((Rectangle){x, y, btn_width, item_height}, "Yellow")) {
+            strcpy(ctx.input_string, "y");
+            GUI_EVENT(IE_INPUT_END);
+        }
+        x += btn_width + item_spacing;
+
+        GuiSetState(STATE_NORMAL);
+        if (GuiButton((Rectangle){x, y, btn_width, item_height}, "Reject")) {
+            strcpy(ctx.input_string, "n");
+            GUI_EVENT(IE_INPUT_END);
+        }
+        x += btn_width + item_spacing;
+
+        GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+        STYLE_END(); // TEXT_SIZE
+    }
+    
     GuiUnlock();
     
     // "Do you really want to exit?" menu
     if (ctx.foreground_menu == FGMENU_EXIT_ROOM) {
-        GuiDisableTooltip();
+        const int menu_width = 250;
+        const int menu_height = 100;
+        
         GuiSetState(STATE_NORMAL);
         DrawRectangle(0, 0, ctx.screen_width, ctx.screen_height, Fade(RAYWHITE, 0.8f));
         int btn_active = -1;
-        GuiMessageBox((Rectangle){ (float)GetScreenWidth()/2 - 125, (float)GetScreenHeight()/2 - 50, 250, 100 }, 
+        GuiMessageBox((Rectangle){ (float)GetScreenWidth()/2.0f - menu_width/2.0f, (float)GetScreenHeight()/2.0f - menu_height/2.0f, menu_width, menu_height }, 
             GuiIconText(ICON_EXIT, "Exiting the game"), "Do you really want to exit?", "Yes;No", &btn_active);
 
         if (btn_active != -1 || IsKeyPressed(KEY_ENTER)) ctx.foreground_menu = FGMENU_NONE;
@@ -6027,7 +6141,6 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
 
         if (!active_gui) GuiLock(); // Lock all items when any GuiDropdownBox is active
 
-        GuiDisableTooltip();
         GuiSetState(STATE_NORMAL);
         DrawRectangle(0, 0, ctx.screen_width, ctx.screen_height, Fade(RAYWHITE, 0.8f));
         int r = GuiWindowBox((Rectangle){
@@ -6040,7 +6153,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
             ctx.foreground_menu = FGMENU_NONE;
         }
 
-        STYLE_START(DEFAULT, TEXT_SIZE, ctx.text_size);
+        STYLE_START(DEFAULT, TEXT_SIZE, ctx.font_size);
         GuiSetStyle(DEFAULT, TEXT_ALIGNMENT, TEXT_ALIGN_CENTER);
         
         if (GuiButton((Rectangle){x, y, item_width, item_height},
@@ -6049,7 +6162,7 @@ GameMenu game_loop(Texture2D texture, Texture2D boids_textures[], bool reset) {
         }
         y += item_height + item_spacing;
 
-        if (GuiButton((Rectangle){x, y, item_width, item_height}, GuiIconText(ICON_EXIT, "Exit the room"))) {
+        if (GuiButton((Rectangle){x, y, item_width, item_height}, GuiIconText(ICON_EXIT, ctx.local_game ? "Main menu" : "Exit the room"))) {
             ctx.foreground_menu = FGMENU_EXIT_ROOM;
         }
         y += item_height + item_spacing;
